@@ -10,8 +10,8 @@ import { startRetention } from "./retention";
 interface App {
   debug: (...args: unknown[]) => void;
   error: (...args: unknown[]) => void;
-  setPluginStatus: (id: string, msg: string) => void;
-  setPluginError: (id: string, msg: string) => void;
+  setPluginStatus: (msg: string) => void;
+  setPluginError: (msg: string) => void;
   selfContext: string;
   selfId: string;
   streambundle: {
@@ -66,8 +66,6 @@ module.exports = (app: App) => {
     return false;
   }
 
-  const PLUGIN_ID = "signalk-questdb";
-
   async function asyncStart(config: Config) {
 
     const host = config.questdbHost ?? "127.0.0.1";
@@ -83,7 +81,6 @@ module.exports = (app: App) => {
           | undefined;
         if (containers && containers.getRuntime()) break;
         app.setPluginStatus(
-          PLUGIN_ID,
           "Waiting for container runtime detection...",
         );
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -92,7 +89,6 @@ module.exports = (app: App) => {
       if (!containers) {
         app.debug("containerManager not found after timeout");
         app.setPluginError(
-          PLUGIN_ID,
           "signalk-container plugin required for managed mode. Install it or set managedContainer=false.",
         );
         return;
@@ -101,7 +97,6 @@ module.exports = (app: App) => {
       if (!containers.getRuntime()) {
         app.debug("container runtime not detected after timeout");
         app.setPluginError(
-          PLUGIN_ID,
           "No container runtime detected. Check signalk-container plugin.",
         );
         return;
@@ -109,7 +104,7 @@ module.exports = (app: App) => {
 
       app.debug("container runtime ready, starting QuestDB");
       try {
-        app.setPluginStatus(PLUGIN_ID, "Starting QuestDB container...");
+        app.setPluginStatus("Starting QuestDB container...");
         await containers.ensureRunning("signalk-questdb", {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
@@ -132,7 +127,6 @@ module.exports = (app: App) => {
       } catch (err) {
         app.debug("ensureRunning failed:", err);
         app.setPluginError(
-          PLUGIN_ID,
           `Failed to start QuestDB container: ${err instanceof Error ? err.message : String(err)}`,
         );
         return;
@@ -142,7 +136,7 @@ module.exports = (app: App) => {
     app.debug("connecting to QuestDB at %s:%d", host, httpPort);
     queryClient = new QueryClient(host, httpPort);
 
-    app.setPluginStatus(PLUGIN_ID, "Waiting for QuestDB to become ready...");
+    app.setPluginStatus("Waiting for QuestDB to become ready...");
     const deadline = Date.now() + 30000;
     while (Date.now() < deadline) {
       if (await queryClient.isHealthy()) break;
@@ -151,13 +145,12 @@ module.exports = (app: App) => {
 
     if (!(await queryClient.isHealthy())) {
       app.setPluginError(
-        PLUGIN_ID,
         `QuestDB not responding at ${host}:${httpPort}`,
       );
       return;
     }
 
-    app.setPluginStatus(PLUGIN_ID, "Creating tables...");
+    app.setPluginStatus("Creating tables...");
     await queryClient.ensureTables();
 
     writer = new ILPWriter(host, ilpPort, (msg) => app.debug(msg));
@@ -207,10 +200,7 @@ module.exports = (app: App) => {
       );
     }
 
-    app.setPluginStatus(
-      PLUGIN_ID,
-      `Recording to QuestDB at ${host}:${ilpPort}`,
-    );
+    app.setPluginStatus(`Recording to QuestDB at ${host}:${ilpPort}`);
   }
 
 
@@ -227,7 +217,6 @@ module.exports = (app: App) => {
 
       asyncStart(config).catch((err) => {
         app.setPluginError(
-          plugin.id,
           `Startup failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
