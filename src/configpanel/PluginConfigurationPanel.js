@@ -503,6 +503,37 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         <span style={S.hint}>0 = keep forever</span>
       </div>
 
+      <CollapsibleSection title="Compression (on-disk)">
+        <div style={S.fieldRow}>
+          <span style={S.label}>Compression codec</span>
+          <select
+            style={S.select}
+            value={compression}
+            onChange={(e) => setCompression(e.target.value)}
+          >
+            <option value="none">None</option>
+            <option value="lz4">LZ4 (fast)</option>
+            <option value="zstd">ZSTD (smaller)</option>
+          </select>
+          <span style={S.hint}>applies to new data after save</span>
+        </div>
+
+        {compression === "zstd" && (
+          <div style={S.fieldRow}>
+            <span style={S.label}>ZSTD level</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              min="1"
+              max="22"
+              value={compressionLevel}
+              onChange={(e) => setCompressionLevel(Number(e.target.value))}
+            />
+            <span style={S.hint}>1 (fast) to 22 (smallest)</span>
+          </div>
+        )}
+      </CollapsibleSection>
+
       <CollapsibleSection title="InfluxDB Migration">
         <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
           <button
@@ -567,35 +598,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         )}
       </CollapsibleSection>
 
-      <CollapsibleSection title="Compression &amp; Export">
-        <div style={S.fieldRow}>
-          <span style={S.label}>Compression codec</span>
-          <select
-            style={S.select}
-            value={compression}
-            onChange={(e) => setCompression(e.target.value)}
-          >
-            <option value="none">None</option>
-            <option value="lz4">LZ4 (fast)</option>
-            <option value="zstd">ZSTD (smaller)</option>
-          </select>
-        </div>
-
-        {compression === "zstd" && (
-          <div style={S.fieldRow}>
-            <span style={S.label}>ZSTD level</span>
-            <input
-              style={S.inputSmall}
-              type="number"
-              min="1"
-              max="22"
-              value={compressionLevel}
-              onChange={(e) => setCompressionLevel(Number(e.target.value))}
-            />
-            <span style={S.hint}>1 (fast) to 22 (smallest)</span>
-          </div>
-        )}
-
+      <CollapsibleSection title="Data Export">
         <div style={S.fieldRow}>
           <span style={S.label}>From</span>
           <input
