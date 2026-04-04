@@ -65,163 +65,155 @@ module.exports = (app: App) => {
     return false;
   }
 
+  const PLUGIN_ID = "signalk-questdb";
+
+  async function asyncStart(config: Config) {
+    const host = config.questdbHost ?? "127.0.0.1";
+    const ilpPort = config.questdbIlpPort ?? 9009;
+    const httpPort = config.questdbHttpPort ?? 9000;
+
+    if (config.managedContainer !== false) {
+      let containers: ContainerManagerApi | undefined;
+      const waitDeadline = Date.now() + 15000;
+      while (Date.now() < waitDeadline) {
+        containers = (app as any).containerManager as
+          | ContainerManagerApi
+          | undefined;
+        if (containers) break;
+        app.setPluginStatus(
+          PLUGIN_ID,
+          "Waiting for signalk-container plugin...",
+        );
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      if (!containers) {
+        app.setPluginError(
+          PLUGIN_ID,
+          "signalk-container plugin required for managed mode. Install it or set managedContainer=false.",
+        );
+        return;
+      }
+
+      try {
+        app.setPluginStatus(PLUGIN_ID, "Starting QuestDB container...");
+        await containers.ensureRunning("signalk-questdb", {
+          image: "questdb/questdb",
+          tag: config.questdbVersion ?? "latest",
+          ports: {
+            "9000/tcp": `127.0.0.1:${httpPort}`,
+            "9009/tcp": `127.0.0.1:${ilpPort}`,
+            "8812/tcp": `127.0.0.1:${config.questdbPgPort ?? 8812}`,
+          },
+          volumes: {
+            "/var/lib/questdb": app.getDataDirPath(),
+          },
+          env: {
+            QDB_TELEMETRY_ENABLED: "false",
+            QDB_HTTP_ENABLED: "true",
+            QDB_LINE_TCP_ENABLED: "true",
+          },
+          restart: "unless-stopped",
+        });
+      } catch (err) {
+        app.setPluginError(
+          PLUGIN_ID,
+          `Failed to start QuestDB container: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
+    }
+
+    queryClient = new QueryClient(host, httpPort);
+
+    app.setPluginStatus(PLUGIN_ID, "Waiting for QuestDB to become ready...");
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      if (await queryClient.isHealthy()) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    if (!(await queryClient.isHealthy())) {
+      app.setPluginError(
+        PLUGIN_ID,
+        `QuestDB not responding at ${host}:${httpPort}`,
+      );
+      return;
+    }
+
+    app.setPluginStatus(PLUGIN_ID, "Creating tables...");
+    await queryClient.ensureTables();
+
+    writer = new ILPWriter(host, ilpPort, (msg) => app.debug(msg));
+    await writer.connect();
+
+    const v2Provider = createHistoryProviderV2(queryClient);
+    app.registerHistoryApiProvider(v2Provider);
+
+    const v1Provider = createHistoryProviderV1(
+      queryClient,
+      app.selfContext,
+      (msg) => app.debug(msg),
+    );
+    app.registerHistoryProvider(v1Provider);
+
+    const bus = app.streambundle.getBus();
+    const unsub = bus.onValue((delta: any) => {
+      if (!writer) return;
+      const { path, value, context, timestamp } = delta;
+      if (!path || value === undefined || value === null) return;
+
+      const isSelf = context === app.selfContext;
+      if (isSelf && !config.recordSelf) return;
+      if (!isSelf && !config.recordOthers) return;
+
+      if (!shouldRecord(path, config.pathFilter)) return;
+      if (isThrottled(path, config.samplingRates)) return;
+
+      const ts = timestamp ? new Date(timestamp) : new Date();
+      const ctx = isSelf ? "self" : context;
+
+      if (typeof value === "number") {
+        writer.write(path, ctx, value, ts);
+      } else if (typeof value === "string") {
+        writer.writeString(path, ctx, value, ts);
+      } else if (value && typeof value === "object" && "latitude" in value) {
+        writer.writePosition(path, ctx, value, ts);
+      }
+    });
+    unsubscribes.push(unsub);
+
+    if (config.retentionDays && config.retentionDays > 0) {
+      retentionTimer = startRetention(
+        queryClient,
+        config.retentionDays,
+        (msg) => app.debug(msg),
+      );
+    }
+
+    app.setPluginStatus(
+      PLUGIN_ID,
+      `Recording to QuestDB at ${host}:${ilpPort}`,
+    );
+  }
+
+
+
   const plugin = {
     id: "signalk-questdb",
     name: "QuestDB History",
 
     schema: ConfigSchema,
 
-    async start(config: Config) {
-      const host = config.questdbHost ?? "127.0.0.1";
-      const ilpPort = config.questdbIlpPort ?? 9009;
-      const httpPort = config.questdbHttpPort ?? 9000;
-
-      if (config.managedContainer !== false) {
-        // Wait for signalk-container to be ready (startup order not guaranteed)
-        let containers: ContainerManagerApi | undefined;
-        const waitDeadline = Date.now() + 15000;
-        while (Date.now() < waitDeadline) {
-          containers = (app as any).containerManager as
-            | ContainerManagerApi
-            | undefined;
-          if (containers) break;
-          app.setPluginStatus(
-            plugin.id,
-            "Waiting for signalk-container plugin...",
-          );
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-
-        if (!containers) {
-          app.setPluginError(
-            plugin.id,
-            "signalk-container plugin required for managed mode. Install it or set managedContainer=false.",
-          );
-          return;
-        }
-
-        try {
-          app.setPluginStatus(
-            plugin.id,
-            "Starting QuestDB container...",
-          );
-          await containers.ensureRunning("signalk-questdb", {
-            image: "questdb/questdb",
-            tag: config.questdbVersion ?? "latest",
-            ports: {
-              "9000/tcp": `127.0.0.1:${httpPort}`,
-              "9009/tcp": `127.0.0.1:${ilpPort}`,
-              "8812/tcp": `127.0.0.1:${config.questdbPgPort ?? 8812}`,
-            },
-            volumes: {
-              "/var/lib/questdb": app.getDataDirPath(),
-            },
-            env: {
-              QDB_TELEMETRY_ENABLED: "false",
-              QDB_HTTP_ENABLED: "true",
-              QDB_LINE_TCP_ENABLED: "true",
-            },
-            restart: "unless-stopped",
-          });
-        } catch (err) {
-          app.setPluginError(
-            plugin.id,
-            `Failed to start QuestDB container: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          return;
-        }
-      }
-
-      queryClient = new QueryClient(host, httpPort);
-
-      app.setPluginStatus(
-        plugin.id,
-        "Waiting for QuestDB to become ready...",
-      );
-      const deadline = Date.now() + 30000;
-      while (Date.now() < deadline) {
-        if (await queryClient.isHealthy()) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-
-      if (!(await queryClient.isHealthy())) {
+    start(config: Config) {
+      // Server does not await start(), so run async init in a
+      // self-contained promise that handles its own errors.
+      asyncStart(config).catch((err) => {
         app.setPluginError(
           plugin.id,
-          `QuestDB not responding at ${host}:${httpPort}`,
+          `Startup failed: ${err instanceof Error ? err.message : String(err)}`,
         );
-        return;
-      }
-
-      app.setPluginStatus(plugin.id, "Creating tables...");
-      try {
-        await queryClient.ensureTables();
-      } catch (err) {
-        app.setPluginError(
-          plugin.id,
-          `Failed to create tables: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        return;
-      }
-
-      writer = new ILPWriter(host, ilpPort, (msg) => app.debug(msg));
-      try {
-        await writer.connect();
-      } catch (err) {
-        app.setPluginError(
-          plugin.id,
-          `ILP connect failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        return;
-      }
-
-      const v2Provider = createHistoryProviderV2(queryClient);
-      app.registerHistoryApiProvider(v2Provider);
-
-      const v1Provider = createHistoryProviderV1(
-        queryClient,
-        app.selfContext,
-        (msg) => app.debug(msg),
-      );
-      app.registerHistoryProvider(v1Provider);
-
-      const bus = app.streambundle.getBus();
-      const unsub = bus.onValue((delta: any) => {
-        if (!writer) return;
-        const { path, value, context, timestamp } = delta;
-        if (!path || value === undefined || value === null) return;
-
-        const isSelf = context === app.selfContext;
-        if (isSelf && !config.recordSelf) return;
-        if (!isSelf && !config.recordOthers) return;
-
-        if (!shouldRecord(path, config.pathFilter)) return;
-        if (isThrottled(path, config.samplingRates)) return;
-
-        const ts = timestamp ? new Date(timestamp) : new Date();
-        const ctx = isSelf ? "self" : context;
-
-        if (typeof value === "number") {
-          writer.write(path, ctx, value, ts);
-        } else if (typeof value === "string") {
-          writer.writeString(path, ctx, value, ts);
-        } else if (value && typeof value === "object" && "latitude" in value) {
-          writer.writePosition(path, ctx, value, ts);
-        }
       });
-      unsubscribes.push(unsub);
-
-      if (config.retentionDays && config.retentionDays > 0) {
-        retentionTimer = startRetention(
-          queryClient,
-          config.retentionDays,
-          (msg) => app.debug(msg),
-        );
-      }
-
-      app.setPluginStatus(
-        plugin.id,
-        `Recording to QuestDB at ${host}:${ilpPort}`,
-      );
     },
 
     async stop() {
