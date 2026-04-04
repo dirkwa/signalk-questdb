@@ -149,7 +149,8 @@ module.exports = (app: App) => {
           ports: containerConfig.ports,
           env: containerConfig.env,
         });
-        const hashFile = `${app.getDataDirPath()}/container-config-hash`;
+        // Store hash next to plugin config JSON, not in the QuestDB data volume
+        const hashFile = `${app.getDataDirPath()}.container-hash`;
         let lastHash = "";
         try {
           lastHash = readFileSync(hashFile, "utf8");
