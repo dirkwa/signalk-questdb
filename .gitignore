@@ -1,5 +1,8 @@
 node_modules/
 dist/
+public/*.js
+public/*.js.map
+public/*.txt
 *.tsbuildinfo
 .DS_Store
 *.log

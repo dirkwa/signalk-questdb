@@ -9,3 +9,5 @@ on:
 jobs:
   test:
     uses: dirkwa/signalk-server/.github/workflows/plugin-ci.yml@feat-ci-for-plugins
+    with:
+      enable-armv7: false
