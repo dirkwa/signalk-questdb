@@ -77,9 +77,21 @@ module.exports = (app: App) => {
       const httpPort = config.questdbHttpPort ?? 9000;
 
       if (config.managedContainer !== false) {
-        const containers = (app as any).containerManager as
-          | ContainerManagerApi
-          | undefined;
+        // Wait for signalk-container to be ready (startup order not guaranteed)
+        let containers: ContainerManagerApi | undefined;
+        const waitDeadline = Date.now() + 15000;
+        while (Date.now() < waitDeadline) {
+          containers = (app as any).containerManager as
+            | ContainerManagerApi
+            | undefined;
+          if (containers) break;
+          app.setPluginStatus(
+            plugin.id,
+            "Waiting for signalk-container plugin...",
+          );
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+
         if (!containers) {
           app.setPluginError(
             plugin.id,
@@ -89,9 +101,13 @@ module.exports = (app: App) => {
         }
 
         try {
+          app.setPluginStatus(
+            plugin.id,
+            "Starting QuestDB container...",
+          );
           await containers.ensureRunning("signalk-questdb", {
             image: "questdb/questdb",
-            tag: config.questdbVersion ?? "9.2.0",
+            tag: config.questdbVersion ?? "latest",
             ports: {
               "9000/tcp": `127.0.0.1:${httpPort}`,
               "9009/tcp": `127.0.0.1:${ilpPort}`,
@@ -118,6 +134,10 @@ module.exports = (app: App) => {
 
       queryClient = new QueryClient(host, httpPort);
 
+      app.setPluginStatus(
+        plugin.id,
+        "Waiting for QuestDB to become ready...",
+      );
       const deadline = Date.now() + 30000;
       while (Date.now() < deadline) {
         if (await queryClient.isHealthy()) break;
@@ -132,6 +152,7 @@ module.exports = (app: App) => {
         return;
       }
 
+      app.setPluginStatus(plugin.id, "Creating tables...");
       try {
         await queryClient.ensureTables();
       } catch (err) {
