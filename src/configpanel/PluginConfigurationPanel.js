@@ -157,6 +157,31 @@ const S = {
   statLabel: { fontSize: 11, color: "#888", marginTop: 2 },
 };
 
+function CollapsibleSection({ title, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div>
+      <div
+        style={{
+          ...S.sectionTitle,
+          cursor: "pointer",
+          userSelect: "none",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+        onClick={() => setOpen(!open)}
+      >
+        <span style={{ fontSize: 10, transition: "transform 0.15s", transform: open ? "rotate(90deg)" : "rotate(0deg)" }}>
+          {"\u25b6"}
+        </span>
+        {title}
+      </div>
+      {open && <div style={{ marginBottom: 16 }}>{children}</div>}
+    </div>
+  );
+}
+
 function formatNumber(n) {
   if (n === null || n === undefined) return "—";
   if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
@@ -478,145 +503,143 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         <span style={S.hint}>0 = keep forever</span>
       </div>
 
-      {/* Migration */}
-      <div style={S.sectionTitle}>InfluxDB Migration</div>
+      <CollapsibleSection title="InfluxDB Migration">
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+          <button
+            style={{
+              ...S.btn,
+              ...S.btnPrimary,
+              ...(migrationDetecting ? S.btnDisabled : {}),
+            }}
+            onClick={detectMigration}
+            disabled={migrationDetecting}
+          >
+            {migrationDetecting ? "Detecting..." : "Detect InfluxDB"}
+          </button>
+          <span style={S.hint}>Checks localhost:8086 for InfluxDB 1.x and 2.x</span>
+        </div>
 
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+        {migrationSources && migrationSources.length > 0 && (
+          <div>
+            {migrationSources.map((src, i) => (
+              <div key={i} style={S.migrationItem}>
+                <div
+                  style={{
+                    ...S.cardIcon,
+                    width: 36,
+                    height: 36,
+                    fontSize: 16,
+                    background: src.type === "influxdb2" ? "#020a47" : "#22adf6",
+                    color: "#fff",
+                  }}
+                >
+                  {src.type === "influxdb2" ? "2" : "1"}
+                </div>
+                <div style={S.cardInfo}>
+                  <div style={S.cardTitle}>
+                    InfluxDB {src.type === "influxdb2" ? "2.x" : "1.x"}
+                    <span style={{ ...S.tag, ...S.tagLatest }}>{src.status}</span>
+                  </div>
+                  <div style={S.cardMeta}>
+                    {src.url} &middot; v{src.version}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{ ...S.fieldRow, marginTop: 10 }}>
+          <span style={S.label}>Manual InfluxDB URL</span>
+          <input
+            style={S.input}
+            placeholder="http://192.168.1.100:8086"
+            value={migrationUrl}
+            onChange={(e) => setMigrationUrl(e.target.value)}
+          />
+          <span style={S.hint}>for remote instances</span>
+        </div>
+
+        {migrationSources && migrationSources.length === 0 && !migrationDetecting && (
+          <div style={{ ...S.empty, padding: "16px", textAlign: "left" }}>
+            No InfluxDB found on localhost. Use manual URL above for remote instances.
+          </div>
+        )}
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Compression &amp; Export">
+        <div style={S.fieldRow}>
+          <span style={S.label}>Compression codec</span>
+          <select
+            style={S.select}
+            value={compression}
+            onChange={(e) => setCompression(e.target.value)}
+          >
+            <option value="none">None</option>
+            <option value="lz4">LZ4 (fast)</option>
+            <option value="zstd">ZSTD (smaller)</option>
+          </select>
+        </div>
+
+        {compression === "zstd" && (
+          <div style={S.fieldRow}>
+            <span style={S.label}>ZSTD level</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              min="1"
+              max="22"
+              value={compressionLevel}
+              onChange={(e) => setCompressionLevel(Number(e.target.value))}
+            />
+            <span style={S.hint}>1 (fast) to 22 (smallest)</span>
+          </div>
+        )}
+
+        <div style={S.fieldRow}>
+          <span style={S.label}>From</span>
+          <input
+            style={S.input}
+            type="datetime-local"
+            value={exportFrom}
+            onChange={(e) => setExportFrom(e.target.value)}
+          />
+        </div>
+
+        <div style={S.fieldRow}>
+          <span style={S.label}>To</span>
+          <input
+            style={S.input}
+            type="datetime-local"
+            value={exportTo}
+            onChange={(e) => setExportTo(e.target.value)}
+          />
+        </div>
+
+        <div style={S.fieldRow}>
+          <span style={S.label}>Format</span>
+          <select
+            style={S.select}
+            value={exportFormat}
+            onChange={(e) => setExportFormat(e.target.value)}
+          >
+            <option value="parquet">Parquet</option>
+            <option value="csv">CSV</option>
+          </select>
+        </div>
+
         <button
           style={{
             ...S.btn,
             ...S.btnPrimary,
-            ...(migrationDetecting ? S.btnDisabled : {}),
+            ...(exporting ? S.btnDisabled : {}),
           }}
-          onClick={detectMigration}
-          disabled={migrationDetecting}
+          onClick={doExport}
+          disabled={exporting}
         >
-          {migrationDetecting ? "Detecting..." : "Detect InfluxDB"}
+          {exporting ? "Exporting..." : "Export Data"}
         </button>
-        <span style={S.hint}>Checks localhost:8086 for InfluxDB 1.x and 2.x</span>
-      </div>
-
-      {migrationSources && migrationSources.length > 0 && (
-        <div>
-          {migrationSources.map((src, i) => (
-            <div key={i} style={S.migrationItem}>
-              <div
-                style={{
-                  ...S.cardIcon,
-                  width: 36,
-                  height: 36,
-                  fontSize: 16,
-                  background: src.type === "influxdb2" ? "#020a47" : "#22adf6",
-                  color: "#fff",
-                }}
-              >
-                {src.type === "influxdb2" ? "2" : "1"}
-              </div>
-              <div style={S.cardInfo}>
-                <div style={S.cardTitle}>
-                  InfluxDB {src.type === "influxdb2" ? "2.x" : "1.x"}
-                  <span style={{ ...S.tag, ...S.tagLatest }}>{src.status}</span>
-                </div>
-                <div style={S.cardMeta}>
-                  {src.url} &middot; v{src.version}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div style={{ ...S.fieldRow, marginTop: 10 }}>
-        <span style={S.label}>Manual InfluxDB URL</span>
-        <input
-          style={S.input}
-          placeholder="http://192.168.1.100:8086"
-          value={migrationUrl}
-          onChange={(e) => setMigrationUrl(e.target.value)}
-        />
-        <span style={S.hint}>for remote instances</span>
-      </div>
-
-      {migrationSources && migrationSources.length === 0 && !migrationDetecting && (
-        <div style={{ ...S.empty, padding: "16px", textAlign: "left" }}>
-          No InfluxDB found on localhost. Use manual URL above for remote instances.
-        </div>
-      )}
-
-      {/* Export */}
-      <div style={S.sectionTitle}>Compression &amp; Export</div>
-
-      <div style={S.fieldRow}>
-        <span style={S.label}>Compression codec</span>
-        <select
-          style={S.select}
-          value={compression}
-          onChange={(e) => setCompression(e.target.value)}
-        >
-          <option value="none">None</option>
-          <option value="lz4">LZ4 (fast)</option>
-          <option value="zstd">ZSTD (smaller)</option>
-        </select>
-      </div>
-
-      {compression === "zstd" && (
-        <div style={S.fieldRow}>
-          <span style={S.label}>ZSTD level</span>
-          <input
-            style={S.inputSmall}
-            type="number"
-            min="1"
-            max="22"
-            value={compressionLevel}
-            onChange={(e) => setCompressionLevel(Number(e.target.value))}
-          />
-          <span style={S.hint}>1 (fast) to 22 (smallest)</span>
-        </div>
-      )}
-
-      <div style={S.fieldRow}>
-        <span style={S.label}>From</span>
-        <input
-          style={S.input}
-          type="datetime-local"
-          value={exportFrom}
-          onChange={(e) => setExportFrom(e.target.value)}
-        />
-      </div>
-
-      <div style={S.fieldRow}>
-        <span style={S.label}>To</span>
-        <input
-          style={S.input}
-          type="datetime-local"
-          value={exportTo}
-          onChange={(e) => setExportTo(e.target.value)}
-        />
-      </div>
-
-      <div style={S.fieldRow}>
-        <span style={S.label}>Format</span>
-        <select
-          style={S.select}
-          value={exportFormat}
-          onChange={(e) => setExportFormat(e.target.value)}
-        >
-          <option value="parquet">Parquet</option>
-          <option value="csv">CSV</option>
-        </select>
-      </div>
-
-      <button
-        style={{
-          ...S.btn,
-          ...S.btnPrimary,
-          ...(exporting ? S.btnDisabled : {}),
-        }}
-        onClick={doExport}
-        disabled={exporting}
-      >
-        {exporting ? "Exporting..." : "Export Data"}
-      </button>
+      </CollapsibleSection>
 
       {/* Status */}
       {actionStatus && (
