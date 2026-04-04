@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync } from "fs";
 import { IRouter } from "express";
 import { minimatch } from "minimatch";
 import { ILPWriter } from "./ilp-writer";
@@ -32,6 +33,8 @@ interface ContainerManagerApi {
     config: unknown,
     options?: unknown,
   ) => Promise<void>;
+  stop: (name: string) => Promise<void>;
+  remove: (name: string) => Promise<void>;
   getState: (name: string) => Promise<string>;
 }
 
@@ -105,8 +108,26 @@ module.exports = (app: App) => {
 
       app.debug("container runtime ready, starting QuestDB");
       try {
-        app.setPluginStatus("Starting QuestDB container...");
-        await containers.ensureRunning("signalk-questdb", {
+        const containerEnv: Record<string, string> = {
+          QDB_TELEMETRY_ENABLED: "false",
+          QDB_HTTP_ENABLED: "true",
+          QDB_LINE_TCP_ENABLED: "true",
+          ...(config.compression && config.compression !== "none"
+            ? {
+                QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
+                  config.compression === "zstd" ? "ZSTD" : "LZ4",
+                ...(config.compression === "zstd" && config.compressionLevel
+                  ? {
+                      QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
+                        config.compressionLevel,
+                      ),
+                    }
+                  : {}),
+              }
+            : {}),
+        };
+
+        const containerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
           ports: {
@@ -117,26 +138,36 @@ module.exports = (app: App) => {
           volumes: {
             "/var/lib/questdb": app.getDataDirPath(),
           },
-          env: {
-            QDB_TELEMETRY_ENABLED: "false",
-            QDB_HTTP_ENABLED: "true",
-            QDB_LINE_TCP_ENABLED: "true",
-            ...(config.compression && config.compression !== "none"
-              ? {
-                  QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
-                    config.compression === "zstd" ? "ZSTD" : "LZ4",
-                  ...(config.compression === "zstd" && config.compressionLevel
-                    ? {
-                        QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
-                          config.compressionLevel,
-                        ),
-                      }
-                    : {}),
-                }
-              : {}),
-          },
-          restart: "unless-stopped",
+          env: containerEnv,
+          restart: "unless-stopped" as const,
+        };
+
+        // Check if container needs recreation (config/version/compression changed).
+        // Compare against stored hash from last successful start.
+        const configHash = JSON.stringify({
+          tag: containerConfig.tag,
+          ports: containerConfig.ports,
+          env: containerConfig.env,
         });
+        const hashFile = `${app.getDataDirPath()}/container-config-hash`;
+        let lastHash = "";
+        try {
+          lastHash = readFileSync(hashFile, "utf8");
+        } catch {
+          // first run
+        }
+
+        const state = await containers.getState("signalk-questdb");
+        if (state !== "missing" && configHash !== lastHash) {
+          app.setPluginStatus("Recreating QuestDB container (config changed)...");
+          await containers.remove("signalk-questdb");
+        }
+
+        app.setPluginStatus("Starting QuestDB container...");
+        await containers.ensureRunning("signalk-questdb", containerConfig);
+
+        // Store hash for next start comparison
+        writeFileSync(hashFile, configHash);
         app.debug("QuestDB container ready");
       } catch (err) {
         app.debug("ensureRunning failed:", err);
