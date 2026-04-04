@@ -69,8 +69,8 @@ export const ConfigSchema = Type.Object({
     ],
     {
       default: "lz4",
-      title: "Parquet export compression",
-      description: "Compression codec for Parquet exports (lz4 = fast, zstd = smaller)",
+      title: "Compression codec",
+      description: "Used for QuestDB on-disk WAL segments and Parquet exports (lz4 = fast, zstd = smaller)",
     },
   ),
   compressionLevel: Type.Number({

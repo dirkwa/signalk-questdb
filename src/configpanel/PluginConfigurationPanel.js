@@ -544,7 +544,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       )}
 
       {/* Export */}
-      <div style={S.sectionTitle}>Data Export</div>
+      <div style={S.sectionTitle}>Compression &amp; Export</div>
 
       <div style={S.fieldRow}>
         <span style={S.label}>Compression codec</span>

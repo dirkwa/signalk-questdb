@@ -121,6 +121,19 @@ module.exports = (app: App) => {
             QDB_TELEMETRY_ENABLED: "false",
             QDB_HTTP_ENABLED: "true",
             QDB_LINE_TCP_ENABLED: "true",
+            ...(config.compression && config.compression !== "none"
+              ? {
+                  QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
+                    config.compression === "zstd" ? "ZSTD" : "LZ4",
+                  ...(config.compression === "zstd" && config.compressionLevel
+                    ? {
+                        QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
+                          config.compressionLevel,
+                        ),
+                      }
+                    : {}),
+                }
+              : {}),
           },
           restart: "unless-stopped",
         });
