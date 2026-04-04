@@ -26,6 +26,7 @@ interface App {
 }
 
 interface ContainerManagerApi {
+  getRuntime: () => { runtime: string; version: string } | null;
   ensureRunning: (
     name: string,
     config: unknown,
@@ -68,26 +69,28 @@ module.exports = (app: App) => {
   const PLUGIN_ID = "signalk-questdb";
 
   async function asyncStart(config: Config) {
+
     const host = config.questdbHost ?? "127.0.0.1";
     const ilpPort = config.questdbIlpPort ?? 9009;
     const httpPort = config.questdbHttpPort ?? 9000;
 
     if (config.managedContainer !== false) {
       let containers: ContainerManagerApi | undefined;
-      const waitDeadline = Date.now() + 15000;
+      const waitDeadline = Date.now() + 30000;
       while (Date.now() < waitDeadline) {
-        containers = (app as any).containerManager as
+        containers = (globalThis as any).__signalk_containerManager as
           | ContainerManagerApi
           | undefined;
-        if (containers) break;
+        if (containers && containers.getRuntime()) break;
         app.setPluginStatus(
           PLUGIN_ID,
-          "Waiting for signalk-container plugin...",
+          "Waiting for container runtime detection...",
         );
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
 
       if (!containers) {
+        app.debug("containerManager not found after timeout");
         app.setPluginError(
           PLUGIN_ID,
           "signalk-container plugin required for managed mode. Install it or set managedContainer=false.",
@@ -95,6 +98,16 @@ module.exports = (app: App) => {
         return;
       }
 
+      if (!containers.getRuntime()) {
+        app.debug("container runtime not detected after timeout");
+        app.setPluginError(
+          PLUGIN_ID,
+          "No container runtime detected. Check signalk-container plugin.",
+        );
+        return;
+      }
+
+      app.debug("container runtime ready, starting QuestDB");
       try {
         app.setPluginStatus(PLUGIN_ID, "Starting QuestDB container...");
         await containers.ensureRunning("signalk-questdb", {
@@ -115,7 +128,9 @@ module.exports = (app: App) => {
           },
           restart: "unless-stopped",
         });
+        app.debug("QuestDB container ready");
       } catch (err) {
+        app.debug("ensureRunning failed:", err);
         app.setPluginError(
           PLUGIN_ID,
           `Failed to start QuestDB container: ${err instanceof Error ? err.message : String(err)}`,
@@ -124,6 +139,7 @@ module.exports = (app: App) => {
       }
     }
 
+    app.debug("connecting to QuestDB at %s:%d", host, httpPort);
     queryClient = new QueryClient(host, httpPort);
 
     app.setPluginStatus(PLUGIN_ID, "Waiting for QuestDB to become ready...");
@@ -208,6 +224,7 @@ module.exports = (app: App) => {
     start(config: Config) {
       // Server does not await start(), so run async init in a
       // self-contained promise that handles its own errors.
+
       asyncStart(config).catch((err) => {
         app.setPluginError(
           plugin.id,
@@ -254,19 +271,31 @@ module.exports = (app: App) => {
             return;
           }
 
-          const countResult = await queryClient.exec(
-            "SELECT count() as cnt FROM signalk",
-          );
-          const pathResult = await queryClient.exec(
-            "SELECT count(distinct path) as cnt FROM signalk WHERE ts > dateadd('d', -1, now())",
-          );
+          let totalRows = 0;
+          let activePathsToday = 0;
+          try {
+            const countResult = await queryClient.exec(
+              "SELECT count() as cnt FROM signalk",
+            );
+            totalRows =
+              countResult.dataset.length > 0
+                ? (countResult.dataset[0][0] as number)
+                : 0;
+            const pathResult = await queryClient.exec(
+              "SELECT count(distinct path) as cnt FROM signalk WHERE ts > dateadd('d', -1, now())",
+            );
+            activePathsToday =
+              pathResult.dataset.length > 0
+                ? (pathResult.dataset[0][0] as number)
+                : 0;
+          } catch {
+            // tables may not exist yet during startup
+          }
 
           res.json({
             status: "running",
-            totalRows:
-              countResult.dataset.length > 0 ? countResult.dataset[0][0] : 0,
-            activePathsToday:
-              pathResult.dataset.length > 0 ? pathResult.dataset[0][0] : 0,
+            totalRows,
+            activePathsToday,
           });
         } catch (err) {
           res.status(500).json({

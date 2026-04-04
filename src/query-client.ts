@@ -102,7 +102,7 @@ export class QueryClient {
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP ENABLED UPSERT KEYS(ts, path, context)
+        DEDUP UPSERT KEYS(ts, path, context)
     `);
 
     await this.exec(`
@@ -114,7 +114,7 @@ export class QueryClient {
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP ENABLED UPSERT KEYS(ts, path, context)
+        DEDUP UPSERT KEYS(ts, path, context)
     `);
 
     await this.exec(`
@@ -126,7 +126,7 @@ export class QueryClient {
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP ENABLED UPSERT KEYS(ts, context)
+        DEDUP UPSERT KEYS(ts, context)
     `);
   }
 
