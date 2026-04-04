@@ -12,7 +12,8 @@
   },
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && webpack",
+    "build:config": "webpack",
     "watch": "tsc --watch",
     "prettier": "prettier --write .",
     "lint": "eslint --fix",
@@ -32,17 +33,23 @@
     "minimatch": "^10.0.0"
   },
   "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/preset-react": "^7.28.5",
     "@eslint/js": "^10.0.1",
     "@js-temporal/polyfill": "^0.5.0",
     "@signalk/server-api": "latest",
     "@types/express": "^5.0.0",
     "@types/node": "^20.0.0",
+    "babel-loader": "^10.1.1",
     "eslint": "^10.2.0",
     "eslint-config-prettier": "^10.1.8",
     "globals": "^17.4.0",
     "prettier": "^3.8.1",
+    "react": "^19.2.4",
     "typescript": "^5.0.0",
-    "typescript-eslint": "^8.58.0"
+    "typescript-eslint": "^8.58.0",
+    "webpack": "^5.105.4",
+    "webpack-cli": "^7.0.2"
   },
   "peerDependencies": {
     "signalk-container": ">=0.1.0"

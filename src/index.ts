@@ -307,6 +307,90 @@ module.exports = (app: App) => {
         }
       });
 
+      router.get("/api/versions", async (_req, res) => {
+        try {
+          const ghRes = await fetch(
+            "https://api.github.com/repos/questdb/questdb/releases?per_page=10",
+            {
+              headers: { Accept: "application/vnd.github+json" },
+              signal: AbortSignal.timeout(10000),
+            },
+          );
+          if (!ghRes.ok) {
+            res.status(502).json({ error: "Failed to fetch releases" });
+            return;
+          }
+          const releases = (await ghRes.json()) as {
+            tag_name: string;
+            prerelease: boolean;
+            draft: boolean;
+          }[];
+          const versions = releases
+            .filter((r) => !r.draft)
+            .map((r) => ({
+              tag: r.tag_name,
+              prerelease: r.prerelease,
+            }));
+          res.json(versions);
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+
+      router.get("/api/migration/detect", async (_req, res) => {
+        const sources: {
+          type: string;
+          url: string;
+          status: string;
+          version?: string;
+        }[] = [];
+
+        // Detect InfluxDB 1.x
+        try {
+          const r = await fetch("http://localhost:8086/ping", {
+            method: "HEAD",
+            signal: AbortSignal.timeout(3000),
+          });
+          if (r.status === 204) {
+            sources.push({
+              type: "influxdb1",
+              url: "http://localhost:8086",
+              status: "found",
+              version: r.headers.get("X-Influxdb-Version") || "unknown",
+            });
+          }
+        } catch {
+          // not running
+        }
+
+        // Detect InfluxDB 2.x
+        try {
+          const r = await fetch("http://localhost:8086/health", {
+            signal: AbortSignal.timeout(3000),
+          });
+          if (r.ok) {
+            const data = (await r.json()) as {
+              status?: string;
+              version?: string;
+            };
+            if (data.status === "pass") {
+              sources.push({
+                type: "influxdb2",
+                url: "http://localhost:8086",
+                status: "found",
+                version: data.version || "unknown",
+              });
+            }
+          }
+        } catch {
+          // not running
+        }
+
+        res.json({ sources });
+      });
+
       router.get("/api/export", async (req, res) => {
         try {
           if (!queryClient) {
