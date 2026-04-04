@@ -60,6 +60,24 @@ export const ConfigSchema = Type.Object({
     default: 0,
     title: "Retention (days, 0 = keep forever)",
   }),
+
+  compression: Type.Union(
+    [
+      Type.Literal("none"),
+      Type.Literal("lz4"),
+      Type.Literal("zstd"),
+    ],
+    {
+      default: "lz4",
+      title: "Parquet export compression",
+      description: "Compression codec for Parquet exports (lz4 = fast, zstd = smaller)",
+    },
+  ),
+  compressionLevel: Type.Number({
+    default: 3,
+    title: "Compression level",
+    description: "zstd: 1-22 (default 3), lz4: ignored",
+  }),
 });
 
 export type Config = Static<typeof ConfigSchema>;

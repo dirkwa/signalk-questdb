@@ -39,6 +39,7 @@ module.exports = (app: App) => {
   let writer: ILPWriter | null = null;
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
+  let currentConfig: Config | null = null;
   const unsubscribes: (() => void)[] = [];
   const throttleMap = new Map<string, number>();
 
@@ -67,7 +68,7 @@ module.exports = (app: App) => {
   }
 
   async function asyncStart(config: Config) {
-
+    currentConfig = config;
     const host = config.questdbHost ?? "127.0.0.1";
     const ilpPort = config.questdbIlpPort ?? 9009;
     const httpPort = config.questdbHttpPort ?? 9000;
@@ -244,6 +245,7 @@ module.exports = (app: App) => {
 
       throttleMap.clear();
       queryClient = null;
+      currentConfig = null;
     },
 
     registerWithRouter(router: IRouter) {
@@ -430,6 +432,7 @@ module.exports = (app: App) => {
           }
           const from = req.query.from as string;
           const to = req.query.to as string;
+          const format = (req.query.format as string) || "csv";
           if (!from || !to) {
             res.status(400).json({ error: "Missing from/to parameters" });
             return;
@@ -438,14 +441,63 @@ module.exports = (app: App) => {
           const safeFrom = new Date(from).toISOString();
           const safeTo = new Date(to).toISOString();
           const sql = `SELECT ts, path, context, value FROM signalk WHERE ts >= '${safeFrom}' AND ts <= '${safeTo}' ORDER BY ts`;
+          const dateSlug = safeFrom.slice(0, 10);
 
-          const csv = await queryClient.execCsv(sql);
-          res.setHeader("Content-Type", "text/csv");
-          res.setHeader(
-            "Content-Disposition",
-            `attachment; filename="signalk-export-${safeFrom.slice(0, 10)}.csv"`,
-          );
-          res.send(csv);
+          const host = currentConfig?.questdbHost ?? "127.0.0.1";
+          const httpPort = currentConfig?.questdbHttpPort ?? 9000;
+          const expUrl = new URL("/exp", `http://${host}:${httpPort}`);
+          expUrl.searchParams.set("query", sql);
+
+          if (format === "parquet") {
+            expUrl.searchParams.set("fmt", "parquet");
+            const codec = currentConfig?.compression ?? "lz4";
+            if (codec !== "none") {
+              expUrl.searchParams.set(
+                "compression_codec",
+                codec === "lz4" ? "LZ4_RAW" : "ZSTD",
+              );
+              if (codec === "zstd") {
+                expUrl.searchParams.set(
+                  "compression_level",
+                  String(currentConfig?.compressionLevel ?? 3),
+                );
+              }
+            }
+
+            const qdbRes = await fetch(expUrl.toString(), {
+              signal: AbortSignal.timeout(300000),
+            });
+            if (!qdbRes.ok || !qdbRes.body) {
+              const body = await qdbRes.text().catch(() => "");
+              res.status(502).json({ error: `QuestDB export failed: ${body}` });
+              return;
+            }
+
+            res.setHeader("Content-Type", "application/vnd.apache.parquet");
+            res.setHeader(
+              "Content-Disposition",
+              `attachment; filename="signalk-export-${dateSlug}.parquet"`,
+            );
+            // Stream the response through
+            const reader = qdbRes.body.getReader();
+            const pump = async () => {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                res.write(value);
+              }
+              res.end();
+            };
+            await pump();
+          } else {
+            const csv = await queryClient.execCsv(sql);
+            res.setHeader("Content-Type", "text/csv");
+            res.setHeader(
+              "Content-Disposition",
+              `attachment; filename="signalk-export-${dateSlug}.csv"`,
+            );
+            res.send(csv);
+          }
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",

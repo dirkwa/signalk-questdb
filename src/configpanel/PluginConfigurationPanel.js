@@ -176,6 +176,8 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
   const [recordOthers, setRecordOthers] = useState(cfg.recordOthers || false);
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
+  const [compression, setCompression] = useState(cfg.compression || "lz4");
+  const [compressionLevel, setCompressionLevel] = useState(cfg.compressionLevel || 3);
 
   const [versions, setVersions] = useState([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
@@ -242,6 +244,11 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     return () => clearInterval(interval);
   }, [fetchVersions, fetchStatus]);
 
+  const [exportFrom, setExportFrom] = useState("");
+  const [exportTo, setExportTo] = useState("");
+  const [exportFormat, setExportFormat] = useState("parquet");
+  const [exporting, setExporting] = useState(false);
+
   const doSave = () => {
     save({
       questdbHost,
@@ -253,11 +260,47 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       recordSelf,
       recordOthers,
       retentionDays,
+      compression,
+      compressionLevel,
       pathFilter: cfg.pathFilter || { mode: "exclude", paths: [] },
       samplingRates: cfg.samplingRates || {},
     });
     setActionStatus("Saved! Plugin will restart with new configuration.");
     setStatusError(false);
+  };
+
+  const doExport = async () => {
+    if (!exportFrom || !exportTo) {
+      setActionStatus("Set both from and to dates for export.");
+      setStatusError(true);
+      return;
+    }
+    setExporting(true);
+    setActionStatus(`Exporting ${exportFormat.toUpperCase()}...`);
+    setStatusError(false);
+    try {
+      const url = `/plugins/signalk-questdb/api/export?from=${encodeURIComponent(exportFrom)}&to=${encodeURIComponent(exportTo)}&format=${exportFormat}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: res.statusText }));
+        setActionStatus(`Export failed: ${data.error}`);
+        setStatusError(true);
+        setExporting(false);
+        return;
+      }
+      const blob = await res.blob();
+      const ext = exportFormat === "parquet" ? "parquet" : "csv";
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `signalk-export-${exportFrom.slice(0, 10)}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      setActionStatus(`Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB`);
+    } catch (e) {
+      setActionStatus(`Export failed: ${e.message}`);
+      setStatusError(true);
+    }
+    setExporting(false);
   };
 
   const isRunning = dbStatus && dbStatus.status === "running";
@@ -499,6 +542,81 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           No InfluxDB found on localhost. Use manual URL above for remote instances.
         </div>
       )}
+
+      {/* Export */}
+      <div style={S.sectionTitle}>Data Export</div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Compression codec</span>
+        <select
+          style={S.select}
+          value={compression}
+          onChange={(e) => setCompression(e.target.value)}
+        >
+          <option value="none">None</option>
+          <option value="lz4">LZ4 (fast)</option>
+          <option value="zstd">ZSTD (smaller)</option>
+        </select>
+      </div>
+
+      {compression === "zstd" && (
+        <div style={S.fieldRow}>
+          <span style={S.label}>ZSTD level</span>
+          <input
+            style={S.inputSmall}
+            type="number"
+            min="1"
+            max="22"
+            value={compressionLevel}
+            onChange={(e) => setCompressionLevel(Number(e.target.value))}
+          />
+          <span style={S.hint}>1 (fast) to 22 (smallest)</span>
+        </div>
+      )}
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>From</span>
+        <input
+          style={S.input}
+          type="datetime-local"
+          value={exportFrom}
+          onChange={(e) => setExportFrom(e.target.value)}
+        />
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>To</span>
+        <input
+          style={S.input}
+          type="datetime-local"
+          value={exportTo}
+          onChange={(e) => setExportTo(e.target.value)}
+        />
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Format</span>
+        <select
+          style={S.select}
+          value={exportFormat}
+          onChange={(e) => setExportFormat(e.target.value)}
+        >
+          <option value="parquet">Parquet</option>
+          <option value="csv">CSV</option>
+        </select>
+      </div>
+
+      <button
+        style={{
+          ...S.btn,
+          ...S.btnPrimary,
+          ...(exporting ? S.btnDisabled : {}),
+        }}
+        onClick={doExport}
+        disabled={exporting}
+      >
+        {exporting ? "Exporting..." : "Export Data"}
+      </button>
 
       {/* Status */}
       {actionStatus && (
