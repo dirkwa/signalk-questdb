@@ -1,0 +1,117 @@
+# signalk-questdb
+
+QuestDB history provider for Signal K -- a drop-in replacement for signalk-to-influxdb and signalk-to-influxdb2.
+
+Stores all vessel data in QuestDB running as a managed container (via [signalk-container](https://github.com/dirkwa/signalk-container)). Implements both the modern v2 History API and the legacy v1 playback API.
+
+## Features
+
+- **Automatic container management** -- QuestDB runs in Podman/Docker, managed by signalk-container
+- **ILP ingestion** -- writes via InfluxDB Line Protocol over raw TCP (no client library needed)
+- **v2 History API** -- `getValues`, `getPaths`, `getContexts` with all aggregate methods
+- **v1 Legacy API** -- `hasAnyData`, `streamHistory`, `getHistory` for WebSocket playback
+- **Path filtering** -- include/exclude paths with glob patterns
+- **Sampling rates** -- per-path throttling to control write volume
+- **Retention policy** -- automatic partition drop after N days
+- **AIS recording** -- optionally record other vessels
+- **Position tracking** -- separate optimized table for lat/lon
+- **CSV export** -- download historical data via REST endpoint
+- **InfluxDB migration** -- auto-detect InfluxDB 1.x/2.x for data import
+- **Config panel** -- status dashboard, version picker, migration wizard, all in Admin UI
+- **SQL injection protection** -- strict input validation on all query endpoints
+
+## QuestDB Schema
+
+Three tables, all with WAL mode, daily partitioning, and deduplication:
+
+| Table | Purpose | Columns |
+|-------|---------|---------|
+| `signalk` | Numeric values | `ts`, `path` (SYMBOL), `context` (SYMBOL), `value` (DOUBLE) |
+| `signalk_str` | String values | `ts`, `path` (SYMBOL), `context` (SYMBOL), `value_str` (VARCHAR) |
+| `signalk_position` | Positions | `ts`, `context` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE) |
+
+## History API
+
+### v2 (REST -- `/signalk/v2/api/history/`)
+
+Registered via `app.registerHistoryApiProvider()`. Supports all aggregate methods:
+
+| Method | QuestDB mapping |
+|--------|----------------|
+| `average` | `avg(value)` |
+| `min` | `min(value)` |
+| `max` | `max(value)` |
+| `first` | `first(value)` |
+| `last` | `last(value)` |
+| `mid` | `(min + max) / 2` |
+| `sma` | Client-side N-sample moving average |
+| `ema` | Client-side exponential moving average |
+
+Query example:
+```
+GET /signalk/v2/api/history/values?paths=navigation.speedOverGround&duration=PT1H&resolution=60
+```
+
+### v1 (WebSocket playback)
+
+Registered via `app.registerHistoryProvider()`. Supports playback at configurable speed multipliers using chunked reads from QuestDB.
+
+## REST Endpoints
+
+All mounted at `/plugins/signalk-questdb/api/`:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/status` | QuestDB health, row counts, active paths |
+| GET | `/query?sql=...` | Read-only SQL proxy (DDL/DML blocked) |
+| GET | `/paths` | All recorded paths with row counts and time range |
+| GET | `/versions` | QuestDB releases from GitHub (for version picker) |
+| GET | `/migration/detect` | Auto-detect InfluxDB on localhost:8086 |
+| GET | `/export?from=...&to=...` | CSV export of historical data |
+
+## Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| QuestDB version | `latest` | Docker image tag (dropdown shows stable + pre-releases) |
+| Managed container | `true` | Let signalk-container manage QuestDB, or connect to external |
+| QuestDB host | `127.0.0.1` | Host (only used when managed=false) |
+| HTTP port | `9000` | QuestDB REST API port |
+| ILP port | `9009` | InfluxDB Line Protocol write port |
+| PostgreSQL port | `8812` | For Grafana connections |
+| Record own vessel | `true` | Record self context |
+| Record AIS targets | `false` | Record other vessels |
+| Retention (days) | `0` | Auto-delete old partitions (0 = keep forever) |
+
+## Data Storage
+
+QuestDB data is stored at `~/.signalk/plugin-config-data/signalk-questdb/` on the host, mounted into the container at `/var/lib/questdb`. Data survives container restarts and image upgrades.
+
+## Grafana Integration
+
+Connect Grafana to QuestDB via the PostgreSQL data source:
+
+- Host: `localhost:8812`
+- User: `admin`
+- Password: `quest`
+- Database: `qdb`
+
+Example query:
+```sql
+SELECT ts AS time, avg(value) AS sog
+FROM signalk
+WHERE path = 'navigation.speedOverGround'
+  AND context = 'self'
+  AND ts BETWEEN $__timeFrom() AND $__timeTo()
+SAMPLE BY $__interval
+```
+
+## Requirements
+
+- Node.js >= 22
+- [signalk-container](https://github.com/dirkwa/signalk-container) plugin (for managed mode)
+- Signal K server
+
+## License
+
+MIT
