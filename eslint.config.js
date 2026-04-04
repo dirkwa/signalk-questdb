@@ -5,7 +5,7 @@ const prettier = require("eslint-config-prettier/flat");
 const globals = require("globals");
 
 module.exports = defineConfig([
-  globalIgnores(["dist", "public", "node_modules"]),
+  globalIgnores(["dist", "public", "node_modules", "src/configpanel"]),
 
   {
     files: ["**/*.ts"],
@@ -16,10 +16,7 @@ module.exports = defineConfig([
     },
     rules: {
       "@typescript-eslint/no-explicit-any": "off",
-      "@typescript-eslint/no-unused-vars": [
-        "error",
-        { argsIgnorePattern: "^_" },
-      ],
+      "@typescript-eslint/no-unused-vars": "error",
     },
   },
 ]);

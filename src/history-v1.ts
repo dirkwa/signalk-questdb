@@ -79,7 +79,8 @@ export function createHistoryProviderV1(
       on: (event: string, cb: (...args: unknown[]) => void) => void;
     },
     options: HistoryOptions,
-    _onChange: () => void,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    onChange: () => void,
   ): () => void {
     let stopped = false;
     const startTime = validateTimestamp(options.startTime.toISOString());
