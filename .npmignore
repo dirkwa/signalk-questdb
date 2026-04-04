@@ -1,0 +1,6 @@
+src/
+.github/
+*.tsbuildinfo
+.DS_Store
+eslint.config.js
+tsconfig.json

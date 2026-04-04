@@ -1,0 +1,55 @@
+{
+  "name": "signalk-questdb",
+  "version": "0.1.0",
+  "description": "QuestDB history provider for Signal K — replaces signalk-to-influxdb",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-plugin-configurator"
+  ],
+  "signalk": {
+    "displayName": "QuestDB History",
+    "appIcon": "./icon.svg"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prettier": "prettier --write .",
+    "lint": "eslint --fix",
+    "format": "npm run prettier && npm run lint",
+    "ci-lint": "eslint && prettier --check .",
+    "test": "node --test 'dist/test/**/*.test.js'",
+    "build:all": "npm run build && npm test",
+    "prepublishOnly": "npm run build"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dirkwa/signalk-questdb"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0",
+    "minimatch": "^10.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@js-temporal/polyfill": "^0.5.0",
+    "@signalk/server-api": "latest",
+    "@types/express": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "eslint": "^10.2.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.4.0",
+    "prettier": "^3.8.1",
+    "typescript": "^5.0.0",
+    "typescript-eslint": "^8.58.0"
+  },
+  "peerDependencies": {
+    "signalk-container": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "signalk-container": {
+      "optional": true
+    }
+  }
+}
