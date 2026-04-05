@@ -213,6 +213,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [migrationUrl, setMigrationUrl] = useState("");
   const [actionStatus, setActionStatus] = useState("");
   const [statusError, setStatusError] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updating, setUpdating] = useState(false);
 
   const fetchVersions = useCallback(async () => {
     setVersionsLoading(true);
@@ -241,6 +244,43 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     }
     setStatusLoading(false);
   }, []);
+
+  const checkForUpdate = async () => {
+    setCheckingUpdate(true);
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/update/check");
+      if (res.ok) {
+        setUpdateInfo(await res.json());
+      }
+    } catch {
+      // silently fail
+    }
+    setCheckingUpdate(false);
+  };
+
+  const applyUpdate = async () => {
+    setUpdating(true);
+    setActionStatus("Pulling new image and restarting...");
+    setStatusError(false);
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/update/apply", {
+        method: "POST",
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setActionStatus(data.message);
+        setUpdateInfo(null);
+      } else {
+        const data = await res.json().catch(() => ({ error: res.statusText }));
+        setActionStatus(`Update failed: ${data.error}`);
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus(`Update failed: ${e.message}`);
+      setStatusError(true);
+    }
+    setUpdating(false);
+  };
 
   const detectMigration = async () => {
     setMigrationDetecting(true);
@@ -368,6 +408,35 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               <div style={S.statValue}>{formatNumber(dbStatus.activePathsToday)}</div>
               <div style={S.statLabel}>Active Paths Today</div>
             </div>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+            {updateInfo && updateInfo.updateAvailable ? (
+              <>
+                <span style={{ fontSize: 13 }}>
+                  v{updateInfo.currentVersion} &rarr; <strong>v{updateInfo.latestVersion}</strong> available
+                </span>
+                <button
+                  style={{ ...S.btn, ...S.btnPrimary, padding: "4px 12px", fontSize: 12, ...(updating ? S.btnDisabled : {}) }}
+                  onClick={applyUpdate}
+                  disabled={updating}
+                >
+                  {updating ? "Updating..." : "Update QuestDB"}
+                </button>
+              </>
+            ) : updateInfo && !updateInfo.updateAvailable ? (
+              <span style={{ fontSize: 12, color: "#888" }}>
+                v{updateInfo.currentVersion} (up to date)
+              </span>
+            ) : (
+              <button
+                style={{ ...S.btn, padding: "4px 12px", fontSize: 12, background: "#f1f5f9", color: "#475569", border: "1px solid #e2e8f0", ...(checkingUpdate ? S.btnDisabled : {}) }}
+                onClick={checkForUpdate}
+                disabled={checkingUpdate}
+              >
+                {checkingUpdate ? "Checking..." : "Check for updates"}
+              </button>
+            )}
           </div>
         </>
       ) : (

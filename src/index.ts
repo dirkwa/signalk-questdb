@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, unlinkSync, writeFileSync } from "fs";
 import { IRouter } from "express";
 import { minimatch } from "minimatch";
 import { ILPWriter } from "./ilp-writer";
@@ -36,6 +36,10 @@ interface ContainerManagerApi {
   stop: (name: string) => Promise<void>;
   remove: (name: string) => Promise<void>;
   getState: (name: string) => Promise<string>;
+  pullImage: (
+    image: string,
+    onProgress?: (msg: string) => void,
+  ) => Promise<void>;
 }
 
 module.exports = (app: App) => {
@@ -410,6 +414,90 @@ module.exports = (app: App) => {
               prerelease: r.prerelease,
             }));
           res.json(versions);
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+
+      router.get("/api/update/check", async (_req, res) => {
+        try {
+          if (!queryClient) {
+            res.status(503).json({ error: "QuestDB not connected" });
+            return;
+          }
+
+          // Get running QuestDB version via SQL
+          const buildResult = await queryClient.exec("SELECT build()");
+          const buildStr =
+            buildResult.dataset.length > 0
+              ? (buildResult.dataset[0][0] as string)
+              : "";
+          const versionMatch = buildStr.match(/QuestDB\s+([\d.]+)/);
+          const currentVersion = versionMatch ? versionMatch[1] : "unknown";
+
+          // Get latest stable release from GitHub
+          const ghRes = await fetch(
+            "https://api.github.com/repos/questdb/questdb/releases?per_page=5",
+            {
+              headers: { Accept: "application/vnd.github+json" },
+              signal: AbortSignal.timeout(10000),
+            },
+          );
+          let latestVersion = "unknown";
+          if (ghRes.ok) {
+            const releases = (await ghRes.json()) as {
+              tag_name: string;
+              prerelease: boolean;
+              draft: boolean;
+            }[];
+            const stable = releases.find((r) => !r.draft && !r.prerelease);
+            if (stable) latestVersion = stable.tag_name;
+          }
+
+          const updateAvailable =
+            currentVersion !== "unknown" &&
+            latestVersion !== "unknown" &&
+            currentVersion !== latestVersion;
+
+          res.json({ currentVersion, latestVersion, updateAvailable });
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+
+      router.post("/api/update/apply", async (_req, res) => {
+        try {
+          const containers = (globalThis as any).__signalk_containerManager as
+            | ContainerManagerApi
+            | undefined;
+          if (!containers || !containers.getRuntime()) {
+            res.status(503).json({ error: "Container manager not available" });
+            return;
+          }
+
+          const tag = currentConfig?.questdbVersion ?? "latest";
+          app.setPluginStatus("Pulling latest QuestDB image...");
+
+          // Pull latest image
+          await containers.pullImage(`questdb/questdb:${tag}`);
+
+          // Remove current container and clear hash to force recreation
+          await containers.remove("signalk-questdb");
+          const hashFile = `${app.getDataDirPath()}.container-hash`;
+          try {
+            unlinkSync(hashFile);
+          } catch {
+            // doesn't exist
+          }
+
+          res.json({
+            status: "updated",
+            message: "Image pulled, container removed. Plugin will restart.",
+          });
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",
