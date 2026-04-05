@@ -656,11 +656,9 @@ module.exports = (app: App) => {
             host,
           );
           if (!isLocal && !isPrivate) {
-            res
-              .status(400)
-              .json({
-                error: "Only localhost and private network URLs allowed",
-              });
+            res.status(400).json({
+              error: "Only localhost and private network URLs allowed",
+            });
             return;
           }
         } catch {
