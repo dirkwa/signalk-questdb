@@ -130,13 +130,14 @@ module.exports = (app: App) => {
             : {}),
         };
 
+        const bind = config.exposeToContainers ? "0.0.0.0" : "127.0.0.1";
         const containerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
           ports: {
-            "9000/tcp": `127.0.0.1:${httpPort}`,
-            "9009/tcp": `127.0.0.1:${ilpPort}`,
-            "8812/tcp": `127.0.0.1:${config.questdbPgPort ?? 8812}`,
+            "9000/tcp": `${bind}:${httpPort}`,
+            "9009/tcp": `${bind}:${ilpPort}`,
+            "8812/tcp": `${bind}:${config.questdbPgPort ?? 8812}`,
           },
           volumes: {
             "/var/lib/questdb": app.getDataDirPath(),
@@ -545,14 +546,17 @@ module.exports = (app: App) => {
           const httpPort = currentConfig?.questdbHttpPort ?? 9000;
           const ilpPort = currentConfig?.questdbIlpPort ?? 9009;
 
+          const updateBind = currentConfig?.exposeToContainers
+            ? "0.0.0.0"
+            : "127.0.0.1";
           app.setPluginStatus(`Starting QuestDB ${newTag}...`);
           await containers.ensureRunning("signalk-questdb", {
             image: "questdb/questdb",
             tag: newTag,
             ports: {
-              "9000/tcp": `127.0.0.1:${httpPort}`,
-              "9009/tcp": `127.0.0.1:${ilpPort}`,
-              "8812/tcp": `127.0.0.1:${currentConfig?.questdbPgPort ?? 8812}`,
+              "9000/tcp": `${updateBind}:${httpPort}`,
+              "9009/tcp": `${updateBind}:${ilpPort}`,
+              "8812/tcp": `${updateBind}:${currentConfig?.questdbPgPort ?? 8812}`,
             },
             volumes: {
               "/var/lib/questdb": app.getDataDirPath(),
@@ -569,9 +573,9 @@ module.exports = (app: App) => {
           const newHash = JSON.stringify({
             tag: newTag,
             ports: {
-              "9000/tcp": `127.0.0.1:${httpPort}`,
-              "9009/tcp": `127.0.0.1:${ilpPort}`,
-              "8812/tcp": `127.0.0.1:${currentConfig?.questdbPgPort ?? 8812}`,
+              "9000/tcp": `${updateBind}:${httpPort}`,
+              "9009/tcp": `${updateBind}:${ilpPort}`,
+              "8812/tcp": `${updateBind}:${currentConfig?.questdbPgPort ?? 8812}`,
             },
             env: {
               QDB_TELEMETRY_ENABLED: "false",

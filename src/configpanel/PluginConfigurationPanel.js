@@ -221,6 +221,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [compressionLevel, setCompressionLevel] = useState(
     cfg.compressionLevel || 3,
   );
+  const [exposeToContainers, setExposeToContainers] = useState(
+    cfg.exposeToContainers || false,
+  );
 
   const [versions, setVersions] = useState([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
@@ -358,6 +361,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       retentionDays,
       compression,
       compressionLevel,
+      exposeToContainers,
       pathFilter: cfg.pathFilter || { mode: "exclude", paths: [] },
       samplingRates: cfg.samplingRates || {},
     });
@@ -611,6 +615,19 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           onChange={(e) => setQuestdbPgPort(Number(e.target.value))}
         />
         <span style={S.hint}>for Grafana</span>
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Expose to other containers</span>
+        <input
+          type="checkbox"
+          style={S.checkbox}
+          checked={exposeToContainers}
+          onChange={(e) => setExposeToContainers(e.target.checked)}
+        />
+        <span style={S.hint}>
+          bind 0.0.0.0 so Grafana in Docker can connect
+        </span>
       </div>
 
       {/* Recording */}

@@ -61,6 +61,13 @@ export const ConfigSchema = Type.Object({
     title: "Retention (days, 0 = keep forever)",
   }),
 
+  exposeToContainers: Type.Boolean({
+    default: false,
+    title: "Expose ports to other containers",
+    description:
+      "Bind to 0.0.0.0 instead of 127.0.0.1 so Grafana or other containers running in Docker/Podman can connect",
+  }),
+
   compression: Type.Union(
     [Type.Literal("none"), Type.Literal("lz4"), Type.Literal("zstd")],
     {
