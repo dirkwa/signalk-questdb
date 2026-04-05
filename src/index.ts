@@ -510,16 +510,11 @@ module.exports = (app: App) => {
           app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
           await containers.pullImage(`questdb/questdb:${newTag}`);
 
-          // Remove current container and clear hash to force recreation
+          // Stop and remove old container
+          app.setPluginStatus("Replacing container...");
           await containers.remove("signalk-questdb");
-          const hashFile = `${app.getDataDirPath()}.container-hash`;
-          try {
-            unlinkSync(hashFile);
-          } catch {
-            // doesn't exist
-          }
 
-          // Update the config to the new version so recreation uses it
+          // Update config and persist
           if (currentConfig) {
             currentConfig.questdbVersion = newTag;
             await new Promise<void>((resolve, reject) => {
@@ -530,9 +525,70 @@ module.exports = (app: App) => {
             });
           }
 
+          // Clear hash and recreate container with new image
+          const hashFile = `${app.getDataDirPath()}.container-hash`;
+          try {
+            unlinkSync(hashFile);
+          } catch {
+            // doesn't exist
+          }
+
+          const host = currentConfig?.questdbHost ?? "127.0.0.1";
+          const httpPort = currentConfig?.questdbHttpPort ?? 9000;
+          const ilpPort = currentConfig?.questdbIlpPort ?? 9009;
+
+          app.setPluginStatus(`Starting QuestDB ${newTag}...`);
+          await containers.ensureRunning("signalk-questdb", {
+            image: "questdb/questdb",
+            tag: newTag,
+            ports: {
+              "9000/tcp": `127.0.0.1:${httpPort}`,
+              "9009/tcp": `127.0.0.1:${ilpPort}`,
+              "8812/tcp": `127.0.0.1:${currentConfig?.questdbPgPort ?? 8812}`,
+            },
+            volumes: {
+              "/var/lib/questdb": app.getDataDirPath(),
+            },
+            env: {
+              QDB_TELEMETRY_ENABLED: "false",
+              QDB_HTTP_ENABLED: "true",
+              QDB_LINE_TCP_ENABLED: "true",
+            },
+            restart: "unless-stopped",
+          });
+
+          // Write new hash
+          const newHash = JSON.stringify({
+            tag: newTag,
+            ports: {
+              "9000/tcp": `127.0.0.1:${httpPort}`,
+              "9009/tcp": `127.0.0.1:${ilpPort}`,
+              "8812/tcp": `127.0.0.1:${currentConfig?.questdbPgPort ?? 8812}`,
+            },
+            env: { QDB_TELEMETRY_ENABLED: "false", QDB_HTTP_ENABLED: "true", QDB_LINE_TCP_ENABLED: "true" },
+          });
+          writeFileSync(hashFile, newHash);
+
+          // Reconnect ILP and query client
+          if (queryClient) {
+            const deadline = Date.now() + 30000;
+            while (Date.now() < deadline) {
+              if (await queryClient.isHealthy()) break;
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+          }
+          if (writer) {
+            try { await writer.disconnect(); } catch { /* ignore */ }
+            await writer.connect();
+          }
+
+          app.setPluginStatus(
+            `Recording to QuestDB ${newTag} at ${host}:${ilpPort}`,
+          );
+
           res.json({
             status: "updated",
-            message: `Updated to QuestDB ${newTag}. Restart plugin to apply.`,
+            message: `Updated to QuestDB ${newTag}. Container running.`,
           });
         } catch (err) {
           res.status(500).json({
