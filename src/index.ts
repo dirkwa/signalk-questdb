@@ -588,6 +588,7 @@ module.exports = (app: App) => {
 
           res.json({
             status: "updated",
+            newVersion: newTag,
             message: `Updated to QuestDB ${newTag}. Container running.`,
           });
         } catch (err) {

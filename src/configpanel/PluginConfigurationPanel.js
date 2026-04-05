@@ -270,6 +270,10 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         const data = await res.json();
         setActionStatus(data.message);
         setUpdateInfo(null);
+        if (data.newVersion) {
+          setQuestdbVersion(data.newVersion);
+        }
+        fetchStatus();
       } else {
         const data = await res.json().catch(() => ({ error: res.statusText }));
         setActionStatus(`Update failed: ${data.error}`);
