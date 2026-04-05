@@ -172,7 +172,13 @@ function CollapsibleSection({ title, children }) {
         }}
         onClick={() => setOpen(!open)}
       >
-        <span style={{ fontSize: 10, transition: "transform 0.15s", transform: open ? "rotate(90deg)" : "rotate(0deg)" }}>
+        <span
+          style={{
+            fontSize: 10,
+            transition: "transform 0.15s",
+            transform: open ? "rotate(90deg)" : "rotate(0deg)",
+          }}
+        >
           {"\u25b6"}
         </span>
         {title}
@@ -192,17 +198,29 @@ function formatNumber(n) {
 export default function PluginConfigurationPanel({ configuration, save }) {
   const cfg = configuration || {};
 
-  const [questdbHost, setQuestdbHost] = useState(cfg.questdbHost || "127.0.0.1");
-  const [questdbIlpPort, setQuestdbIlpPort] = useState(cfg.questdbIlpPort || 9009);
-  const [questdbHttpPort, setQuestdbHttpPort] = useState(cfg.questdbHttpPort || 9000);
+  const [questdbHost, setQuestdbHost] = useState(
+    cfg.questdbHost || "127.0.0.1",
+  );
+  const [questdbIlpPort, setQuestdbIlpPort] = useState(
+    cfg.questdbIlpPort || 9009,
+  );
+  const [questdbHttpPort, setQuestdbHttpPort] = useState(
+    cfg.questdbHttpPort || 9000,
+  );
   const [questdbPgPort, setQuestdbPgPort] = useState(cfg.questdbPgPort || 8812);
-  const [questdbVersion, setQuestdbVersion] = useState(cfg.questdbVersion || "latest");
-  const [managedContainer, setManagedContainer] = useState(cfg.managedContainer !== false);
+  const [questdbVersion, setQuestdbVersion] = useState(
+    cfg.questdbVersion || "latest",
+  );
+  const [managedContainer, setManagedContainer] = useState(
+    cfg.managedContainer !== false,
+  );
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
   const [recordOthers, setRecordOthers] = useState(cfg.recordOthers || false);
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
   const [compression, setCompression] = useState(cfg.compression || "lz4");
-  const [compressionLevel, setCompressionLevel] = useState(cfg.compressionLevel || 3);
+  const [compressionLevel, setCompressionLevel] = useState(
+    cfg.compressionLevel || 3,
+  );
 
   const [versions, setVersions] = useState([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
@@ -290,8 +308,12 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     setMigrationDetecting(true);
     setActionStatus("");
     try {
-      const params = migrationUrl ? `?url=${encodeURIComponent(migrationUrl)}` : "";
-      const res = await fetch(`/plugins/signalk-questdb/api/migration/detect${params}`);
+      const params = migrationUrl
+        ? `?url=${encodeURIComponent(migrationUrl)}`
+        : "";
+      const res = await fetch(
+        `/plugins/signalk-questdb/api/migration/detect${params}`,
+      );
       if (res.ok) {
         const data = await res.json();
         setMigrationSources(data.sources);
@@ -299,7 +321,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           setActionStatus(
             migrationUrl
               ? `No InfluxDB found at ${migrationUrl}.`
-              : "No InfluxDB instances detected on localhost:8086."
+              : "No InfluxDB instances detected on localhost:8086.",
           );
           setStatusError(false);
         }
@@ -393,14 +415,21 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       ) : isRunning ? (
         <>
           <div style={S.card}>
-            <div style={{ ...S.cardIcon, background: "#7c3aed", color: "#fff" }}>Q</div>
+            <div
+              style={{ ...S.cardIcon, background: "#7c3aed", color: "#fff" }}
+            >
+              Q
+            </div>
             <div style={S.cardInfo}>
               <div style={S.cardTitle}>QuestDB</div>
               <div style={S.cardMeta}>
                 {questdbHost}:{questdbHttpPort} &middot; Recording
               </div>
             </div>
-            <div style={{ ...S.stateIndicator, background: "#10b981" }} title="Running" />
+            <div
+              style={{ ...S.stateIndicator, background: "#10b981" }}
+              title="Running"
+            />
           </div>
 
           <div style={S.statsGrid}>
@@ -409,19 +438,35 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               <div style={S.statLabel}>Total Rows</div>
             </div>
             <div style={S.statCard}>
-              <div style={S.statValue}>{formatNumber(dbStatus.activePathsToday)}</div>
+              <div style={S.statValue}>
+                {formatNumber(dbStatus.activePathsToday)}
+              </div>
               <div style={S.statLabel}>Active Paths Today</div>
             </div>
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              marginBottom: 12,
+            }}
+          >
             {updateInfo && updateInfo.updateAvailable ? (
               <>
                 <span style={{ fontSize: 13 }}>
-                  v{updateInfo.currentVersion} &rarr; <strong>v{updateInfo.latestVersion}</strong> available
+                  v{updateInfo.currentVersion} &rarr;{" "}
+                  <strong>v{updateInfo.latestVersion}</strong> available
                 </span>
                 <button
-                  style={{ ...S.btn, ...S.btnPrimary, padding: "4px 12px", fontSize: 12, ...(updating ? S.btnDisabled : {}) }}
+                  style={{
+                    ...S.btn,
+                    ...S.btnPrimary,
+                    padding: "4px 12px",
+                    fontSize: 12,
+                    ...(updating ? S.btnDisabled : {}),
+                  }}
                   onClick={applyUpdate}
                   disabled={updating}
                 >
@@ -434,7 +479,15 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               </span>
             ) : (
               <button
-                style={{ ...S.btn, padding: "4px 12px", fontSize: 12, background: "#f1f5f9", color: "#475569", border: "1px solid #e2e8f0", ...(checkingUpdate ? S.btnDisabled : {}) }}
+                style={{
+                  ...S.btn,
+                  padding: "4px 12px",
+                  fontSize: 12,
+                  background: "#f1f5f9",
+                  color: "#475569",
+                  border: "1px solid #e2e8f0",
+                  ...(checkingUpdate ? S.btnDisabled : {}),
+                }}
                 onClick={checkForUpdate}
                 disabled={checkingUpdate}
               >
@@ -445,11 +498,17 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         </>
       ) : (
         <div style={S.card}>
-          <div style={{ ...S.cardIcon, background: "#fef2f2", color: "#ef4444" }}>Q</div>
+          <div
+            style={{ ...S.cardIcon, background: "#fef2f2", color: "#ef4444" }}
+          >
+            Q
+          </div>
           <div style={S.cardInfo}>
             <div style={S.cardTitle}>QuestDB</div>
             <div style={S.cardMeta}>
-              {dbStatus?.status === "unhealthy" ? "Not responding" : "Not running"}
+              {dbStatus?.status === "unhealthy"
+                ? "Not responding"
+                : "Not running"}
               {managedContainer ? " — enable plugin to start container" : ""}
             </div>
           </div>
@@ -482,7 +541,12 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         </select>
         {versionsLoading && <span style={S.hint}>loading releases...</span>}
         <button
-          style={{ ...S.btn, ...S.btnPrimary, padding: "4px 10px", fontSize: 11 }}
+          style={{
+            ...S.btn,
+            ...S.btnPrimary,
+            padding: "4px 10px",
+            fontSize: 11,
+          }}
           onClick={fetchVersions}
         >
           ↻
@@ -501,7 +565,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           onChange={(e) => setManagedContainer(e.target.checked)}
         />
         <span style={S.hint}>
-          {managedContainer ? "signalk-container manages QuestDB" : "Connect to external QuestDB"}
+          {managedContainer
+            ? "signalk-container manages QuestDB"
+            : "Connect to external QuestDB"}
         </span>
       </div>
 
@@ -613,7 +679,14 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       </CollapsibleSection>
 
       <CollapsibleSection title="InfluxDB Migration">
-        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            marginBottom: 10,
+          }}
+        >
           <button
             style={{
               ...S.btn,
@@ -625,7 +698,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           >
             {migrationDetecting ? "Detecting..." : "Detect InfluxDB"}
           </button>
-          <span style={S.hint}>Checks localhost:8086 for InfluxDB 1.x and 2.x</span>
+          <span style={S.hint}>
+            Checks localhost:8086 for InfluxDB 1.x and 2.x
+          </span>
         </div>
 
         {migrationSources && migrationSources.length > 0 && (
@@ -638,7 +713,8 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                     width: 36,
                     height: 36,
                     fontSize: 16,
-                    background: src.type === "influxdb2" ? "#020a47" : "#22adf6",
+                    background:
+                      src.type === "influxdb2" ? "#020a47" : "#22adf6",
                     color: "#fff",
                   }}
                 >
@@ -647,7 +723,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                 <div style={S.cardInfo}>
                   <div style={S.cardTitle}>
                     InfluxDB {src.type === "influxdb2" ? "2.x" : "1.x"}
-                    <span style={{ ...S.tag, ...S.tagLatest }}>{src.status}</span>
+                    <span style={{ ...S.tag, ...S.tagLatest }}>
+                      {src.status}
+                    </span>
                   </div>
                   <div style={S.cardMeta}>
                     {src.url} &middot; v{src.version}
@@ -669,11 +747,14 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           <span style={S.hint}>for remote instances</span>
         </div>
 
-        {migrationSources && migrationSources.length === 0 && !migrationDetecting && (
-          <div style={{ ...S.empty, padding: "16px", textAlign: "left" }}>
-            No InfluxDB found on localhost. Use manual URL above for remote instances.
-          </div>
-        )}
+        {migrationSources &&
+          migrationSources.length === 0 &&
+          !migrationDetecting && (
+            <div style={{ ...S.empty, padding: "16px", textAlign: "left" }}>
+              No InfluxDB found on localhost. Use manual URL above for remote
+              instances.
+            </div>
+          )}
       </CollapsibleSection>
 
       <CollapsibleSection title="Data Export">

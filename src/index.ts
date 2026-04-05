@@ -23,10 +23,7 @@ interface App {
   registerHistoryProvider: (provider: unknown) => void;
   registerHistoryApiProvider: (provider: unknown) => void;
   getDataDirPath: () => string;
-  savePluginOptions: (
-    config: unknown,
-    cb: (err?: Error) => void,
-  ) => void;
+  savePluginOptions: (config: unknown, cb: (err?: Error) => void) => void;
   [key: string]: unknown;
 }
 
@@ -92,9 +89,7 @@ module.exports = (app: App) => {
           | ContainerManagerApi
           | undefined;
         if (containers && containers.getRuntime()) break;
-        app.setPluginStatus(
-          "Waiting for container runtime detection...",
-        );
+        app.setPluginStatus("Waiting for container runtime detection...");
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
 
@@ -168,7 +163,9 @@ module.exports = (app: App) => {
 
         const state = await containers.getState("signalk-questdb");
         if (state !== "missing" && configHash !== lastHash) {
-          app.setPluginStatus("Recreating QuestDB container (config changed)...");
+          app.setPluginStatus(
+            "Recreating QuestDB container (config changed)...",
+          );
           await containers.remove("signalk-questdb");
         }
 
@@ -198,9 +195,7 @@ module.exports = (app: App) => {
     }
 
     if (!(await queryClient.isHealthy())) {
-      app.setPluginError(
-        `QuestDB not responding at ${host}:${httpPort}`,
-      );
+      app.setPluginError(`QuestDB not responding at ${host}:${httpPort}`);
       return;
     }
 
@@ -256,8 +251,6 @@ module.exports = (app: App) => {
 
     app.setPluginStatus(`Recording to QuestDB at ${host}:${ilpPort}`);
   }
-
-
 
   const plugin = {
     id: "signalk-questdb",
@@ -580,7 +573,11 @@ module.exports = (app: App) => {
               "9009/tcp": `127.0.0.1:${ilpPort}`,
               "8812/tcp": `127.0.0.1:${currentConfig?.questdbPgPort ?? 8812}`,
             },
-            env: { QDB_TELEMETRY_ENABLED: "false", QDB_HTTP_ENABLED: "true", QDB_LINE_TCP_ENABLED: "true" },
+            env: {
+              QDB_TELEMETRY_ENABLED: "false",
+              QDB_HTTP_ENABLED: "true",
+              QDB_LINE_TCP_ENABLED: "true",
+            },
           });
           writeFileSync(hashFile, newHash);
 
@@ -593,7 +590,11 @@ module.exports = (app: App) => {
             }
           }
           if (writer) {
-            try { await writer.disconnect(); } catch { /* ignore */ }
+            try {
+              await writer.disconnect();
+            } catch {
+              /* ignore */
+            }
             await writer.connect();
           }
 
@@ -614,8 +615,7 @@ module.exports = (app: App) => {
       });
 
       router.get("/api/migration/detect", async (req, res) => {
-        const baseUrl =
-          (req.query.url as string) || "http://localhost:8086";
+        const baseUrl = (req.query.url as string) || "http://localhost:8086";
         const sources: {
           type: string;
           url: string;

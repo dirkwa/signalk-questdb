@@ -62,15 +62,12 @@ export const ConfigSchema = Type.Object({
   }),
 
   compression: Type.Union(
-    [
-      Type.Literal("none"),
-      Type.Literal("lz4"),
-      Type.Literal("zstd"),
-    ],
+    [Type.Literal("none"), Type.Literal("lz4"), Type.Literal("zstd")],
     {
       default: "lz4",
       title: "Compression codec",
-      description: "Used for QuestDB on-disk WAL segments and Parquet exports (lz4 = fast, zstd = smaller)",
+      description:
+        "Used for QuestDB on-disk WAL segments and Parquet exports (lz4 = fast, zstd = smaller)",
     },
   ),
   compressionLevel: Type.Number({
