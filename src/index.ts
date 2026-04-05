@@ -522,15 +522,17 @@ module.exports = (app: App) => {
           // Update the config to the new version so recreation uses it
           if (currentConfig) {
             currentConfig.questdbVersion = newTag;
-            app.savePluginOptions(
-              { ...currentConfig },
-              () => {},
-            );
+            await new Promise<void>((resolve, reject) => {
+              app.savePluginOptions({ ...currentConfig! }, (err) => {
+                if (err) reject(err);
+                else resolve();
+              });
+            });
           }
 
           res.json({
             status: "updated",
-            message: `Updated to QuestDB ${newTag}. Plugin will restart.`,
+            message: `Updated to QuestDB ${newTag}. Restart plugin to apply.`,
           });
         } catch (err) {
           res.status(500).json({
