@@ -469,10 +469,21 @@ module.exports = (app: App) => {
             if (stable) latestVersion = stable.tag_name;
           }
 
+          const semverGreater = (a: string, b: string): boolean => {
+            const pa = a.split(".").map(Number);
+            const pb = b.split(".").map(Number);
+            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+              const va = pa[i] ?? 0;
+              const vb = pb[i] ?? 0;
+              if (vb > va) return true;
+              if (vb < va) return false;
+            }
+            return false;
+          };
           const updateAvailable =
             currentVersion !== "unknown" &&
             latestVersion !== "unknown" &&
-            currentVersion !== latestVersion;
+            semverGreater(currentVersion, latestVersion);
 
           res.json({ currentVersion, latestVersion, updateAvailable });
         } catch (err) {
@@ -565,6 +576,21 @@ module.exports = (app: App) => {
               QDB_TELEMETRY_ENABLED: "false",
               QDB_HTTP_ENABLED: "true",
               QDB_LINE_TCP_ENABLED: "true",
+              ...(currentConfig?.compression &&
+              currentConfig.compression !== "none"
+                ? {
+                    QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
+                      currentConfig.compression === "zstd" ? "ZSTD" : "LZ4",
+                    ...(currentConfig.compression === "zstd" &&
+                    currentConfig.compressionLevel
+                      ? {
+                          QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
+                            currentConfig.compressionLevel,
+                          ),
+                        }
+                      : {}),
+                  }
+                : {}),
             },
             restart: "unless-stopped",
           });
@@ -620,6 +646,28 @@ module.exports = (app: App) => {
 
       router.get("/api/migration/detect", async (req, res) => {
         const baseUrl = (req.query.url as string) || "http://localhost:8086";
+
+        try {
+          const urlObj = new URL(baseUrl);
+          const host = urlObj.hostname;
+          const isLocal =
+            host === "localhost" || host === "127.0.0.1" || host === "::1";
+          const isPrivate = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(
+            host,
+          );
+          if (!isLocal && !isPrivate) {
+            res
+              .status(400)
+              .json({
+                error: "Only localhost and private network URLs allowed",
+              });
+            return;
+          }
+        } catch {
+          res.status(400).json({ error: "Invalid URL" });
+          return;
+        }
+
         const sources: {
           type: string;
           url: string;
@@ -735,15 +783,19 @@ module.exports = (app: App) => {
             );
             // Stream the response through
             const reader = qdbRes.body.getReader();
-            const pump = async () => {
+            try {
               while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
-                res.write(value);
+                if (!res.write(value)) {
+                  await new Promise((resolve) => res.once("drain", resolve));
+                }
               }
               res.end();
-            };
-            await pump();
+            } catch (streamErr) {
+              app.debug("export stream error:", streamErr);
+              res.end();
+            }
           } else {
             const csv = await queryClient.execCsv(sql);
             res.setHeader("Content-Type", "text/csv");
