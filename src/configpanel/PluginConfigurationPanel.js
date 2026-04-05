@@ -246,12 +246,17 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     setMigrationDetecting(true);
     setActionStatus("");
     try {
-      const res = await fetch("/plugins/signalk-questdb/api/migration/detect");
+      const params = migrationUrl ? `?url=${encodeURIComponent(migrationUrl)}` : "";
+      const res = await fetch(`/plugins/signalk-questdb/api/migration/detect${params}`);
       if (res.ok) {
         const data = await res.json();
         setMigrationSources(data.sources);
         if (data.sources.length === 0) {
-          setActionStatus("No InfluxDB instances detected on localhost:8086.");
+          setActionStatus(
+            migrationUrl
+              ? `No InfluxDB found at ${migrationUrl}.`
+              : "No InfluxDB instances detected on localhost:8086."
+          );
           setStatusError(false);
         }
       }

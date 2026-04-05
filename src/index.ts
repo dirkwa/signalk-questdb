@@ -417,7 +417,9 @@ module.exports = (app: App) => {
         }
       });
 
-      router.get("/api/migration/detect", async (_req, res) => {
+      router.get("/api/migration/detect", async (req, res) => {
+        const baseUrl =
+          (req.query.url as string) || "http://localhost:8086";
         const sources: {
           type: string;
           url: string;
@@ -427,14 +429,14 @@ module.exports = (app: App) => {
 
         // Detect InfluxDB 1.x
         try {
-          const r = await fetch("http://localhost:8086/ping", {
+          const r = await fetch(`${baseUrl}/ping`, {
             method: "HEAD",
             signal: AbortSignal.timeout(3000),
           });
           if (r.status === 204) {
             sources.push({
               type: "influxdb1",
-              url: "http://localhost:8086",
+              url: baseUrl,
               status: "found",
               version: r.headers.get("X-Influxdb-Version") || "unknown",
             });
@@ -445,7 +447,7 @@ module.exports = (app: App) => {
 
         // Detect InfluxDB 2.x
         try {
-          const r = await fetch("http://localhost:8086/health", {
+          const r = await fetch(`${baseUrl}/health`, {
             signal: AbortSignal.timeout(3000),
           });
           if (r.ok) {
@@ -456,7 +458,7 @@ module.exports = (app: App) => {
             if (data.status === "pass") {
               sources.push({
                 type: "influxdb2",
-                url: "http://localhost:8086",
+                url: baseUrl,
                 status: "found",
                 version: data.version || "unknown",
               });
@@ -483,8 +485,16 @@ module.exports = (app: App) => {
             return;
           }
 
-          const safeFrom = new Date(from).toISOString();
-          const safeTo = new Date(to).toISOString();
+          const fromDate = new Date(from);
+          const toDate = new Date(to);
+          if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+            res
+              .status(400)
+              .json({ error: "Invalid date format for from/to parameters" });
+            return;
+          }
+          const safeFrom = fromDate.toISOString();
+          const safeTo = toDate.toISOString();
           const sql = `SELECT ts, path, context, value FROM signalk WHERE ts >= '${safeFrom}' AND ts <= '${safeTo}' ORDER BY ts`;
           const dateSlug = safeFrom.slice(0, 10);
 
