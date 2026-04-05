@@ -63,9 +63,9 @@ export const ConfigSchema = Type.Object({
 
   exposeToContainers: Type.Boolean({
     default: false,
-    title: "Expose ports to other containers",
+    title: "Bind to 0.0.0.0",
     description:
-      "Bind to 0.0.0.0 instead of 127.0.0.1 so Grafana or other containers running in Docker/Podman can connect",
+      "Caution! This can expose your data to the internet. Only enable if Grafana runs in a separate Docker instance.",
   }),
 
   compression: Type.Union(

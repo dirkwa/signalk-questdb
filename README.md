@@ -91,19 +91,20 @@ All mounted at `/plugins/signalk-questdb/api/`:
 
 ## Configuration
 
-| Setting            | Default     | Description                                                  |
-| ------------------ | ----------- | ------------------------------------------------------------ |
-| QuestDB version    | `latest`    | Docker image tag (dropdown shows stable + pre-releases)      |
-| Managed container  | `true`      | Let signalk-container manage QuestDB, or connect to external |
-| QuestDB host       | `127.0.0.1` | Host (only used when managed=false)                          |
-| HTTP port          | `9000`      | QuestDB REST API port                                        |
-| ILP port           | `9009`      | InfluxDB Line Protocol write port                            |
-| PostgreSQL port    | `8812`      | For Grafana connections                                      |
-| Record own vessel  | `true`      | Record self context                                          |
-| Record AIS targets | `false`     | Record other vessels                                         |
-| Retention (days)   | `0`         | Auto-delete old partitions (0 = keep forever)                |
-| Compression codec  | `lz4`       | On-disk WAL compression: `none`, `lz4`, or `zstd`            |
-| Compression level  | `3`         | ZSTD level 1-22 (only when codec is zstd)                    |
+| Setting            | Default     | Description                                                   |
+| ------------------ | ----------- | ------------------------------------------------------------- |
+| QuestDB version    | `latest`    | Docker image tag (dropdown shows stable + pre-releases)       |
+| Managed container  | `true`      | Let signalk-container manage QuestDB, or connect to external  |
+| QuestDB host       | `127.0.0.1` | Host (only used when managed=false)                           |
+| HTTP port          | `9000`      | QuestDB REST API port                                         |
+| ILP port           | `9009`      | InfluxDB Line Protocol write port                             |
+| PostgreSQL port    | `8812`      | For Grafana connections                                       |
+| Record own vessel  | `true`      | Record self context                                           |
+| Record AIS targets | `false`     | Record other vessels                                          |
+| Retention (days)   | `0`         | Auto-delete old partitions (0 = keep forever)                 |
+| Compression codec  | `lz4`       | On-disk WAL compression: `none`, `lz4`, or `zstd`             |
+| Compression level  | `3`         | ZSTD level 1-22 (only when codec is zstd)                     |
+| Bind to 0.0.0.0    | `false`     | Bind ports to all interfaces instead of localhost (see below) |
 
 ## Data Storage
 
@@ -117,6 +118,12 @@ Connect Grafana to QuestDB via the PostgreSQL data source:
 - User: `admin`
 - Password: `quest`
 - Database: `qdb`
+
+If Grafana runs on the host or in Podman, `localhost:8812` works out of the box.
+
+If Grafana runs in a **separate Docker** container, it cannot reach the host's localhost. In that case, enable **"Bind to 0.0.0.0"** in the QuestDB plugin config and use your machine's LAN IP (e.g. `192.168.0.122:8812`) as the host in Grafana.
+
+**Warning:** Binding to 0.0.0.0 exposes QuestDB's ports to your entire network. Only enable this if necessary, and ensure your firewall is configured appropriately.
 
 Example query:
 

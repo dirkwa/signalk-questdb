@@ -618,15 +618,22 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       </div>
 
       <div style={S.fieldRow}>
-        <span style={S.label}>Expose to other containers</span>
+        <span style={S.label}>Bind to 0.0.0.0</span>
         <input
           type="checkbox"
           style={S.checkbox}
           checked={exposeToContainers}
           onChange={(e) => setExposeToContainers(e.target.checked)}
         />
-        <span style={S.hint}>
-          bind 0.0.0.0 so Grafana in Docker can connect
+        <span
+          style={{
+            ...S.hint,
+            color: exposeToContainers ? "#ef4444" : undefined,
+          }}
+        >
+          {exposeToContainers
+            ? "Caution! This can expose your data to the internet"
+            : "Only needed if Grafana runs in a separate Docker instance"}
         </span>
       </div>
 
