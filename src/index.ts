@@ -298,6 +298,21 @@ module.exports = (app: App) => {
 
       throttleMap.clear();
       queryClient = null;
+
+      // Stop the managed container when plugin is disabled
+      if (currentConfig?.managedContainer !== false) {
+        const containers = (globalThis as any).__signalk_containerManager as
+          | ContainerManagerApi
+          | undefined;
+        if (containers) {
+          try {
+            await containers.stop("signalk-questdb");
+          } catch {
+            // container may already be stopped
+          }
+        }
+      }
+
       currentConfig = null;
     },
 
