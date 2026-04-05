@@ -23,6 +23,10 @@ interface App {
   registerHistoryProvider: (provider: unknown) => void;
   registerHistoryApiProvider: (provider: unknown) => void;
   getDataDirPath: () => string;
+  savePluginOptions: (
+    config: unknown,
+    cb: (err?: Error) => void,
+  ) => void;
   [key: string]: unknown;
 }
 
@@ -479,11 +483,32 @@ module.exports = (app: App) => {
             return;
           }
 
-          const tag = currentConfig?.questdbVersion ?? "latest";
-          app.setPluginStatus("Pulling latest QuestDB image...");
+          // Get latest stable version from GitHub
+          const ghRes = await fetch(
+            "https://api.github.com/repos/questdb/questdb/releases?per_page=5",
+            {
+              headers: { Accept: "application/vnd.github+json" },
+              signal: AbortSignal.timeout(10000),
+            },
+          );
+          if (!ghRes.ok) {
+            res.status(502).json({ error: "Failed to fetch releases" });
+            return;
+          }
+          const releases = (await ghRes.json()) as {
+            tag_name: string;
+            prerelease: boolean;
+            draft: boolean;
+          }[];
+          const stable = releases.find((r) => !r.draft && !r.prerelease);
+          if (!stable) {
+            res.status(404).json({ error: "No stable release found" });
+            return;
+          }
+          const newTag = stable.tag_name;
 
-          // Pull latest image
-          await containers.pullImage(`questdb/questdb:${tag}`);
+          app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
+          await containers.pullImage(`questdb/questdb:${newTag}`);
 
           // Remove current container and clear hash to force recreation
           await containers.remove("signalk-questdb");
@@ -494,9 +519,18 @@ module.exports = (app: App) => {
             // doesn't exist
           }
 
+          // Update the config to the new version so recreation uses it
+          if (currentConfig) {
+            currentConfig.questdbVersion = newTag;
+            app.savePluginOptions(
+              { ...currentConfig },
+              () => {},
+            );
+          }
+
           res.json({
             status: "updated",
-            message: "Image pulled, container removed. Plugin will restart.",
+            message: `Updated to QuestDB ${newTag}. Plugin will restart.`,
           });
         } catch (err) {
           res.status(500).json({
