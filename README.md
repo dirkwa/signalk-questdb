@@ -99,6 +99,7 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | HTTP port          | `9000`       | QuestDB REST API port                                         |
 | ILP port           | `9009`       | InfluxDB Line Protocol write port                             |
 | PostgreSQL port    | `8812`       | For Grafana connections                                       |
+| Sampling rate (ms) | `1000`       | Default min ms between writes per path (0 = every update)     |
 | Record own vessel  | `true`       | Record self context                                           |
 | Record AIS targets | `false`      | Record other vessels                                          |
 | Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                 |
@@ -106,6 +107,15 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | Compression level  | `3`          | ZSTD level 1-22 (only when codec is zstd)                     |
 | Container network  | `sk-network` | Shared Podman/Docker network for Grafana integration          |
 | Bind to 0.0.0.0    | `false`      | Bind ports to all interfaces instead of localhost (see below) |
+
+## Performance (Pi / Low-Power Devices)
+
+The plugin is optimized for Raspberry Pi and similar low-power devices:
+
+- **Default sampling rate** of 1000ms limits each path to 1 write/sec, reducing total writes from ~500/s to ~238/s on a typical NMEA 2000 bus
+- **QuestDB worker threads** reduced to 1 each (WAL, shared, ILP) to minimize CPU usage
+- **ILP batching** at 500ms intervals with 1000-row batches reduces TCP overhead
+- Per-path overrides allow faster rates for critical paths (e.g. `{ "environment.wind.*": 200 }`) while keeping slow-changing paths throttled
 
 ## History API Provider
 
