@@ -221,7 +221,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [compressionLevel, setCompressionLevel] = useState(
     cfg.compressionLevel || 3,
   );
-  const [networkName, setNetworkName] = useState(cfg.networkName || "");
+  const [networkName, setNetworkName] = useState(
+    cfg.networkName || "sk-network",
+  );
   const [exposeToContainers, setExposeToContainers] = useState(
     cfg.exposeToContainers || false,
   );
@@ -623,11 +625,10 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         <span style={S.label}>Container network</span>
         <input
           style={S.input}
-          placeholder="e.g. sk-network (empty = default)"
           value={networkName}
           onChange={(e) => setNetworkName(e.target.value)}
         />
-        <span style={S.hint}>set to sk-network if using signalk-grafana</span>
+        <span style={S.hint}>shared with signalk-grafana</span>
       </div>
 
       <div style={S.fieldRow}>

@@ -62,10 +62,10 @@ export const ConfigSchema = Type.Object({
   }),
 
   networkName: Type.String({
-    default: "",
+    default: "sk-network",
     title: "Container network",
     description:
-      "Join a shared Podman/Docker network (e.g. sk-network) so Grafana can connect via container DNS. Leave empty for default networking.",
+      "Shared Podman/Docker network so Grafana can connect via container DNS",
   }),
 
   exposeToContainers: Type.Boolean({
