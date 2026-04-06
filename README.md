@@ -91,20 +91,25 @@ All mounted at `/plugins/signalk-questdb/api/`:
 
 ## Configuration
 
-| Setting            | Default     | Description                                                   |
-| ------------------ | ----------- | ------------------------------------------------------------- |
-| QuestDB version    | `latest`    | Docker image tag (dropdown shows stable + pre-releases)       |
-| Managed container  | `true`      | Let signalk-container manage QuestDB, or connect to external  |
-| QuestDB host       | `127.0.0.1` | Host (only used when managed=false)                           |
-| HTTP port          | `9000`      | QuestDB REST API port                                         |
-| ILP port           | `9009`      | InfluxDB Line Protocol write port                             |
-| PostgreSQL port    | `8812`      | For Grafana connections                                       |
-| Record own vessel  | `true`      | Record self context                                           |
-| Record AIS targets | `false`     | Record other vessels                                          |
-| Retention (days)   | `0`         | Auto-delete old partitions (0 = keep forever)                 |
-| Compression codec  | `lz4`       | On-disk WAL compression: `none`, `lz4`, or `zstd`             |
-| Compression level  | `3`         | ZSTD level 1-22 (only when codec is zstd)                     |
-| Bind to 0.0.0.0    | `false`     | Bind ports to all interfaces instead of localhost (see below) |
+| Setting            | Default      | Description                                                   |
+| ------------------ | ------------ | ------------------------------------------------------------- |
+| QuestDB version    | `latest`     | Docker image tag (dropdown shows stable + pre-releases)       |
+| Managed container  | `true`       | Let signalk-container manage QuestDB, or connect to external  |
+| QuestDB host       | `127.0.0.1`  | Host (only used when managed=false)                           |
+| HTTP port          | `9000`       | QuestDB REST API port                                         |
+| ILP port           | `9009`       | InfluxDB Line Protocol write port                             |
+| PostgreSQL port    | `8812`       | For Grafana connections                                       |
+| Record own vessel  | `true`       | Record self context                                           |
+| Record AIS targets | `false`      | Record other vessels                                          |
+| Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                 |
+| Compression codec  | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`             |
+| Compression level  | `3`          | ZSTD level 1-22 (only when codec is zstd)                     |
+| Container network  | `sk-network` | Shared Podman/Docker network for Grafana integration          |
+| Bind to 0.0.0.0    | `false`      | Bind ports to all interfaces instead of localhost (see below) |
+
+## History API Provider
+
+QuestDB automatically registers as the **default** Signal K v2 History API provider. Any app or Grafana plugin that queries `/signalk/v2/api/history/` uses QuestDB.
 
 ## Data Storage
 

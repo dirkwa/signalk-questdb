@@ -617,7 +617,7 @@ module.exports = (app: App) => {
             restart: "unless-stopped",
           });
 
-          // Write new hash
+          // Write new hash (must match startup hash structure)
           const newHash = JSON.stringify({
             tag: newTag,
             ports: {
@@ -629,7 +629,23 @@ module.exports = (app: App) => {
               QDB_TELEMETRY_ENABLED: "false",
               QDB_HTTP_ENABLED: "true",
               QDB_LINE_TCP_ENABLED: "true",
+              ...(currentConfig?.compression &&
+              currentConfig.compression !== "none"
+                ? {
+                    QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
+                      currentConfig.compression === "zstd" ? "ZSTD" : "LZ4",
+                    ...(currentConfig.compression === "zstd" &&
+                    currentConfig.compressionLevel
+                      ? {
+                          QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
+                            currentConfig.compressionLevel,
+                          ),
+                        }
+                      : {}),
+                  }
+                : {}),
             },
+            networkMode: currentConfig?.networkName,
           });
           writeFileSync(hashFile, newHash);
 
