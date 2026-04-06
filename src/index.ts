@@ -284,7 +284,12 @@ module.exports = (app: App) => {
         writer.write(path, ctx, value, ts);
       } else if (typeof value === "string") {
         writer.writeString(path, ctx, value, ts);
-      } else if (value && typeof value === "object" && "latitude" in value) {
+      } else if (
+        value &&
+        typeof value === "object" &&
+        "latitude" in value &&
+        "longitude" in value
+      ) {
         writer.writePosition(path, ctx, value, ts);
       }
     });
