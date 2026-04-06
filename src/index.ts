@@ -37,6 +37,7 @@ interface ContainerManagerApi {
   stop: (name: string) => Promise<void>;
   remove: (name: string) => Promise<void>;
   getState: (name: string) => Promise<string>;
+  ensureNetwork: (name: string) => Promise<void>;
   pullImage: (
     image: string,
     onProgress?: (msg: string) => void,
@@ -131,7 +132,7 @@ module.exports = (app: App) => {
         };
 
         const bind = config.exposeToContainers ? "0.0.0.0" : "127.0.0.1";
-        const containerConfig = {
+        const containerConfig: Record<string, unknown> = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
           ports: {
@@ -143,8 +144,13 @@ module.exports = (app: App) => {
             "/var/lib/questdb": app.getDataDirPath(),
           },
           env: containerEnv,
-          restart: "unless-stopped" as const,
+          restart: "unless-stopped",
         };
+
+        if (config.networkName) {
+          await containers.ensureNetwork(config.networkName);
+          containerConfig.networkMode = config.networkName;
+        }
 
         // Check if container needs recreation (config/version/compression changed).
         // Compare against stored hash from last successful start.
@@ -152,6 +158,7 @@ module.exports = (app: App) => {
           tag: containerConfig.tag,
           ports: containerConfig.ports,
           env: containerConfig.env,
+          networkMode: containerConfig.networkMode,
         });
         // Store hash next to plugin config JSON, not in the QuestDB data volume
         const hashFile = `${app.getDataDirPath()}.container-hash`;

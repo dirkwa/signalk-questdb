@@ -61,6 +61,13 @@ export const ConfigSchema = Type.Object({
     title: "Retention (days, 0 = keep forever)",
   }),
 
+  networkName: Type.String({
+    default: "",
+    title: "Container network",
+    description:
+      "Join a shared Podman/Docker network (e.g. sk-network) so Grafana can connect via container DNS. Leave empty for default networking.",
+  }),
+
   exposeToContainers: Type.Boolean({
     default: false,
     title: "Bind to 0.0.0.0",
