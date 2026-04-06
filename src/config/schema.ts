@@ -40,11 +40,18 @@ export const ConfigSchema = Type.Object({
     }),
   }),
 
+  defaultSamplingRate: Type.Number({
+    default: 1000,
+    title: "Default sampling rate (ms)",
+    description:
+      "Minimum ms between writes for any path (0 = write every update). 1000ms recommended for Pi/low-power devices.",
+  }),
+
   samplingRates: Type.Record(Type.String(), Type.Number(), {
     default: {},
     title: "Per-path sampling rates (ms)",
     description:
-      'Minimum ms between writes per path. e.g. { "environment.wind.*": 1000 }',
+      'Override default rate for specific paths. e.g. { "environment.wind.*": 200, "tanks.*": 10000 }',
   }),
 
   recordSelf: Type.Boolean({

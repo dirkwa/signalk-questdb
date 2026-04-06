@@ -62,8 +62,14 @@ module.exports = (app: App) => {
     return filter.mode === "exclude" ? !matches : matches;
   }
 
-  function isThrottled(path: string, rates: Record<string, number>): boolean {
+  function isThrottled(
+    path: string,
+    rates: Record<string, number>,
+    defaultRate: number,
+  ): boolean {
     const now = Date.now();
+
+    // Check per-path overrides first
     for (const [pattern, minMs] of Object.entries(rates)) {
       if (minMs <= 0) continue;
       if (!minimatch(path, pattern)) continue;
@@ -73,6 +79,14 @@ module.exports = (app: App) => {
       throttleMap.set(path, now);
       return false;
     }
+
+    // Apply default rate
+    if (defaultRate > 0) {
+      const lastWrite = throttleMap.get(path) ?? 0;
+      if (now - lastWrite < defaultRate) return true;
+      throttleMap.set(path, now);
+    }
+
     return false;
   }
 
@@ -116,6 +130,11 @@ module.exports = (app: App) => {
           QDB_TELEMETRY_ENABLED: "false",
           QDB_HTTP_ENABLED: "true",
           QDB_LINE_TCP_ENABLED: "true",
+          // Reduce CPU usage on low-power devices (Pi, Cerbo)
+          QDB_CAIRO_WAL_APPLY_WORKER_COUNT: "1",
+          QDB_SHARED_WORKER_COUNT: "1",
+          QDB_LINE_TCP_WRITER_WORKER_COUNT: "1",
+          QDB_CAIRO_O3_COLUMN_MEMORY_SIZE: "262144",
           ...(config.compression && config.compression !== "none"
             ? {
                 QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
@@ -249,7 +268,14 @@ module.exports = (app: App) => {
       if (!isSelf && !config.recordOthers) return;
 
       if (!shouldRecord(path, config.pathFilter)) return;
-      if (isThrottled(path, config.samplingRates)) return;
+      if (
+        isThrottled(
+          path,
+          config.samplingRates,
+          config.defaultSamplingRate ?? 1000,
+        )
+      )
+        return;
 
       const ts = timestamp ? new Date(timestamp) : new Date();
       const ctx = isSelf ? "self" : context;

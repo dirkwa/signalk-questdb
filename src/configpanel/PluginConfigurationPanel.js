@@ -216,6 +216,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   );
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
   const [recordOthers, setRecordOthers] = useState(cfg.recordOthers || false);
+  const [defaultSamplingRate, setDefaultSamplingRate] = useState(
+    cfg.defaultSamplingRate ?? 1000,
+  );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
   const [compression, setCompression] = useState(cfg.compression || "lz4");
   const [compressionLevel, setCompressionLevel] = useState(
@@ -359,6 +362,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       questdbPgPort,
       questdbVersion,
       managedContainer,
+      defaultSamplingRate,
       recordSelf,
       recordOthers,
       retentionDays,
@@ -653,6 +657,19 @@ export default function PluginConfigurationPanel({ configuration, save }) {
 
       {/* Recording */}
       <div style={S.sectionTitle}>Recording</div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Default sampling rate (ms)</span>
+        <input
+          style={S.inputSmall}
+          type="number"
+          value={defaultSamplingRate}
+          onChange={(e) => setDefaultSamplingRate(Number(e.target.value))}
+        />
+        <span style={S.hint}>
+          1000 = max 1 write/sec per path (0 = every update)
+        </span>
+      </div>
 
       <div style={S.fieldRow}>
         <span style={S.label}>Record own vessel</span>

@@ -25,7 +25,7 @@ describe("ILPWriter", () => {
     writer.write("navigation.speedOverGround", "self", 6.4, ts);
 
     // Wait for flush timer
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, 600));
     await writer.disconnect();
 
     server.close();
@@ -60,7 +60,7 @@ describe("ILPWriter", () => {
     const ts = new Date("2024-06-15T12:00:00.000Z");
     writer.writeString("navigation.state", "self", "motoring", ts);
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, 600));
     await writer.disconnect();
 
     server.close();
@@ -99,7 +99,7 @@ describe("ILPWriter", () => {
       ts,
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, 600));
     await writer.disconnect();
 
     server.close();
@@ -131,7 +131,7 @@ describe("ILPWriter", () => {
     const ts = new Date("2024-06-15T12:00:00.000Z");
     writer.write("path with spaces", "ctx,with,commas", 1.0, ts);
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, 600));
     await writer.disconnect();
 
     server.close();

@@ -1,7 +1,7 @@
 import * as net from "net";
 
-const FLUSH_INTERVAL_MS = 100;
-const FLUSH_BATCH_SIZE = 500;
+const FLUSH_INTERVAL_MS = 500;
+const FLUSH_BATCH_SIZE = 1000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 
 function escapeTag(s: string): string {
