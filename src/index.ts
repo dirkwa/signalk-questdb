@@ -216,6 +216,21 @@ module.exports = (app: App) => {
     const v2Provider = createHistoryProviderV2(queryClient);
     app.registerHistoryApiProvider(v2Provider);
 
+    // Set ourselves as default history provider (other plugins like Kip may
+    // register first depending on load order)
+    setTimeout(async () => {
+      try {
+        const port = process.env.PORT || 3000;
+        await fetch(
+          `http://127.0.0.1:${port}/signalk/v2/api/history/_providers/_default/signalk-questdb`,
+          { method: "POST", signal: AbortSignal.timeout(5000) },
+        );
+        app.debug("set as default history provider");
+      } catch {
+        app.debug("could not set as default history provider");
+      }
+    }, 5000);
+
     const v1Provider = createHistoryProviderV1(
       queryClient,
       app.selfContext,
