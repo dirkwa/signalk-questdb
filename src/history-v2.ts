@@ -108,11 +108,34 @@ function buildRangeWhere(range: ResolvedRange, context?: string): string {
   return where;
 }
 
-export function createHistoryProviderV2(queryClient: QueryClient) {
+/**
+ * Map a Signal K context value to the storage form used by signalk-questdb.
+ *
+ * Per the v2 History API spec, callers may send the context as `vessels.self`
+ * or as a fully-qualified context like `vessels.urn:mrn:imo:mmsi:123456789`.
+ * We store the own vessel as the literal string "self" for compactness, so
+ * any incoming context that refers to the own vessel is normalized to "self".
+ */
+function normalizeContext(context: string, selfContext: string): string {
+  if (
+    context === "self" ||
+    context === "vessels.self" ||
+    context === selfContext
+  ) {
+    return "self";
+  }
+  return context;
+}
+
+export function createHistoryProviderV2(
+  queryClient: QueryClient,
+  selfContext: string,
+) {
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
     const range = resolveTimeRange(query as any);
-    const context = query.context ?? "self";
-    const safeContext = validateIdentifier(context);
+    const requestedContext = query.context ?? "vessels.self";
+    const storedContext = normalizeContext(requestedContext, selfContext);
+    const safeContext = validateIdentifier(storedContext);
 
     const valuesList: { path: string; method: string }[] = [];
     const columnData: Map<string, [string, unknown][]> = new Map();
@@ -215,7 +238,7 @@ export function createHistoryProviderV2(queryClient: QueryClient) {
     });
 
     return {
-      context,
+      context: requestedContext,
       range: { from: range.from, to: range.to },
       values: valuesList,
       data,
@@ -247,7 +270,11 @@ export function createHistoryProviderV2(queryClient: QueryClient) {
        ORDER BY context`,
     );
 
-    return result.dataset.map((row) => row[0] as string);
+    // Translate stored "self" back to the spec-canonical "vessels.self"
+    return result.dataset.map((row) => {
+      const ctx = row[0] as string;
+      return ctx === "self" ? "vessels.self" : ctx;
+    });
   }
 
   return { getValues, getPaths, getContexts };

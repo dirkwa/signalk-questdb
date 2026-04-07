@@ -232,7 +232,7 @@ module.exports = (app: App) => {
     writer = new ILPWriter(host, ilpPort, (msg) => app.debug(msg));
     await writer.connect();
 
-    const v2Provider = createHistoryProviderV2(queryClient);
+    const v2Provider = createHistoryProviderV2(queryClient, app.selfContext);
     app.registerHistoryApiProvider(v2Provider);
 
     // Set ourselves as default history provider (other plugins like Kip may
