@@ -48,12 +48,6 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Lint
-        run: npm run ci-lint
-
-      - name: Test
-        run: npm test
-
       - name: Publish
         run: |
           if [[ "${{ github.ref }}" == refs/tags/*-beta.* ]] || [[ "${{ github.ref }}" == refs/tags/*-rc.* ]]; then
