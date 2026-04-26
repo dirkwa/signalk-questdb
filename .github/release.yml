@@ -1,0 +1,11 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+  categories:
+    - title: 📦 Dependencies
+      labels:
+        - dependencies
+    - title: Changes
+      labels:
+        - "*"
