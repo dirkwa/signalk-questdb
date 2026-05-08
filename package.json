@@ -1,6 +1,6 @@
 {
   "name": "signalk-questdb",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "QuestDB history provider for Signal K — replaces signalk-to-influxdb",
   "keywords": [
     "signalk-node-server-plugin",
@@ -29,6 +29,7 @@
   "engines": {
     "node": ">=22"
   },
+  "author": "Dirk Wahrheit <dirkwahrheit@gmail.com>",
   "license": "MIT",
   "repository": {
     "type": "git",
