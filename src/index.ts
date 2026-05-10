@@ -878,6 +878,103 @@ module.exports = (app: App) => {
           });
         }
       });
+
+      // List the tables a backup-style "full export" caller should pull.
+      // Hardcoded (not introspected via QuestDB's tables() function) because
+      // we DO know our schema — we created it. Keeps the contract stable
+      // even if QuestDB ever returns extra system tables.
+      router.get("/api/full-export/tables", (_req, res) => {
+        if (!queryClient) {
+          res.status(503).json({ error: "QuestDB not connected" });
+          return;
+        }
+        res.json({ tables: ["signalk", "signalk_str", "signalk_position"] });
+      });
+
+      // Full-content export: stream EVERY row of one table as Parquet.
+      // Used by signalk-backup to capture history into snapshots. Distinct
+      // from /api/export, which is range-bounded (from/to required) and
+      // hardwired to the `signalk` value table.
+      router.get("/api/full-export/:table", async (req, res) => {
+        try {
+          if (!queryClient) {
+            res.status(503).json({ error: "QuestDB not connected" });
+            return;
+          }
+          const table = req.params.table;
+          const allowed = new Set([
+            "signalk",
+            "signalk_str",
+            "signalk_position",
+          ]);
+          if (!allowed.has(table)) {
+            res.status(404).json({ error: `Unknown table: ${table}` });
+            return;
+          }
+
+          // No ORDER BY — QuestDB rows are already returned in designated-
+          // timestamp order, and adding ORDER BY forces a sort over the full
+          // table that's slow on the Pi for the wide signalk table.
+          const sql = `SELECT * FROM ${table}`;
+
+          const host = currentConfig?.questdbHost ?? "127.0.0.1";
+          const httpPort = currentConfig?.questdbHttpPort ?? 9000;
+          const expUrl = new URL("/exp", `http://${host}:${httpPort}`);
+          expUrl.searchParams.set("query", sql);
+          expUrl.searchParams.set("fmt", "parquet");
+          const codec = currentConfig?.compression ?? "lz4";
+          if (codec !== "none") {
+            expUrl.searchParams.set(
+              "compression_codec",
+              codec === "lz4" ? "LZ4_RAW" : "ZSTD",
+            );
+            if (codec === "zstd") {
+              expUrl.searchParams.set(
+                "compression_level",
+                String(currentConfig?.compressionLevel ?? 3),
+              );
+            }
+          }
+
+          const qdbRes = await fetch(expUrl.toString(), {
+            // Long timeout: a full-table export of 500k+ rows on a Pi can
+            // take a couple of minutes. Cap at 10 min to bound runaway.
+            signal: AbortSignal.timeout(600_000),
+          });
+          if (!qdbRes.ok || !qdbRes.body) {
+            const body = await qdbRes.text().catch(() => "");
+            res.status(502).json({
+              error: `QuestDB export failed: ${body}`,
+            });
+            return;
+          }
+
+          res.setHeader("Content-Type", "application/vnd.apache.parquet");
+          res.setHeader(
+            "Content-Disposition",
+            `attachment; filename="${table}.parquet"`,
+          );
+
+          const reader = qdbRes.body.getReader();
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (!res.write(value)) {
+                await new Promise((resolve) => res.once("drain", resolve));
+              }
+            }
+            res.end();
+          } catch (streamErr) {
+            app.debug("full-export stream error:", streamErr);
+            res.end();
+          }
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
     },
   };
 
