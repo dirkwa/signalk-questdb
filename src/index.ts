@@ -44,6 +44,17 @@ interface ContainerManagerApi {
   ) => Promise<void>;
 }
 
+// Tables exposed by /api/full-export. Hardcoded (not introspected via
+// QuestDB's tables() function) because we DO know our schema — we
+// created it. Single source of truth for both the listing endpoint and
+// the per-table export's allowlist.
+const FULL_EXPORT_TABLES = [
+  "signalk",
+  "signalk_str",
+  "signalk_position",
+] as const;
+const FULL_EXPORT_TABLE_SET: ReadonlySet<string> = new Set(FULL_EXPORT_TABLES);
+
 module.exports = (app: App) => {
   let writer: ILPWriter | null = null;
   let queryClient: QueryClient | null = null;
@@ -880,15 +891,14 @@ module.exports = (app: App) => {
       });
 
       // List the tables a backup-style "full export" caller should pull.
-      // Hardcoded (not introspected via QuestDB's tables() function) because
-      // we DO know our schema — we created it. Keeps the contract stable
-      // even if QuestDB ever returns extra system tables.
+      // The allowlist (FULL_EXPORT_TABLES) is module-level so both this
+      // listing and the per-table export below stay in sync.
       router.get("/api/full-export/tables", (_req, res) => {
         if (!queryClient) {
           res.status(503).json({ error: "QuestDB not connected" });
           return;
         }
-        res.json({ tables: ["signalk", "signalk_str", "signalk_position"] });
+        res.json({ tables: FULL_EXPORT_TABLES });
       });
 
       // Full-content export: stream EVERY row of one table as Parquet.
@@ -902,12 +912,7 @@ module.exports = (app: App) => {
             return;
           }
           const table = req.params.table;
-          const allowed = new Set([
-            "signalk",
-            "signalk_str",
-            "signalk_position",
-          ]);
-          if (!allowed.has(table)) {
+          if (!FULL_EXPORT_TABLE_SET.has(table)) {
             res.status(404).json({ error: `Unknown table: ${table}` });
             return;
           }
@@ -936,12 +941,41 @@ module.exports = (app: App) => {
             }
           }
 
-          const qdbRes = await fetch(expUrl.toString(), {
-            // Long timeout: a full-table export of 500k+ rows on a Pi can
-            // take a couple of minutes. Cap at 10 min to bound runaway.
-            signal: AbortSignal.timeout(600_000),
-          });
+          // Manual AbortController so we can cancel the upstream fetch
+          // when EITHER (a) the 10-min cap fires for runaway queries, or
+          // (b) the downstream client (the backup plugin) disconnects
+          // mid-stream. Without (b), QuestDB keeps streaming bytes into
+          // a closed socket until the timeout — wasteful on a Pi.
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => {
+            controller.abort();
+          }, 600_000);
+          const onClientClose = () => {
+            controller.abort();
+          };
+          res.once("close", onClientClose);
+
+          // Pre-stream phase: fetch + status check. Any failure here
+          // ends in a 4xx/5xx JSON response, no headers committed to
+          // the body yet.
+          let qdbRes: Response;
+          try {
+            qdbRes = await fetch(expUrl.toString(), {
+              signal: controller.signal,
+            });
+          } catch (fetchErr) {
+            clearTimeout(timeoutId);
+            res.removeListener("close", onClientClose);
+            const msg =
+              fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+            if (!res.headersSent) {
+              res.status(502).json({ error: `QuestDB unreachable: ${msg}` });
+            }
+            return;
+          }
           if (!qdbRes.ok || !qdbRes.body) {
+            clearTimeout(timeoutId);
+            res.removeListener("close", onClientClose);
             const body = await qdbRes.text().catch(() => "");
             res.status(502).json({
               error: `QuestDB export failed: ${body}`,
@@ -949,6 +983,10 @@ module.exports = (app: App) => {
             return;
           }
 
+          // Streaming phase: headers are committed at the first write,
+          // so we can no longer switch to a JSON error. Best we can do
+          // on stream failure is end the response and let the client
+          // notice the truncation.
           res.setHeader("Content-Type", "application/vnd.apache.parquet");
           res.setHeader(
             "Content-Disposition",
@@ -964,15 +1002,31 @@ module.exports = (app: App) => {
                 await new Promise((resolve) => res.once("drain", resolve));
               }
             }
-            res.end();
           } catch (streamErr) {
             app.debug("full-export stream error:", streamErr);
-            res.end();
+          } finally {
+            clearTimeout(timeoutId);
+            res.removeListener("close", onClientClose);
+            // Cancel the upstream reader so QuestDB's connection is
+            // closed promptly. cancel() throws if the stream already
+            // ended cleanly — that's fine, swallow it.
+            try {
+              await reader.cancel();
+            } catch {
+              // already finished
+            }
+            if (!res.writableEnded) {
+              res.end();
+            }
           }
         } catch (err) {
-          res.status(500).json({
-            error: err instanceof Error ? err.message : "Unknown error",
-          });
+          // Pre-fetch errors only (URL construction etc.) — the inner
+          // streaming block has its own finally for cleanup.
+          if (!res.headersSent) {
+            res.status(500).json({
+              error: err instanceof Error ? err.message : "Unknown error",
+            });
+          }
         }
       });
     },
