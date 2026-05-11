@@ -154,7 +154,7 @@ SAMPLE BY $__interval
 ## Requirements
 
 - Node.js >= 22
-- [signalk-container](https://github.com/dirkwa/signalk-container) plugin (for managed mode)
+- [signalk-container](https://github.com/dirkwa/signalk-container) >= 1.6.0 plugin (for managed mode)
 - Signal K server
 
 ## License
