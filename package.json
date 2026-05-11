@@ -9,6 +9,9 @@
   "signalk": {
     "displayName": "QuestDB History",
     "appIcon": "./app-icon.svg",
+    "screenshots": [
+      "./doc/screenshots/signalk-questdb-1.png"
+    ],
     "requires": [
       "signalk-container"
     ]
