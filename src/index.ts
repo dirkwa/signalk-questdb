@@ -1,4 +1,3 @@
-import { readFileSync, unlinkSync, writeFileSync } from "fs";
 import { IRouter } from "express";
 import { minimatch } from "minimatch";
 import { ILPWriter } from "./ilp-writer";
@@ -27,16 +26,22 @@ interface App {
   [key: string]: unknown;
 }
 
+interface ContainerConfig {
+  image: string;
+  tag: string;
+  ports: Record<string, string>;
+  volumes: Record<string, string>;
+  env: Record<string, string>;
+  restart?: string;
+  networkMode?: string;
+}
+
 interface ContainerManagerApi {
   getRuntime: () => { runtime: string; version: string } | null;
-  ensureRunning: (
-    name: string,
-    config: unknown,
-    options?: unknown,
-  ) => Promise<void>;
+  whenReady: () => Promise<void>;
+  ensureRunning: (name: string, config: ContainerConfig) => Promise<void>;
   stop: (name: string) => Promise<void>;
   remove: (name: string) => Promise<void>;
-  getState: (name: string) => Promise<string>;
   ensureNetwork: (name: string) => Promise<void>;
   pullImage: (
     image: string,
@@ -97,32 +102,37 @@ module.exports = (app: App) => {
     const httpPort = config.questdbHttpPort ?? 9000;
 
     if (config.managedContainer !== false) {
-      let containers: ContainerManagerApi | undefined;
-      const waitDeadline = Date.now() + 30000;
-      while (Date.now() < waitDeadline) {
-        containers = (globalThis as any).__signalk_containerManager as
-          | ContainerManagerApi
-          | undefined;
-        if (containers && containers.getRuntime()) break;
-        app.setPluginStatus("Waiting for container runtime detection...");
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
+      const containers = (globalThis as any).__signalk_containerManager as
+        | ContainerManagerApi
+        | undefined;
 
       if (!containers) {
-        app.debug("containerManager not found after timeout");
+        app.debug("containerManager not found");
         app.setPluginError(
           "signalk-container plugin required for managed mode. Install it or set managedContainer=false.",
         );
         return;
       }
 
+      app.setPluginStatus("Waiting for container runtime detection...");
+      await containers.whenReady();
+
       if (!containers.getRuntime()) {
-        app.debug("container runtime not detected after timeout");
+        app.debug("container runtime not detected");
         app.setPluginError(
           "No container runtime detected. Check signalk-container plugin.",
         );
         return;
       }
+
+      void (async () => {
+        try {
+          const fs = await import("fs/promises");
+          await fs.unlink(`${app.getDataDirPath()}.container-hash`);
+        } catch {
+          /* never existed or already cleaned up */
+        }
+      })();
 
       app.debug("container runtime ready, starting QuestDB");
       try {
@@ -151,7 +161,7 @@ module.exports = (app: App) => {
         };
 
         const bind = config.exposeToContainers ? "0.0.0.0" : "127.0.0.1";
-        const containerConfig: Record<string, unknown> = {
+        const containerConfig: ContainerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
           ports: {
@@ -171,36 +181,8 @@ module.exports = (app: App) => {
           containerConfig.networkMode = config.networkName;
         }
 
-        // Check if container needs recreation (config/version/compression changed).
-        // Compare against stored hash from last successful start.
-        const configHash = JSON.stringify({
-          tag: containerConfig.tag,
-          ports: containerConfig.ports,
-          env: containerConfig.env,
-          networkMode: containerConfig.networkMode,
-        });
-        // Store hash next to plugin config JSON, not in the QuestDB data volume
-        const hashFile = `${app.getDataDirPath()}.container-hash`;
-        let lastHash = "";
-        try {
-          lastHash = readFileSync(hashFile, "utf8");
-        } catch {
-          // first run
-        }
-
-        const state = await containers.getState("signalk-questdb");
-        if (state !== "missing" && configHash !== lastHash) {
-          app.setPluginStatus(
-            "Recreating QuestDB container (config changed)...",
-          );
-          await containers.remove("signalk-questdb");
-        }
-
         app.setPluginStatus("Starting QuestDB container...");
         await containers.ensureRunning("signalk-questdb", containerConfig);
-
-        // Store hash for next start comparison
-        writeFileSync(hashFile, configHash);
         app.debug("QuestDB container ready");
       } catch (err) {
         app.debug("ensureRunning failed:", err);
@@ -583,11 +565,6 @@ module.exports = (app: App) => {
           app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
           await containers.pullImage(`questdb/questdb:${newTag}`);
 
-          // Stop and remove old container
-          app.setPluginStatus("Replacing container...");
-          await containers.remove("signalk-questdb");
-
-          // Update config and persist
           if (currentConfig) {
             currentConfig.questdbVersion = newTag;
             await new Promise<void>((resolve, reject) => {
@@ -596,14 +573,6 @@ module.exports = (app: App) => {
                 else resolve();
               });
             });
-          }
-
-          // Clear hash and recreate container with new image
-          const hashFile = `${app.getDataDirPath()}.container-hash`;
-          try {
-            unlinkSync(hashFile);
-          } catch {
-            // doesn't exist
           }
 
           const host = currentConfig?.questdbHost ?? "127.0.0.1";
@@ -647,38 +616,6 @@ module.exports = (app: App) => {
             },
             restart: "unless-stopped",
           });
-
-          // Write new hash (must match startup hash structure)
-          const newHash = JSON.stringify({
-            tag: newTag,
-            ports: {
-              "9000/tcp": `${updateBind}:${httpPort}`,
-              "9009/tcp": `${updateBind}:${ilpPort}`,
-              "8812/tcp": `${updateBind}:${currentConfig?.questdbPgPort ?? 8812}`,
-            },
-            env: {
-              QDB_TELEMETRY_ENABLED: "false",
-              QDB_HTTP_ENABLED: "true",
-              QDB_LINE_TCP_ENABLED: "true",
-              ...(currentConfig?.compression &&
-              currentConfig.compression !== "none"
-                ? {
-                    QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
-                      currentConfig.compression === "zstd" ? "ZSTD" : "LZ4",
-                    ...(currentConfig.compression === "zstd" &&
-                    currentConfig.compressionLevel
-                      ? {
-                          QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
-                            currentConfig.compressionLevel,
-                          ),
-                        }
-                      : {}),
-                  }
-                : {}),
-            },
-            networkMode: currentConfig?.networkName,
-          });
-          writeFileSync(hashFile, newHash);
 
           // Reconnect ILP and query client
           if (queryClient) {
