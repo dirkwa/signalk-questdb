@@ -78,16 +78,28 @@ Registered via `app.registerHistoryProvider()`. Supports playback at configurabl
 
 All mounted at `/plugins/signalk-questdb/api/`:
 
-| Method | Path                                     | Description                                        |
-| ------ | ---------------------------------------- | -------------------------------------------------- |
-| GET    | `/status`                                | QuestDB health, row counts, active paths           |
-| GET    | `/query?sql=...`                         | Read-only SQL proxy (DDL/DML blocked)              |
-| GET    | `/paths`                                 | All recorded paths with row counts and time range  |
-| GET    | `/versions`                              | QuestDB releases from GitHub (for version picker)  |
-| GET    | `/update/check`                          | Compare running version against latest release     |
-| POST   | `/update/apply`                          | Pull latest image, recreate container, reconnect   |
-| GET    | `/migration/detect`                      | Auto-detect InfluxDB (supports `?url=` for remote) |
-| GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export                              |
+| Method | Path                                     | Description                                                                              |
+| ------ | ---------------------------------------- | ---------------------------------------------------------------------------------------- |
+| GET    | `/status`                                | QuestDB health, row counts, active paths                                                 |
+| GET    | `/query?sql=...`                         | Read-only SQL proxy (DDL/DML blocked)                                                    |
+| GET    | `/paths`                                 | All recorded paths with row counts and time range                                        |
+| GET    | `/versions`                              | QuestDB releases from GitHub (for version picker)                                        |
+| GET    | `/update/check`                          | Compare running version against latest release                                           |
+| POST   | `/update/apply`                          | Pull latest image, recreate container, reconnect                                         |
+| GET    | `/migration/detect`                      | Auto-detect InfluxDB (supports `?url=` for remote)                                       |
+| GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)               |
+| GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                   |
+| GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet. Optional half-open `[from, to)` range for slicing into shards |
+
+### `/full-export/:table` (since 0.4.0)
+
+Designed for snapshot/backup tooling that needs the full table content but
+wants to slice it into kopia-dedup-friendly shards. Allowed tables:
+`signalk`, `signalk_str`, `signalk_position`.
+
+- Both `from` and `to` are **optional but must be set together**: omit both for a full-table export, or pass both as ISO 8601 timestamps for a windowed export. Half-open `[from, to)` interval — no row appears in two adjacent windows.
+- Repeated query params (`?from=A&from=B`) and empty strings (`?from=`) are rejected with HTTP 400 — silently downgrading to a full-table export would hide bugs in the caller.
+- Output format and compression follow the plugin's `compression` config (LZ4_RAW or ZSTD), same as `/export`.
 
 ## Configuration
 
