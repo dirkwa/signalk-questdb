@@ -6,6 +6,7 @@ import { Config, ConfigSchema } from "./config/schema";
 import { createHistoryProviderV2 } from "./history-v2";
 import { createHistoryProviderV1 } from "./history-v1";
 import { startRetention } from "./retention";
+import { buildFullExportWhere } from "./full-export-range";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -854,10 +855,23 @@ module.exports = (app: App) => {
             return;
           }
 
+          // Half-open [from, to) range, both required together. Lets the
+          // backup plugin slice the table into kopia-dedup-friendly weekly
+          // shards. Omitting both keeps the full-table behavior.
+          const from =
+            typeof req.query.from === "string" ? req.query.from : undefined;
+          const to =
+            typeof req.query.to === "string" ? req.query.to : undefined;
+          const rangeResult = buildFullExportWhere(from, to);
+          if (!rangeResult.ok) {
+            res.status(400).json({ error: rangeResult.error });
+            return;
+          }
+
           // No ORDER BY — QuestDB rows are already returned in designated-
           // timestamp order, and adding ORDER BY forces a sort over the full
           // table that's slow on the Pi for the wide signalk table.
-          const sql = `SELECT * FROM ${table}`;
+          const sql = `SELECT * FROM ${table}${rangeResult.where}`;
 
           const host = currentConfig?.questdbHost ?? "127.0.0.1";
           const httpPort = currentConfig?.questdbHttpPort ?? 9000;
