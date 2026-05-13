@@ -49,6 +49,18 @@ describe("buildFullExportWhere", () => {
     assert.match(r.error, /ISO 8601/);
   });
 
+  it("rejects empty-string params (not silently downgraded to full export)", () => {
+    // ?from=&to= → both present but empty. Must NOT be treated as 'unset'.
+    const both = buildFullExportWhere("", "");
+    assert.equal(both.ok, false);
+    if (both.ok) return;
+    assert.match(both.error, /ISO 8601/);
+
+    // Just `from=` empty also rejected — same as half-set semantics.
+    const onlyFromEmpty = buildFullExportWhere("", "2026-05-11T00:00:00Z");
+    assert.equal(onlyFromEmpty.ok, false);
+  });
+
   it("rejects when from >= to (would yield empty or backwards range)", () => {
     const equal = buildFullExportWhere(
       "2026-05-04T00:00:00Z",

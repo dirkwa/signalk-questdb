@@ -858,11 +858,20 @@ module.exports = (app: App) => {
           // Half-open [from, to) range, both required together. Lets the
           // backup plugin slice the table into kopia-dedup-friendly weekly
           // shards. Omitting both keeps the full-table behavior.
-          const from =
-            typeof req.query.from === "string" ? req.query.from : undefined;
-          const to =
-            typeof req.query.to === "string" ? req.query.to : undefined;
-          const rangeResult = buildFullExportWhere(from, to);
+          // Reject repeated params (`?from=A&from=B` → string[]) — silently
+          // downgrading to full-export hides the bug from the caller.
+          const rawFrom = req.query.from;
+          const rawTo = req.query.to;
+          if (
+            (rawFrom !== undefined && typeof rawFrom !== "string") ||
+            (rawTo !== undefined && typeof rawTo !== "string")
+          ) {
+            res
+              .status(400)
+              .json({ error: "from and to must each be a single value" });
+            return;
+          }
+          const rangeResult = buildFullExportWhere(rawFrom, rawTo);
           if (!rangeResult.ok) {
             res.status(400).json({ error: rangeResult.error });
             return;

@@ -18,8 +18,11 @@ export function buildFullExportWhere(
   from: string | undefined,
   to: string | undefined,
 ): FullExportRangeResult {
-  if (!from && !to) return { ok: true, where: "" };
-  if ((from && !to) || (to && !from)) {
+  // undefined-checks (not falsy) so an explicit empty string `?from=&to=`
+  // gets treated as a provided-but-invalid value and rejected, not silently
+  // downgraded to the full-table export.
+  if (from === undefined && to === undefined) return { ok: true, where: "" };
+  if ((from === undefined) !== (to === undefined)) {
     return {
       ok: false,
       error: "from and to query params must be set together",
