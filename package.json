@@ -4,7 +4,8 @@
   "description": "QuestDB history provider for Signal K — replaces signalk-to-influxdb",
   "keywords": [
     "signalk-node-server-plugin",
-    "signalk-plugin-configurator"
+    "signalk-plugin-configurator",
+    "signalk-category-database"
   ],
   "signalk": {
     "displayName": "QuestDB History",
