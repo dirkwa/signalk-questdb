@@ -48,6 +48,17 @@ interface ContainerManagerApi {
     image: string,
     onProgress?: (msg: string) => void,
   ) => Promise<void>;
+  /**
+   * Translate a container-internal absolute path (e.g. the value
+   * `app.getDataDirPath()` returns when SK is itself running in a
+   * container) into the host-side source signalk-container should
+   * pass to the runtime as a bind-mount source. Returns `null` on
+   * bare-metal SK (no translation needed) or when no SK mount covers
+   * the path; the caller falls back to the original path in that case.
+   */
+  resolveHostPath?: (
+    absPath: string,
+  ) => Promise<{ source: string; subPath: string } | null>;
 }
 
 // Tables exposed by /api/full-export. Hardcoded (not introspected via
@@ -68,6 +79,27 @@ module.exports = (app: App) => {
   let currentConfig: Config | null = null;
   const unsubscribes: (() => void)[] = [];
   const throttleMap = new Map<string, number>();
+
+  /**
+   * Compute the bind-mount source for QuestDB's /var/lib/questdb volume.
+   *
+   * `app.getDataDirPath()` returns the path from SK's own perspective. On
+   * bare-metal that is the host path and the runtime can use it directly.
+   * When SK runs inside a container the same string is the SK-container-
+   * internal path, and the host's runtime daemon — which is on the host,
+   * not inside SK — cannot resolve it. signalk-container 1.9.0+ exposes
+   * `resolveHostPath()` to translate such paths back to the host source;
+   * if it returns null (older signalk-container or no covering mount) we
+   * fall back to the original path, preserving bare-metal behaviour.
+   */
+  async function resolveQuestdbVolumeSource(
+    containers: ContainerManagerApi,
+  ): Promise<string> {
+    const dataPath = app.getDataDirPath();
+    if (typeof containers.resolveHostPath !== "function") return dataPath;
+    const resolved = await containers.resolveHostPath(dataPath);
+    return resolved?.source ?? dataPath;
+  }
 
   function shouldRecord(
     path: string,
@@ -173,6 +205,7 @@ module.exports = (app: App) => {
         };
 
         const bind = config.exposeToContainers ? "0.0.0.0" : "127.0.0.1";
+        const volumeSource = await resolveQuestdbVolumeSource(containers);
         const containerConfig: ContainerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
@@ -182,7 +215,7 @@ module.exports = (app: App) => {
             "8812/tcp": `${bind}:${config.questdbPgPort ?? 8812}`,
           },
           volumes: {
-            "/var/lib/questdb": app.getDataDirPath(),
+            "/var/lib/questdb": volumeSource,
           },
           env: containerEnv,
           restart: "unless-stopped",
@@ -594,6 +627,8 @@ module.exports = (app: App) => {
           const updateBind = currentConfig?.exposeToContainers
             ? "0.0.0.0"
             : "127.0.0.1";
+          const updateVolumeSource =
+            await resolveQuestdbVolumeSource(containers);
           app.setPluginStatus(`Starting QuestDB ${newTag}...`);
           await containers.ensureRunning("signalk-questdb", {
             image: "questdb/questdb",
@@ -604,7 +639,7 @@ module.exports = (app: App) => {
               "8812/tcp": `${updateBind}:${currentConfig?.questdbPgPort ?? 8812}`,
             },
             volumes: {
-              "/var/lib/questdb": app.getDataDirPath(),
+              "/var/lib/questdb": updateVolumeSource,
             },
             env: {
               QDB_TELEMETRY_ENABLED: "false",
