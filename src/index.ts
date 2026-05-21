@@ -97,8 +97,17 @@ module.exports = (app: App) => {
   ): Promise<string> {
     const dataPath = app.getDataDirPath();
     if (typeof containers.resolveHostPath !== "function") return dataPath;
-    const resolved = await containers.resolveHostPath(dataPath);
-    return resolved?.source ?? dataPath;
+    // signalk-container's resolveHostPath is documented as non-throwing, but
+    // we consume it through a runtime cross-plugin API (cast through `any`),
+    // so an unexpected throw from a future or older version must not abort
+    // startup — fall back to the original path instead.
+    try {
+      const resolved = await containers.resolveHostPath(dataPath);
+      return resolved?.source ?? dataPath;
+    } catch (err) {
+      app.debug("resolveHostPath threw, falling back to dataPath:", err);
+      return dataPath;
+    }
   }
 
   function shouldRecord(
