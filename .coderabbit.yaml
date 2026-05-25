@@ -1,0 +1,219 @@
+language: en-US
+
+reviews:
+  profile: assertive
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_title_keywords:
+      - "chore(release):"
+      - "chore(deps):"
+      - "chore(deps-dev):"
+      - "[skip review]"
+      - "WIP"
+    ignore_usernames:
+      - "release-please[bot]"
+      - "renovate[bot]"
+      - "dependabot[bot]"
+      - "github-actions[bot]"
+
+  path_filters:
+    - "!**/package-lock.json"
+    - "!**/yarn.lock"
+    - "!**/pnpm-lock.yaml"
+    - "!**/*.min.js"
+    - "!**/*.min.css"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/public/**"
+    - "!**/node_modules/**"
+
+  high_level_summary_instructions: |
+    Write summaries in present tense. Describe what the code does, not what
+    it did. Skip filler like "This PR" — go straight to the change.
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        ## Scope
+
+        Focus on files changed since `master`. Think about how changes
+        interact with the rest of the stack, not just the diff in
+        isolation.
+
+        signalk-questdb is a **Signal K server plugin that ingests vessel
+        deltas into a managed QuestDB container** and serves them back via
+        Signal K's v1 and v2 history APIs. It is a drop-in replacement for
+        signalk-to-influxdb.
+
+        ## Two surfaces
+
+        1. **Plugin runtime** (`src/`, TypeScript, compiled to `dist/`).
+           Loaded by signalk-server as `main` (`dist/index.js`).
+        2. **React config panel** (`src/configpanel/`, plain JS — NOT
+           TypeScript). Bundled by webpack via Module Federation into
+           `public/remoteEntry.js`. React 19 is a shared singleton with
+           the host Admin UI.
+
+        Both build outputs ship in the npm package; `prepublishOnly`
+        rebuilds them.
+
+        ## Container integration: adopt via signalk-container
+
+        The plugin does NOT run QuestDB itself. It looks up
+        `signalk-container`'s `ContainerManagerApi` at runtime (NOT via
+        npm import) and, when `managedContainer: true`, calls
+        `ensureRunning` / `ensureNetwork` / `pullImage` / `stop` to drive
+        the QuestDB container's lifecycle on the shared `sk-network`.
+
+        - Never `import` from `signalk-container`. The API surface is
+          declared inline in `src/index.ts` (`ContainerManagerApi`,
+          `ContainerConfig`, `ContainerResourceLimits`). Flag any npm
+          dependency on signalk-container.
+        - `signalk.requires: ['signalk-container']` in `package.json` is
+          the only declared dependency. Don't add a `peerDependency` —
+          npm's semver matching against signalk-container prereleases is
+          broken.
+        - When `managedContainer: false`, the plugin connects to an
+          external QuestDB at the configured host/ports — no container
+          calls.
+
+        ## Hot path: streambundle → ILP writer
+
+        `bus.onValue(...)` in `src/index.ts` runs on every Signal K
+        delta. Keep it cheap:
+
+        - No `app.debug(...)` or logging calls inside the per-delta
+          handler. Debug calls in the hot path show up as load average on
+          Pi/Cerbo-class hosts.
+        - Throttle via `isThrottled(path, samplingRates,
+          defaultSamplingRate)` BEFORE building the ILP line. Flag any
+          path that builds the ILP string before throttling.
+        - `ILPWriter` (`src/ilp-writer.ts`) buffers and flushes every
+          500ms or 1000 lines. Don't add per-write socket flushes.
+
+        ## Config schema is the source of truth
+
+        `src/config/schema.ts` uses TypeBox (`@sinclair/typebox`). The
+        schema is BOTH the JSON Schema rendered by the Signal K Admin UI
+        AND the source of the `Config` TypeScript type via `Static<...>`.
+        Add new options there only.
+
+        - The plain-JS configpanel cannot `import` from `schema.ts`
+          (webpack only resolves `.js`/`.jsx`, no TS loader). The panel
+          owns its own UI state defaults that must be kept in sync with
+          the schema defaults. Flag any divergence between the schema's
+          `default:` value and the corresponding `useState(cfg.X ??
+          <literal>)` in `PluginConfigurationPanel.js`.
+        - For runtime fallbacks (e.g. `config.foo ?? 1000` in
+          `src/index.ts`), use the same literal as the schema default for
+          the same reason: schema is canonical, fallback is a backstop
+          for configs that predate the field.
+
+        ## Read-only SQL gate
+
+        `/plugins/signalk-questdb/api/query` (in `src/index.ts`) MUST
+        only accept SELECT-shaped statements. The gate is `isReadOnlySQL`
+        in `src/query-client.ts`. DDL/DML (CREATE, ALTER, DROP, INSERT,
+        UPDATE, DELETE, TRUNCATE) must remain blocked. Flag any
+        loosening of this gate or any new SQL endpoint that bypasses it.
+
+        ## History providers
+
+        Two providers are registered: v2 (`src/history-v2.ts`, REST under
+        `/signalk/v2/api/history/`) and v1 (`src/history-v1.ts`,
+        WebSocket playback). Aggregates map to native QuestDB SQL except
+        `sma`/`ema` which are computed client-side. Flag changes that
+        push `sma`/`ema` into the SQL.
+
+        ## TypeScript
+
+        - `tsconfig.json` runs strict mode. Do not loosen `strict`,
+          `noImplicitAny`, `noUnusedLocals`, `noUnusedParameters`. Code
+          must narrow `unknown` and avoid `any`.
+        - The configpanel is plain JS (Babel + `@babel/preset-react`).
+          Don't suggest migrating it to TSX inside an unrelated PR.
+        - Node `>= 22` per `engines` (uses Node's built-in test runner).
+
+        ## Tests
+
+        `src/test/` uses `node:test` and runs against the **compiled**
+        JS in `dist/test/`. Always build before testing
+        (`npm run build:all`). Flag changes that add tests but don't
+        match the existing pattern.
+
+        ## Echo comments
+
+        Flag any comment that merely restates what the code already says.
+        Examples to flag:
+
+        - `// Subscribe to the bus` above `app.streambundle.getBus()...`
+        - `// Connect to QuestDB` above `writer.connect()`
+
+        Replace with comments explaining *why*, not *what*. Or delete.
+
+        ## Documentation drift risk
+
+        Flag any `.md` file that contains:
+
+        - Specific code snippets, function signatures, or config values
+          likely to fall out of sync as code evolves.
+        - Step-by-step build/development instructions that duplicate or
+          shadow the code itself.
+        - Implementation status, progress markers, "currently implemented
+          as X" wording. Build narratives belong in PR descriptions, not
+          in repo docs.
+
+        Architecture decisions and conceptual design rationale are fine.
+
+        ## Leftover crumbs from intermediate commits
+
+        Flag references in the current diff to symbols, files, or
+        approaches that no longer exist on this branch — old function
+        names in comments, dangling imports, stale TODOs from a
+        superseded approach.
+
+        ## Unchecked items in test plans
+
+        If the PR description has a checklist with unchecked items, flag
+        it. Either the work isn't done, or the unchecked items should be
+        removed.
+
+        ## Commit / PR conventions
+
+        - Branch names use **hyphens**, never slashes.
+        - Angular conventional commits: `<type>(<scope>): <subject>`.
+          Subject ≤ 50 chars, imperative mood, no period.
+        - One logical change per commit and per PR.
+        - **No AI attribution** in commits, PR bodies, or code. Don't
+          mention Claude, AI, or add `Co-Authored-By` trailers.
+        - **No version bumps** in feature/fix PRs. Versions are bumped
+          in dedicated `chore(release):` PRs only when the user
+          explicitly asks.
+        - PR descriptions: no checkboxes. "Tested" lists what was
+          actually verified, not what's planned.
+        - **CHANGELOG.md is auto-generated** by CI from conventional
+          commits. Flag any manual CHANGELOG edits in PRs.
+
+        ## What NOT to flag
+
+        These are intentional:
+
+        - The hand-rolled `ContainerManagerApi` / `ContainerConfig`
+          interfaces in `src/index.ts` mirroring signalk-container's API
+          — loose coupling is required.
+        - `signalk.requires: ['signalk-container']` without a matching
+          npm dependency — see "Container integration" above.
+        - The configpanel being plain JS instead of TS — webpack/babel
+          setup is intentional, migration is out of scope for feature
+          PRs.
+        - The single-worker QuestDB env vars
+          (`QDB_SHARED_WORKER_COUNT=1`, etc.) in `src/index.ts` — tuned
+          for Pi/Cerbo, do not "fix" by raising.
+        - The 500ms / 1000-line ILP flush thresholds in
+          `src/ilp-writer.ts` — picked deliberately.
+        - Resource caps applied via signalk-container's
+          `ContainerResourceLimits` (memory + cpus) — the defaults of
+          `768m` / `1.5 cpus` are deliberate for the typical Signal K
+          host stack (questdb + grafana + mayara + backup co-resident).
