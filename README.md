@@ -111,7 +111,9 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 | HTTP port          | `9000`       | QuestDB REST API port                                         |
 | ILP port           | `9009`       | InfluxDB Line Protocol write port                             |
 | PostgreSQL port    | `8812`       | For Grafana connections                                       |
-| Sampling rate (ms) | `1000`       | Default min ms between writes per path (0 = every update)     |
+| Sampling rate (ms) | `2000`       | Default min ms between writes per path (0 = every update)     |
+| Memory limit       | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)  |
+| CPU limit (cores)  | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                 |
 | Record own vessel  | `true`       | Record self context                                           |
 | Record AIS targets | `false`      | Record other vessels                                          |
 | Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                 |
@@ -124,10 +126,12 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 
 The plugin is optimized for Raspberry Pi and similar low-power devices:
 
-- **Default sampling rate** of 1000ms limits each path to 1 write/sec, reducing total writes from ~500/s to ~238/s on a typical NMEA 2000 bus
+- **Default sampling rate** of 2000ms limits each path to 1 write per 2 seconds, keeping write volume modest on busy NMEA 2000 buses
+- **Resource caps** of 768 MB RAM and 1.5 CPU cores (cgroup limits via signalk-container) keep QuestDB from squeezing co-resident containers like Grafana, mayara, or signalk-backup. The JVM auto-sizes its heap to a fraction of the memory cap, so total footprint (heap + off-heap) is bounded
 - **QuestDB worker threads** reduced to 1 each (WAL, shared, ILP) to minimize CPU usage
 - **ILP batching** at 500ms intervals with 1000-row batches reduces TCP overhead
 - Per-path overrides allow faster rates for critical paths (e.g. `{ "environment.wind.*": 200 }`) while keeping slow-changing paths throttled
+- Set the memory limit to empty or CPU limit to `0` to disable the cap entirely on roomier hosts
 
 ## History API Provider
 
