@@ -217,7 +217,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
   const [recordOthers, setRecordOthers] = useState(cfg.recordOthers || false);
   const [defaultSamplingRate, setDefaultSamplingRate] = useState(
-    cfg.defaultSamplingRate ?? 1000,
+    cfg.defaultSamplingRate ?? 2000,
   );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
   const [compression, setCompression] = useState(cfg.compression || "lz4");

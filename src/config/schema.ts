@@ -28,6 +28,20 @@ export const ConfigSchema = Type.Object({
     description: "Disable to connect to an external QuestDB instance",
   }),
 
+  questdbMemoryLimit: Type.String({
+    default: "768m",
+    title: "QuestDB memory limit",
+    description:
+      "Hard cgroup memory cap (e.g. 512m, 1g, 2g). Empty = unlimited. The JVM auto-sizes its heap to a fraction of this, so capping here bounds total footprint including off-heap.",
+  }),
+
+  questdbCpuLimit: Type.Number({
+    default: 1.5,
+    title: "QuestDB CPU limit (cores)",
+    description:
+      "Max CPU cores QuestDB can use (fractional, e.g. 1.5). 0 = unlimited.",
+  }),
+
   pathFilter: Type.Object({
     mode: Type.Union([Type.Literal("exclude"), Type.Literal("include")], {
       default: "exclude",
@@ -41,10 +55,10 @@ export const ConfigSchema = Type.Object({
   }),
 
   defaultSamplingRate: Type.Number({
-    default: 1000,
+    default: 2000,
     title: "Default sampling rate (ms)",
     description:
-      "Minimum ms between writes for any path (0 = write every update). 1000ms recommended for Pi/low-power devices.",
+      "Minimum ms between writes for any path (0 = write every update). 2000ms is a sensible default for Pi/Cerbo-class hardware; lower it per-path via samplingRates when you need finer resolution.",
   }),
 
   samplingRates: Type.Record(Type.String(), Type.Number(), {
