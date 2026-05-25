@@ -325,7 +325,7 @@ module.exports = (app: App) => {
         isThrottled(
           path,
           config.samplingRates,
-          config.defaultSamplingRate ?? 1000,
+          config.defaultSamplingRate ?? 2000,
         )
       )
         return;
