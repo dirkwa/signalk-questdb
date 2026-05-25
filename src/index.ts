@@ -27,6 +27,11 @@ interface App {
   [key: string]: unknown;
 }
 
+interface ContainerResourceLimits {
+  cpus?: number | null;
+  memory?: string | null;
+}
+
 interface ContainerConfig {
   image: string;
   tag: string;
@@ -35,6 +40,7 @@ interface ContainerConfig {
   env: Record<string, string>;
   restart?: string;
   networkMode?: string;
+  resources?: ContainerResourceLimits;
 }
 
 interface ContainerManagerApi {
@@ -71,6 +77,16 @@ const FULL_EXPORT_TABLES = [
   "signalk_position",
 ] as const;
 const FULL_EXPORT_TABLE_SET: ReadonlySet<string> = new Set(FULL_EXPORT_TABLES);
+
+function buildResourceLimits(config: Config): ContainerResourceLimits {
+  return {
+    memory: config.questdbMemoryLimit?.trim() || null,
+    cpus:
+      typeof config.questdbCpuLimit === "number" && config.questdbCpuLimit > 0
+        ? config.questdbCpuLimit
+        : null,
+  };
+}
 
 module.exports = (app: App) => {
   let writer: ILPWriter | null = null;
@@ -228,6 +244,7 @@ module.exports = (app: App) => {
           },
           env: containerEnv,
           restart: "unless-stopped",
+          resources: buildResourceLimits(config),
         };
 
         if (config.networkName) {
@@ -671,6 +688,9 @@ module.exports = (app: App) => {
                 : {}),
             },
             restart: "unless-stopped",
+            resources: currentConfig
+              ? buildResourceLimits(currentConfig)
+              : undefined,
           });
 
           // Reconnect ILP and query client
