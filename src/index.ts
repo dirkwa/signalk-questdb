@@ -271,7 +271,7 @@ module.exports = (app: App) => {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
           ports: {
-            "9000/tcp": `${bind}:${httpPort}`,
+            [`${QUESTDB_INTERNAL_HTTP_PORT}/tcp`]: `${bind}:${httpPort}`,
             "9009/tcp": `${bind}:${ilpPort}`,
             "8812/tcp": `${bind}:${config.questdbPgPort ?? 8812}`,
           },
@@ -697,7 +697,7 @@ module.exports = (app: App) => {
             image: "questdb/questdb",
             tag: newTag,
             ports: {
-              "9000/tcp": `${updateBind}:${httpPort}`,
+              [`${QUESTDB_INTERNAL_HTTP_PORT}/tcp`]: `${updateBind}:${httpPort}`,
               "9009/tcp": `${updateBind}:${ilpPort}`,
               "8812/tcp": `${updateBind}:${currentConfig?.questdbPgPort ?? 8812}`,
             },
@@ -728,6 +728,7 @@ module.exports = (app: App) => {
             resources: currentConfig
               ? buildResourceLimits(currentConfig)
               : undefined,
+            healthcheck: QUESTDB_HEALTHCHECK,
           });
 
           // Reconnect ILP and query client
