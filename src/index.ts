@@ -41,6 +41,15 @@ interface ContainerConfig {
   restart?: string;
   networkMode?: string;
   resources?: ContainerResourceLimits;
+  healthcheck?:
+    | false
+    | {
+        test: string[];
+        interval?: string;
+        timeout?: string;
+        startPeriod?: string;
+        retries?: number;
+      };
 }
 
 interface ContainerManagerApi {
@@ -77,6 +86,33 @@ const FULL_EXPORT_TABLES = [
   "signalk_position",
 ] as const;
 const FULL_EXPORT_TABLE_SET: ReadonlySet<string> = new Set(FULL_EXPORT_TABLES);
+
+// QuestDB's HTTP server always listens on 9000 *inside* the container — the
+// configurable `questdbHttpPort` only remaps the host-side binding. The
+// healthcheck runs in the container, so it must use the fixed internal port.
+const QUESTDB_INTERNAL_HTTP_PORT = 9000;
+
+// Healthcheck for the QuestDB container. The `questdb/questdb` image ships no
+// HEALTHCHECK of its own, so under Podman the container would otherwise sit in
+// `starting` forever (Podman reports a probeless container as perpetually
+// starting, never healthy). We give it an explicit probe — `curl` is present
+// in the image — hitting QuestDB's purpose-built `/ping` liveness endpoint,
+// which returns an empty `204` immediately. (Probing `/` instead makes curl
+// hang on the web-console `301` redirect until it times out.) signalk-container
+// emits this as `--health-*` run flags (see its `healthcheck` ContainerConfig
+// field).
+const QUESTDB_HEALTHCHECK = {
+  test: [
+    "CMD",
+    "curl",
+    "-f",
+    `http://127.0.0.1:${QUESTDB_INTERNAL_HTTP_PORT}/ping`,
+  ],
+  interval: "30s",
+  timeout: "5s",
+  startPeriod: "15s",
+  retries: 3,
+};
 
 function buildResourceLimits(config: Config): ContainerResourceLimits {
   return {
@@ -235,7 +271,7 @@ module.exports = (app: App) => {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
           ports: {
-            "9000/tcp": `${bind}:${httpPort}`,
+            [`${QUESTDB_INTERNAL_HTTP_PORT}/tcp`]: `${bind}:${httpPort}`,
             "9009/tcp": `${bind}:${ilpPort}`,
             "8812/tcp": `${bind}:${config.questdbPgPort ?? 8812}`,
           },
@@ -245,6 +281,7 @@ module.exports = (app: App) => {
           env: containerEnv,
           restart: "unless-stopped",
           resources: buildResourceLimits(config),
+          healthcheck: QUESTDB_HEALTHCHECK,
         };
 
         if (config.networkName) {
@@ -660,7 +697,7 @@ module.exports = (app: App) => {
             image: "questdb/questdb",
             tag: newTag,
             ports: {
-              "9000/tcp": `${updateBind}:${httpPort}`,
+              [`${QUESTDB_INTERNAL_HTTP_PORT}/tcp`]: `${updateBind}:${httpPort}`,
               "9009/tcp": `${updateBind}:${ilpPort}`,
               "8812/tcp": `${updateBind}:${currentConfig?.questdbPgPort ?? 8812}`,
             },
@@ -691,6 +728,7 @@ module.exports = (app: App) => {
             resources: currentConfig
               ? buildResourceLimits(currentConfig)
               : undefined,
+            healthcheck: QUESTDB_HEALTHCHECK,
           });
 
           // Reconnect ILP and query client
