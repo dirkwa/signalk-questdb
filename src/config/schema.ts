@@ -26,7 +26,7 @@ export const ConfigSchema = Type.Object({
       "Host binding for Grafana/psql when 'Bind to 0.0.0.0' is on. Ignored otherwise (signalk-container allocates the port).",
   }),
   questdbVersion: Type.String({
-    default: "9.2.0",
+    default: "latest",
     title: "QuestDB image version",
   }),
 
