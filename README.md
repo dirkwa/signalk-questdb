@@ -145,6 +145,27 @@ whether Signal K runs on bare metal or is itself containerized:
 In **external mode** (`Managed container` off) the plugin connects to the
 QuestDB you point it at via `QuestDB host` + the HTTP/ILP ports.
 
+## QuestDB Web Console
+
+QuestDB ships a web console (SQL editor + import UI) on its HTTP port. On the
+Signal K host it is at:
+
+```
+http://localhost:9000
+```
+
+By default ("Bind to 0.0.0.0" off) that port is bound to loopback only, so it
+is **not** reachable from another machine. To open the console from your
+laptop, either tunnel over SSH:
+
+```
+ssh -L 9000:127.0.0.1:9000 <user>@<signalk-host>
+```
+
+then browse to `http://localhost:9000`, or enable **"Bind to 0.0.0.0"** in the
+plugin config and use `http://<signalk-host-ip>:9000` (this exposes QuestDB to
+your network — see the warning under Grafana Integration).
+
 ## Performance (Pi / Low-Power Devices)
 
 The plugin is optimized for Raspberry Pi and similar low-power devices:
