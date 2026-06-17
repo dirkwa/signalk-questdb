@@ -7,6 +7,16 @@ import { createHistoryProviderV2 } from "./history-v2";
 import { createHistoryProviderV1 } from "./history-v1";
 import { startRetention } from "./retention";
 import { buildFullExportWhere } from "./full-export-range";
+import {
+  QUESTDB_INTERNAL_HTTP_PORT,
+  QUESTDB_INTERNAL_ILP_PORT,
+  QUESTDB_INTERNAL_PG_PORT,
+  QUESTDB_ACCESSIBLE_PORTS,
+  resolveManagedEndpoints,
+  resolveLanExposureHost,
+  lanExposureEndpoints,
+  type Endpoint,
+} from "./questdb-endpoint";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -35,11 +45,23 @@ interface ContainerResourceLimits {
 interface ContainerConfig {
   image: string;
   tag: string;
-  ports: Record<string, string>;
+  // Default (secure) connectivity path. signalk-container owns the networking
+  // (port allocation, host binding, or attaching the container to Signal K's
+  // own network) and exposes the resulting endpoint via
+  // resolveContainerAddress(). Connectivity then works in every topology
+  // (bare-metal SK, containerized SK on a user network, or default bridge)
+  // without exposing QuestDB beyond loopback / the shared network. Mutually
+  // exclusive with `ports`/`networkMode` — used when exposeToContainers is off.
+  signalkAccessiblePorts?: number[];
+  // Manual host port bindings ("9000/tcp" -> "0.0.0.0:9000"). Used for the
+  // LAN-exposure path (exposeToContainers=true) so a separate machine or a
+  // separate-Docker Grafana can reach QuestDB. Mutually exclusive with
+  // signalkAccessiblePorts.
+  ports?: Record<string, string>;
+  networkMode?: string;
   volumes: Record<string, string>;
   env: Record<string, string>;
   restart?: string;
-  networkMode?: string;
   resources?: ContainerResourceLimits;
   healthcheck?:
     | false
@@ -59,10 +81,51 @@ interface ContainerManagerApi {
   stop: (name: string) => Promise<void>;
   remove: (name: string) => Promise<void>;
   ensureNetwork: (name: string) => Promise<void>;
+  /**
+   * Attach an existing managed container to a user-defined network so other
+   * containers on it can reach the container by its `sk-`-prefixed DNS name.
+   * On the default path we use it so the companion signalk-grafana (which
+   * joins `networkName` and resolves `sk-<name>`) still reaches QuestDB.
+   * Optional so the plugin degrades gracefully on older signalk-container.
+   */
+  connectToNetwork?: (
+    containerName: string,
+    networkName: string,
+  ) => Promise<void>;
   pullImage: (
     image: string,
     onProgress?: (msg: string) => void,
   ) => Promise<void>;
+  /**
+   * Diagnostics API. We only read `doctor.selfDeployment().isContainerized`:
+   * on the LAN-exposure path it decides whether the Signal K process reaches
+   * QuestDB's published port over the host loopback (bare-metal) or via the
+   * `host.containers.internal` gateway (Signal K itself in a container).
+   * Optional (the whole `doctor` object and its method) so the plugin degrades
+   * gracefully on older signalk-container.
+   */
+  doctor?: {
+    selfDeployment?: () => Promise<{ isContainerized: boolean }>;
+  };
+  /**
+   * Resolve the `host:port` string the Signal K process should use to reach
+   * `containerPort` on a managed container, for a port declared in that
+   * container's `signalkAccessiblePorts`. signalk-container returns the right
+   * endpoint for the current topology:
+   *
+   *   - bare-metal SK              → `127.0.0.1:<allocated host port>`
+   *   - containerized, user net    → `sk-<name>:<containerPort>` (container DNS)
+   *   - containerized, default net → `127.0.0.1:<containerPort>` (shared netns)
+   *
+   * Call after `ensureRunning()`. Returns `null` if the runtime is unavailable
+   * or the port was never declared; throws if declared but `ensureRunning()`
+   * has not run yet. Available in signalk-container 1.14.0+ — optional so the
+   * plugin degrades gracefully (falls back to `questdbHost`) on older versions.
+   */
+  resolveContainerAddress?: (
+    containerName: string,
+    containerPort: number,
+  ) => Promise<string | null>;
   /**
    * Translate a container-internal absolute path (e.g. the value
    * `app.getDataDirPath()` returns when SK is itself running in a
@@ -76,6 +139,10 @@ interface ContainerManagerApi {
   ) => Promise<{ source: string; subPath: string } | null>;
 }
 
+// The managed QuestDB container's name. signalk-container prefixes it with
+// `sk-` for the actual container and its DNS name (e.g. `sk-signalk-questdb`).
+const QUESTDB_CONTAINER_NAME = "signalk-questdb";
+
 // Tables exposed by /api/full-export. Hardcoded (not introspected via
 // QuestDB's tables() function) because we DO know our schema — we
 // created it. Single source of truth for both the listing endpoint and
@@ -86,11 +153,6 @@ const FULL_EXPORT_TABLES = [
   "signalk_position",
 ] as const;
 const FULL_EXPORT_TABLE_SET: ReadonlySet<string> = new Set(FULL_EXPORT_TABLES);
-
-// QuestDB's HTTP server always listens on 9000 *inside* the container — the
-// configurable `questdbHttpPort` only remaps the host-side binding. The
-// healthcheck runs in the container, so it must use the fixed internal port.
-const QUESTDB_INTERNAL_HTTP_PORT = 9000;
 
 // Healthcheck for the QuestDB container. The `questdb/questdb` image ships no
 // HEALTHCHECK of its own, so under Podman the container would otherwise sit in
@@ -129,8 +191,30 @@ module.exports = (app: App) => {
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
   let currentConfig: Config | null = null;
+  // The HTTP/ILP endpoints the Signal K process uses to reach QuestDB. In
+  // managed mode signalk-container resolves these (loopback bare-metal,
+  // container DNS when SK is containerized); in external mode they come from
+  // config. The REST/export endpoints read `questdbEndpoints.http` so they
+  // stay correct in every topology, not just when questdbHost is loopback.
+  let questdbEndpoints: { http: Endpoint; ilp: Endpoint } | null = null;
   const unsubscribes: (() => void)[] = [];
   const throttleMap = new Map<string, number>();
+
+  // The HTTP base URL for QuestDB's REST API (/exp, /exec). Used by the export
+  // endpoints, which talk to QuestDB directly rather than through QueryClient.
+  // Those callers all guard on `!queryClient` first, and `questdbEndpoints` is
+  // set before `queryClient` in asyncStart and cleared after it in stop(), so
+  // it is non-null whenever this runs. The config-derived branch is purely
+  // defensive (never exercised in practice).
+  function questdbHttpBaseUrl(): string {
+    if (questdbEndpoints) {
+      const { host, port } = questdbEndpoints.http;
+      return `http://${host}:${port}`;
+    }
+    const host = currentConfig?.questdbHost ?? "127.0.0.1";
+    const port = currentConfig?.questdbHttpPort ?? QUESTDB_INTERNAL_HTTP_PORT;
+    return `http://${host}:${port}`;
+  }
 
   /**
    * Compute the bind-mount source for QuestDB's /var/lib/questdb volume.
@@ -160,6 +244,92 @@ module.exports = (app: App) => {
       app.debug("resolveHostPath threw, falling back to dataPath:", err);
       return dataPath;
     }
+  }
+
+  /**
+   * Apply the chosen networking to a managed-QuestDB ContainerConfig and
+   * return the endpoints the Signal K process should use to reach it. Two
+   * paths, keyed on `exposeToContainers`:
+   *
+   *   - off (default): signalkAccessiblePorts — signalk-container owns the
+   *     networking and resolveContainerAddress() yields the endpoint. Secure;
+   *     QuestDB is not published beyond loopback / the shared network.
+   *   - on: publish the configured host ports on 0.0.0.0 (for LAN / separate-
+   *     Docker Grafana) on the shared `networkName`; the Signal K process
+   *     reaches them on the host loopback (bare-metal) or via the
+   *     host.containers.internal gateway (containerized SK).
+   *
+   * `endpoints` is resolved AFTER ensureRunning() on the signalkAccessiblePorts
+   * path (the host port is allocated by then); on the LAN path it is already
+   * known, so the returned resolver just echoes it.
+   */
+  async function applyQuestdbNetworking(
+    config: Config,
+    containers: ContainerManagerApi,
+    name: string,
+    containerConfig: ContainerConfig,
+  ): Promise<() => Promise<{ http: Endpoint; ilp: Endpoint }>> {
+    const httpPort = config.questdbHttpPort ?? QUESTDB_INTERNAL_HTTP_PORT;
+    const ilpPort = config.questdbIlpPort ?? QUESTDB_INTERNAL_ILP_PORT;
+    const pgPort = config.questdbPgPort ?? QUESTDB_INTERNAL_PG_PORT;
+    const fallbackHost = config.questdbHost ?? "127.0.0.1";
+
+    // signalkAccessiblePorts is the modern (1.14.0+) connectivity path. Without
+    // it, signalk-container ignores the field and would publish no host port,
+    // so on older versions we must keep the historical manual port bindings.
+    const hasAccessiblePorts =
+      typeof containers.resolveContainerAddress === "function";
+
+    // The LAN-exposure path and the old-container fallback both publish ports
+    // and attach to networkName; only the host the SK process uses differs.
+    const publishOnHost = config.exposeToContainers || !hasAccessiblePorts;
+    if (publishOnHost) {
+      const bind = config.exposeToContainers ? "0.0.0.0" : "127.0.0.1";
+      containerConfig.ports = {
+        [`${QUESTDB_INTERNAL_HTTP_PORT}/tcp`]: `${bind}:${httpPort}`,
+        [`${QUESTDB_INTERNAL_ILP_PORT}/tcp`]: `${bind}:${ilpPort}`,
+        [`${QUESTDB_INTERNAL_PG_PORT}/tcp`]: `${bind}:${pgPort}`,
+      };
+      if (config.networkName) {
+        await containers.ensureNetwork(config.networkName);
+        containerConfig.networkMode = config.networkName;
+      }
+      // A 0.0.0.0-published port is reachable from a containerized SK via the
+      // host gateway; a loopback-only one (or any bare-metal/old-container
+      // case) is reached on 127.0.0.1.
+      const skHost = config.exposeToContainers
+        ? await resolveLanExposureHost(containers, (msg) => app.debug(msg))
+        : "127.0.0.1";
+      const endpoints = lanExposureEndpoints(skHost, httpPort, ilpPort);
+      return async () => endpoints;
+    }
+
+    // Default path: signalk-container owns the networking. After the container
+    // is up we additionally attach it to `networkName` so the companion
+    // signalk-grafana (which joins that network and resolves QuestDB by its
+    // `sk-`-prefixed DNS name) keeps working, then resolve the SK->QuestDB
+    // endpoint from whatever address signalk-container reports.
+    containerConfig.signalkAccessiblePorts = QUESTDB_ACCESSIBLE_PORTS;
+    return async () => {
+      if (
+        config.networkName &&
+        typeof containers.connectToNetwork === "function"
+      ) {
+        try {
+          await containers.ensureNetwork(config.networkName);
+          await containers.connectToNetwork(name, config.networkName);
+        } catch (err) {
+          // Non-fatal: SK->QuestDB does not depend on this network; only the
+          // companion Grafana's DNS path does. Log and carry on.
+          app.debug(
+            `connectToNetwork(${name}, ${config.networkName}) failed: ${String(err)}`,
+          );
+        }
+      }
+      return resolveManagedEndpoints(containers, name, fallbackHost, (msg) =>
+        app.debug(msg),
+      );
+    };
   }
 
   function shouldRecord(
@@ -202,9 +372,18 @@ module.exports = (app: App) => {
 
   async function asyncStart(config: Config) {
     currentConfig = config;
-    const host = config.questdbHost ?? "127.0.0.1";
-    const ilpPort = config.questdbIlpPort ?? 9009;
-    const httpPort = config.questdbHttpPort ?? 9000;
+    // External mode: the configured host/ports are authoritative. Managed mode
+    // overwrites this below with the endpoints signalk-container resolves.
+    questdbEndpoints = {
+      http: {
+        host: config.questdbHost ?? "127.0.0.1",
+        port: config.questdbHttpPort ?? QUESTDB_INTERNAL_HTTP_PORT,
+      },
+      ilp: {
+        host: config.questdbHost ?? "127.0.0.1",
+        port: config.questdbIlpPort ?? QUESTDB_INTERNAL_ILP_PORT,
+      },
+    };
 
     if (config.managedContainer !== false) {
       const containers = (globalThis as any).__signalk_containerManager as
@@ -265,16 +444,10 @@ module.exports = (app: App) => {
             : {}),
         };
 
-        const bind = config.exposeToContainers ? "0.0.0.0" : "127.0.0.1";
         const volumeSource = await resolveQuestdbVolumeSource(containers);
         const containerConfig: ContainerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
-          ports: {
-            [`${QUESTDB_INTERNAL_HTTP_PORT}/tcp`]: `${bind}:${httpPort}`,
-            "9009/tcp": `${bind}:${ilpPort}`,
-            "8812/tcp": `${bind}:${config.questdbPgPort ?? 8812}`,
-          },
           volumes: {
             "/var/lib/questdb": volumeSource,
           },
@@ -283,15 +456,18 @@ module.exports = (app: App) => {
           resources: buildResourceLimits(config),
           healthcheck: QUESTDB_HEALTHCHECK,
         };
-
-        if (config.networkName) {
-          await containers.ensureNetwork(config.networkName);
-          containerConfig.networkMode = config.networkName;
-        }
+        const resolveEndpoints = await applyQuestdbNetworking(
+          config,
+          containers,
+          QUESTDB_CONTAINER_NAME,
+          containerConfig,
+        );
 
         app.setPluginStatus("Starting QuestDB container...");
-        await containers.ensureRunning("signalk-questdb", containerConfig);
+        await containers.ensureRunning(QUESTDB_CONTAINER_NAME, containerConfig);
         app.debug("QuestDB container ready");
+
+        questdbEndpoints = await resolveEndpoints();
       } catch (err) {
         app.debug("ensureRunning failed:", err);
         app.setPluginError(
@@ -301,8 +477,11 @@ module.exports = (app: App) => {
       }
     }
 
-    app.debug("connecting to QuestDB at %s:%d", host, httpPort);
-    queryClient = new QueryClient(host, httpPort);
+    const { host: httpHost, port: httpPort } = questdbEndpoints.http;
+    const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
+
+    app.debug("connecting to QuestDB at %s:%d", httpHost, httpPort);
+    queryClient = new QueryClient(httpHost, httpPort);
 
     app.setPluginStatus("Waiting for QuestDB to become ready...");
     const deadline = Date.now() + 30000;
@@ -312,14 +491,14 @@ module.exports = (app: App) => {
     }
 
     if (!(await queryClient.isHealthy())) {
-      app.setPluginError(`QuestDB not responding at ${host}:${httpPort}`);
+      app.setPluginError(`QuestDB not responding at ${httpHost}:${httpPort}`);
       return;
     }
 
     app.setPluginStatus("Creating tables...");
     await queryClient.ensureTables();
 
-    writer = new ILPWriter(host, ilpPort, (msg) => app.debug(msg));
+    writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg));
     await writer.connect();
 
     const v2Provider = createHistoryProviderV2(queryClient, app.selfContext);
@@ -393,7 +572,7 @@ module.exports = (app: App) => {
       );
     }
 
-    app.setPluginStatus(`Recording to QuestDB at ${host}:${ilpPort}`);
+    app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
   }
 
   const plugin = {
@@ -435,6 +614,7 @@ module.exports = (app: App) => {
 
       throttleMap.clear();
       queryClient = null;
+      questdbEndpoints = null;
 
       // Stop the managed container when plugin is disabled
       if (currentConfig?.managedContainer !== false) {
@@ -443,7 +623,7 @@ module.exports = (app: App) => {
           | undefined;
         if (containers) {
           try {
-            await containers.stop("signalk-questdb");
+            await containers.stop(QUESTDB_CONTAINER_NAME);
           } catch {
             // container may already be stopped
           }
@@ -492,6 +672,9 @@ module.exports = (app: App) => {
             status: "running",
             totalRows,
             activePathsToday,
+            endpoint: questdbEndpoints
+              ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
+              : null,
           });
         } catch (err) {
           res.status(500).json({
@@ -683,24 +866,12 @@ module.exports = (app: App) => {
             });
           }
 
-          const host = currentConfig?.questdbHost ?? "127.0.0.1";
-          const httpPort = currentConfig?.questdbHttpPort ?? 9000;
-          const ilpPort = currentConfig?.questdbIlpPort ?? 9009;
-
-          const updateBind = currentConfig?.exposeToContainers
-            ? "0.0.0.0"
-            : "127.0.0.1";
           const updateVolumeSource =
             await resolveQuestdbVolumeSource(containers);
           app.setPluginStatus(`Starting QuestDB ${newTag}...`);
-          await containers.ensureRunning("signalk-questdb", {
+          const updateConfig: ContainerConfig = {
             image: "questdb/questdb",
             tag: newTag,
-            ports: {
-              [`${QUESTDB_INTERNAL_HTTP_PORT}/tcp`]: `${updateBind}:${httpPort}`,
-              "9009/tcp": `${updateBind}:${ilpPort}`,
-              "8812/tcp": `${updateBind}:${currentConfig?.questdbPgPort ?? 8812}`,
-            },
             volumes: {
               "/var/lib/questdb": updateVolumeSource,
             },
@@ -729,9 +900,24 @@ module.exports = (app: App) => {
               ? buildResourceLimits(currentConfig)
               : undefined,
             healthcheck: QUESTDB_HEALTHCHECK,
-          });
+          };
+          const resolveUpdateEndpoints = await applyQuestdbNetworking(
+            currentConfig ?? ({} as Config),
+            containers,
+            QUESTDB_CONTAINER_NAME,
+            updateConfig,
+          );
+          await containers.ensureRunning(QUESTDB_CONTAINER_NAME, updateConfig);
 
-          // Reconnect ILP and query client
+          // Re-resolve so the export endpoints and status line reflect the
+          // current endpoint. The version bump keeps the same container name
+          // and networking, so the endpoint is stable — the existing
+          // QueryClient/ILPWriter stay valid (and the registered history
+          // providers keep their reference).
+          questdbEndpoints = await resolveUpdateEndpoints();
+          const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
+
+          // Wait for the recreated container to answer, then reconnect ILP.
           if (queryClient) {
             const deadline = Date.now() + 30000;
             while (Date.now() < deadline) {
@@ -749,7 +935,7 @@ module.exports = (app: App) => {
           }
 
           app.setPluginStatus(
-            `Recording to QuestDB ${newTag} at ${host}:${ilpPort}`,
+            `Recording to QuestDB ${newTag} at ${ilpHost}:${ilpPort}`,
           );
 
           res.json({
@@ -864,9 +1050,7 @@ module.exports = (app: App) => {
           const sql = `SELECT ts, path, context, value FROM signalk WHERE ts >= '${safeFrom}' AND ts <= '${safeTo}' ORDER BY ts`;
           const dateSlug = safeFrom.slice(0, 10);
 
-          const host = currentConfig?.questdbHost ?? "127.0.0.1";
-          const httpPort = currentConfig?.questdbHttpPort ?? 9000;
-          const expUrl = new URL("/exp", `http://${host}:${httpPort}`);
+          const expUrl = new URL("/exp", questdbHttpBaseUrl());
           expUrl.searchParams.set("query", sql);
 
           if (format === "parquet") {
@@ -984,9 +1168,7 @@ module.exports = (app: App) => {
           // table that's slow on the Pi for the wide signalk table.
           const sql = `SELECT * FROM ${table}${rangeResult.where}`;
 
-          const host = currentConfig?.questdbHost ?? "127.0.0.1";
-          const httpPort = currentConfig?.questdbHttpPort ?? 9000;
-          const expUrl = new URL("/exp", `http://${host}:${httpPort}`);
+          const expUrl = new URL("/exp", questdbHttpBaseUrl());
           expUrl.searchParams.set("query", sql);
           expUrl.searchParams.set("fmt", "parquet");
           const codec = currentConfig?.compression ?? "lz4";
