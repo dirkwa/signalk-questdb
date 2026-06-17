@@ -103,24 +103,47 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 
 ## Configuration
 
-| Setting            | Default      | Description                                                   |
-| ------------------ | ------------ | ------------------------------------------------------------- |
-| QuestDB version    | `latest`     | Docker image tag (dropdown shows stable + pre-releases)       |
-| Managed container  | `true`       | Let signalk-container manage QuestDB, or connect to external  |
-| QuestDB host       | `127.0.0.1`  | Host (only used when managed=false)                           |
-| HTTP port          | `9000`       | QuestDB REST API port                                         |
-| ILP port           | `9009`       | InfluxDB Line Protocol write port                             |
-| PostgreSQL port    | `8812`       | For Grafana connections                                       |
-| Sampling rate (ms) | `2000`       | Default min ms between writes per path (0 = every update)     |
-| Memory limit       | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)  |
-| CPU limit (cores)  | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                 |
-| Record own vessel  | `true`       | Record self context                                           |
-| Record AIS targets | `false`      | Record other vessels                                          |
-| Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                 |
-| Compression codec  | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`             |
-| Compression level  | `3`          | ZSTD level 1-22 (only when codec is zstd)                     |
-| Container network  | `sk-network` | Shared Podman/Docker network for Grafana integration          |
-| Bind to 0.0.0.0    | `false`      | Bind ports to all interfaces instead of localhost (see below) |
+| Setting            | Default      | Description                                                       |
+| ------------------ | ------------ | ----------------------------------------------------------------- |
+| QuestDB version    | `latest`     | Docker image tag (dropdown shows stable + pre-releases)           |
+| Managed container  | `true`       | Let signalk-container manage QuestDB, or connect to external      |
+| QuestDB host       | `127.0.0.1`  | External QuestDB host (only used when managed=false)              |
+| HTTP port          | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on   |
+| ILP port           | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on   |
+| PostgreSQL port    | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on        |
+| Sampling rate (ms) | `2000`       | Default min ms between writes per path (0 = every update)         |
+| Memory limit       | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)      |
+| CPU limit (cores)  | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                     |
+| Record own vessel  | `true`       | Record self context                                               |
+| Record AIS targets | `false`      | Record other vessels                                              |
+| Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                     |
+| Compression codec  | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                 |
+| Compression level  | `3`          | ZSTD level 1-22 (only when codec is zstd)                         |
+| Container network  | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0) |
+| Bind to 0.0.0.0    | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)        |
+
+## Connectivity
+
+In **managed mode** the plugin no longer needs `QuestDB host` to be correct for
+your deployment — signalk-container resolves the right address automatically,
+whether Signal K runs on bare metal or is itself containerized:
+
+- **Bind to 0.0.0.0 = off (default).** QuestDB stays private. signalk-container
+  binds its ports to the host loopback (bare-metal Signal K) or attaches QuestDB
+  to Signal K's own container network (containerized Signal K), and the plugin
+  connects to whatever address it reports back. Nothing is exposed to the
+  network. QuestDB is also attached to the shared `Container network` so the
+  companion [signalk-grafana](https://github.com/dirkwa/signalk-grafana) plugin
+  still reaches it by container DNS. This is the recommended setup and fixes
+  connectivity for Signal K in a container.
+- **Bind to 0.0.0.0 = on.** QuestDB's HTTP/ILP/PostgreSQL ports are published on
+  all interfaces using the configured port numbers, on the shared
+  `Container network`. Enable this only to reach QuestDB from another machine or
+  from a Grafana running in a separate Docker instance. When Signal K itself is
+  containerized it reaches the published ports via `host.containers.internal`.
+
+In **external mode** (`Managed container` off) the plugin connects to the
+QuestDB you point it at via `QuestDB host` + the HTTP/ILP ports.
 
 ## Performance (Pi / Low-Power Devices)
 
@@ -143,16 +166,20 @@ QuestDB data is stored at `~/.signalk/plugin-config-data/signalk-questdb/` on th
 
 ## Grafana Integration
 
-Connect Grafana to QuestDB via the PostgreSQL data source:
+Connect Grafana to QuestDB via the PostgreSQL data source (user `admin`,
+password `quest`, database `qdb`).
 
-- Host: `localhost:8812`
-- User: `admin`
-- Password: `quest`
-- Database: `qdb`
+The companion [signalk-grafana](https://github.com/dirkwa/signalk-grafana)
+plugin wires this up for you: it runs Grafana as a managed container and
+reaches QuestDB by its container DNS name on the shared `sk-network`, so no
+host port needs to be exposed.
 
-If Grafana runs on the host or in Podman, `localhost:8812` works out of the box.
+For a **self-hosted Grafana on the host or in Podman**, point it at
+`localhost:<HTTP/PostgreSQL port>` — but note this only works when **"Bind to
+0.0.0.0"** is enabled (otherwise QuestDB is not published on a host port).
 
-If Grafana runs in a **separate Docker** container, it cannot reach the host's localhost. In that case, enable **"Bind to 0.0.0.0"** in the QuestDB plugin config and use your machine's LAN IP (e.g. `192.168.0.122:8812`) as the host in Grafana.
+For Grafana in a **separate Docker instance**, enable **"Bind to 0.0.0.0"** and
+use your machine's LAN IP (e.g. `192.168.0.122:8812`) as the host in Grafana.
 
 **Warning:** Binding to 0.0.0.0 exposes QuestDB's ports to your entire network. Only enable this if necessary, and ensure your firewall is configured appropriately.
 
@@ -170,7 +197,7 @@ SAMPLE BY $__interval
 ## Requirements
 
 - Node.js >= 22
-- [signalk-container](https://github.com/dirkwa/signalk-container) >= 1.6.0 plugin (for managed mode)
+- [signalk-container](https://github.com/dirkwa/signalk-container) >= 1.14.0 plugin (for managed mode; older versions still work but fall back to loopback connectivity)
 - Signal K server
 
 ## License

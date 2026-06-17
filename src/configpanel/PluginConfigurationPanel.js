@@ -435,7 +435,8 @@ export default function PluginConfigurationPanel({ configuration, save }) {
             <div style={S.cardInfo}>
               <div style={S.cardTitle}>QuestDB</div>
               <div style={S.cardMeta}>
-                {questdbHost}:{questdbHttpPort} &middot; Recording
+                {dbStatus?.endpoint || `${questdbHost}:${questdbHttpPort}`}{" "}
+                &middot; Recording
               </div>
             </div>
             <div
@@ -583,77 +584,111 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         </span>
       </div>
 
+      {/* External mode: the user points the plugin at their own QuestDB, so
+          host + connect ports are what we use. In managed mode the address is
+          resolved automatically (signalk-container), so these are hidden. */}
       {!managedContainer && (
+        <>
+          <div style={S.fieldRow}>
+            <span style={S.label}>QuestDB host</span>
+            <input
+              style={S.input}
+              value={questdbHost}
+              onChange={(e) => setQuestdbHost(e.target.value)}
+            />
+          </div>
+
+          <div style={S.fieldRow}>
+            <span style={S.label}>HTTP port (queries)</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              value={questdbHttpPort}
+              onChange={(e) => setQuestdbHttpPort(Number(e.target.value))}
+            />
+          </div>
+
+          <div style={S.fieldRow}>
+            <span style={S.label}>ILP port (writes)</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              value={questdbIlpPort}
+              onChange={(e) => setQuestdbIlpPort(Number(e.target.value))}
+            />
+          </div>
+        </>
+      )}
+
+      {/* Managed mode: connectivity is automatic. "Bind to 0.0.0.0" is the one
+          switch that matters — turning it on publishes QuestDB on the LAN and
+          reveals the host-port/network knobs that path uses. */}
+      {managedContainer && (
         <div style={S.fieldRow}>
-          <span style={S.label}>QuestDB host</span>
+          <span style={S.label}>Bind to 0.0.0.0</span>
           <input
-            style={S.input}
-            value={questdbHost}
-            onChange={(e) => setQuestdbHost(e.target.value)}
+            type="checkbox"
+            style={S.checkbox}
+            checked={exposeToContainers}
+            onChange={(e) => setExposeToContainers(e.target.checked)}
           />
+          <span
+            style={{
+              ...S.hint,
+              color: exposeToContainers ? "#ef4444" : undefined,
+            }}
+          >
+            {exposeToContainers
+              ? "Caution! This exposes your data to the network"
+              : "Signal K reaches QuestDB automatically — only enable to reach it from another machine or a separate-Docker Grafana"}
+          </span>
         </div>
       )}
 
-      <div style={S.fieldRow}>
-        <span style={S.label}>HTTP port (queries)</span>
-        <input
-          style={S.inputSmall}
-          type="number"
-          value={questdbHttpPort}
-          onChange={(e) => setQuestdbHttpPort(Number(e.target.value))}
-        />
-      </div>
+      {managedContainer && exposeToContainers && (
+        <>
+          <div style={S.fieldRow}>
+            <span style={S.label}>HTTP port (queries)</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              value={questdbHttpPort}
+              onChange={(e) => setQuestdbHttpPort(Number(e.target.value))}
+            />
+          </div>
 
-      <div style={S.fieldRow}>
-        <span style={S.label}>ILP port (writes)</span>
-        <input
-          style={S.inputSmall}
-          type="number"
-          value={questdbIlpPort}
-          onChange={(e) => setQuestdbIlpPort(Number(e.target.value))}
-        />
-      </div>
+          <div style={S.fieldRow}>
+            <span style={S.label}>ILP port (writes)</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              value={questdbIlpPort}
+              onChange={(e) => setQuestdbIlpPort(Number(e.target.value))}
+            />
+          </div>
 
-      <div style={S.fieldRow}>
-        <span style={S.label}>PostgreSQL wire port</span>
-        <input
-          style={S.inputSmall}
-          type="number"
-          value={questdbPgPort}
-          onChange={(e) => setQuestdbPgPort(Number(e.target.value))}
-        />
-        <span style={S.hint}>for Grafana</span>
-      </div>
+          <div style={S.fieldRow}>
+            <span style={S.label}>PostgreSQL wire port</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              value={questdbPgPort}
+              onChange={(e) => setQuestdbPgPort(Number(e.target.value))}
+            />
+            <span style={S.hint}>for Grafana</span>
+          </div>
 
-      <div style={S.fieldRow}>
-        <span style={S.label}>Container network</span>
-        <input
-          style={S.input}
-          value={networkName}
-          onChange={(e) => setNetworkName(e.target.value)}
-        />
-        <span style={S.hint}>shared with signalk-grafana</span>
-      </div>
-
-      <div style={S.fieldRow}>
-        <span style={S.label}>Bind to 0.0.0.0</span>
-        <input
-          type="checkbox"
-          style={S.checkbox}
-          checked={exposeToContainers}
-          onChange={(e) => setExposeToContainers(e.target.checked)}
-        />
-        <span
-          style={{
-            ...S.hint,
-            color: exposeToContainers ? "#ef4444" : undefined,
-          }}
-        >
-          {exposeToContainers
-            ? "Caution! This can expose your data to the internet"
-            : "Only needed if Grafana runs in a separate Docker instance"}
-        </span>
-      </div>
+          <div style={S.fieldRow}>
+            <span style={S.label}>Container network</span>
+            <input
+              style={S.input}
+              value={networkName}
+              onChange={(e) => setNetworkName(e.target.value)}
+            />
+            <span style={S.hint}>shared with signalk-grafana</span>
+          </div>
+        </>
+      )}
 
       {/* Recording */}
       <div style={S.sectionTitle}>Recording</div>

@@ -4,18 +4,26 @@ export const ConfigSchema = Type.Object({
   questdbHost: Type.String({
     default: "127.0.0.1",
     title: "QuestDB host",
+    description:
+      "Only used when managed container is off (external QuestDB). In managed mode the address is resolved automatically.",
   }),
   questdbIlpPort: Type.Number({
     default: 9009,
     title: "ILP port (writes)",
+    description:
+      "External mode, or the host binding when 'Bind to 0.0.0.0' is on. Ignored otherwise (signalk-container allocates the port).",
   }),
   questdbHttpPort: Type.Number({
     default: 9000,
     title: "HTTP port (queries)",
+    description:
+      "External mode, or the host binding when 'Bind to 0.0.0.0' is on. Ignored otherwise (signalk-container allocates the port).",
   }),
   questdbPgPort: Type.Number({
     default: 8812,
     title: "PostgreSQL wire port",
+    description:
+      "Host binding for Grafana/psql when 'Bind to 0.0.0.0' is on. Ignored otherwise (signalk-container allocates the port).",
   }),
   questdbVersion: Type.String({
     default: "9.2.0",
@@ -86,14 +94,14 @@ export const ConfigSchema = Type.Object({
     default: "sk-network",
     title: "Container network",
     description:
-      "Shared Podman/Docker network so Grafana can connect via container DNS",
+      "Shared Podman/Docker network for QuestDB. Only applied when 'Bind to 0.0.0.0' is on (so a separate-Docker Grafana can reach QuestDB by DNS).",
   }),
 
   exposeToContainers: Type.Boolean({
     default: false,
     title: "Bind to 0.0.0.0",
     description:
-      "Caution! This can expose your data to the internet. Only enable if Grafana runs in a separate Docker instance.",
+      "Publish QuestDB's ports on all interfaces so another machine or a separate-Docker Grafana can reach them. Off (default) keeps QuestDB private — Signal K still reaches it automatically. Caution! Enabling exposes your data to the network.",
   }),
 
   compression: Type.Union(
