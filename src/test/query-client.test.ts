@@ -19,6 +19,17 @@ describe("validateIdentifier", () => {
     );
   });
 
+  it("accepts paths containing underscores", () => {
+    assert.equal(
+      validateIdentifier("electrical.batteries.house_bank.voltage"),
+      "electrical.batteries.house_bank.voltage",
+    );
+    assert.equal(
+      validateIdentifier("tanks.fuel.starboard_main.currentLevel"),
+      "tanks.fuel.starboard_main.currentLevel",
+    );
+  });
+
   it("rejects SQL injection attempts", () => {
     assert.throws(() => validateIdentifier("'; DROP TABLE signalk;--"));
     assert.throws(() => validateIdentifier("path OR 1=1"));

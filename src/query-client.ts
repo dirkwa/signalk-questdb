@@ -1,4 +1,4 @@
-const SAFE_IDENTIFIER = /^[a-zA-Z0-9._:-]+$/;
+const SAFE_IDENTIFIER = /^[a-zA-Z0-9_.:-]+$/;
 const READ_ONLY_SQL = /^\s*(SELECT|SHOW|WITH)\b/i;
 const DANGEROUS_SQL =
   /\b(DROP|ALTER|INSERT|UPDATE|DELETE|CREATE|TRUNCATE|GRANT|REVOKE)\b/i;
