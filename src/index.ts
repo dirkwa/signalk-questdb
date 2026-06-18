@@ -63,6 +63,7 @@ interface ContainerConfig {
   env: Record<string, string>;
   restart?: string;
   resources?: ContainerResourceLimits;
+  ulimits?: Record<string, number | { soft: number; hard: number }>;
   healthcheck?:
     | false
     | {
@@ -175,6 +176,14 @@ const QUESTDB_HEALTHCHECK = {
   startPeriod: "15s",
   retries: 3,
 };
+
+// QuestDB recommends nofile=1048576; below it the engine logs an open-files
+// warning and risks WAL corruption under heavy ingestion. A containerized
+// process inherits this limit from the runtime, not the host's `fs.file-max`,
+// so we pin it on the container. signalk-container clamps it down to what the
+// host can actually grant (a rootless container cannot exceed the calling
+// user's hard limit), so this is safe even where the host limit is lower.
+const QUESTDB_ULIMITS = { nofile: 1048576 };
 
 function buildResourceLimits(config: Config): ContainerResourceLimits {
   return {
@@ -454,6 +463,7 @@ module.exports = (app: App) => {
           env: containerEnv,
           restart: "unless-stopped",
           resources: buildResourceLimits(config),
+          ulimits: QUESTDB_ULIMITS,
           healthcheck: QUESTDB_HEALTHCHECK,
         };
         const resolveEndpoints = await applyQuestdbNetworking(
@@ -937,6 +947,7 @@ module.exports = (app: App) => {
             resources: currentConfig
               ? buildResourceLimits(currentConfig)
               : undefined,
+            ulimits: QUESTDB_ULIMITS,
             healthcheck: QUESTDB_HEALTHCHECK,
           };
           const resolveUpdateEndpoints = await applyQuestdbNetworking(
