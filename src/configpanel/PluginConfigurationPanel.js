@@ -37,6 +37,30 @@ const S = {
   },
   btnDisabled: { opacity: 0.5, cursor: "not-allowed" },
   status: { marginTop: 8, fontSize: 12, minHeight: 18 },
+  warnBanner: {
+    padding: "12px 16px",
+    background: "#fef2f2",
+    border: "1px solid #fecaca",
+    borderRadius: 10,
+    marginBottom: 12,
+    fontSize: 13,
+    color: "#991b1b",
+    lineHeight: 1.5,
+  },
+  warnBannerTitle: { fontWeight: 700, marginBottom: 4 },
+  warnBannerCode: {
+    display: "block",
+    marginTop: 8,
+    padding: "8px 10px",
+    background: "#fff",
+    border: "1px solid #fecaca",
+    borderRadius: 6,
+    fontFamily: "monospace",
+    fontSize: 12,
+    color: "#7f1d1d",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+  },
   card: {
     display: "flex",
     alignItems: "center",
@@ -412,6 +436,8 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   };
 
   const isRunning = dbStatus && dbStatus.status === "running";
+  const suspendedTables = (isRunning && dbStatus.suspendedTables) || [];
+  const walSuspended = suspendedTables.length > 0;
 
   // Build version options: latest first, then pre-releases, then stable
   const stableVersions = versions.filter((v) => !v.prerelease).slice(0, 3);
@@ -426,6 +452,32 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         <div style={S.empty}>Checking QuestDB...</div>
       ) : isRunning ? (
         <>
+          {walSuspended && (
+            <div style={S.warnBanner}>
+              <div style={S.warnBannerTitle}>
+                QuestDB WAL suspended — recording stalled
+              </div>
+              Rows are arriving but no longer commit, so the counts below have
+              stopped advancing. This usually follows a torn write (often a low
+              host <code>fs.file-max</code> limit). Resume each suspended table
+              in the QuestDB SQL console (<code>:9000</code>), skipping the
+              broken transaction:
+              <code style={S.warnBannerCode}>
+                {suspendedTables
+                  .map((t) => {
+                    // Double-quote the identifier (escaping embedded quotes) so
+                    // the copy-pasted SQL is valid even for table names with
+                    // spaces or other special characters.
+                    const ident = `"${String(t.name).replace(/"/g, '""')}"`;
+                    return (
+                      `ALTER TABLE ${ident} RESUME WAL FROM TXN ${t.writerTxn + 1};` +
+                      `  -- ${formatNumber(t.txnLag)} txns behind`
+                    );
+                  })
+                  .join("\n")}
+              </code>
+            </div>
+          )}
           <div style={S.card}>
             <div
               style={{ ...S.cardIcon, background: "#7c3aed", color: "#fff" }}
@@ -436,12 +488,15 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               <div style={S.cardTitle}>QuestDB</div>
               <div style={S.cardMeta}>
                 {dbStatus?.endpoint || `${questdbHost}:${questdbHttpPort}`}{" "}
-                &middot; Recording
+                &middot; {walSuspended ? "WAL suspended" : "Recording"}
               </div>
             </div>
             <div
-              style={{ ...S.stateIndicator, background: "#10b981" }}
-              title="Running"
+              style={{
+                ...S.stateIndicator,
+                background: walSuspended ? "#ef4444" : "#10b981",
+              }}
+              title={walSuspended ? "WAL suspended" : "Running"}
             />
           </div>
 

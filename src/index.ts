@@ -674,10 +674,42 @@ module.exports = (app: App) => {
             // tables may not exist yet during startup
           }
 
+          // A suspended WAL means rows are arriving over ILP but never commit,
+          // so totalRows/activePathsToday quietly flatline while the status line
+          // still reads "running". Surface it explicitly so the panel can warn
+          // instead of looking healthy. `txnLag` = sequencer ahead of writer =
+          // the backlog that will never drain until the WAL is resumed.
+          let suspendedTables: {
+            name: string;
+            writerTxn: number;
+            sequencerTxn: number;
+            txnLag: number;
+          }[] = [];
+          try {
+            const walResult = await queryClient.exec(
+              "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true",
+            );
+            suspendedTables = queryClient.toObjects(walResult).map((row) => {
+              const writerTxn = Number(row.writerTxn ?? 0);
+              const sequencerTxn = Number(row.sequencerTxn ?? 0);
+              return {
+                name: String(row.name),
+                writerTxn,
+                sequencerTxn,
+                txnLag: Math.max(0, sequencerTxn - writerTxn),
+              };
+            });
+          } catch {
+            // wal_tables() is unavailable on non-WAL/older QuestDB, or the
+            // tables don't exist yet during startup — treat as "not suspended".
+          }
+
           res.json({
             status: "running",
             totalRows,
             activePathsToday,
+            walSuspended: suspendedTables.length > 0,
+            suspendedTables,
             endpoint: questdbEndpoints
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
               : null,
