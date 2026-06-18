@@ -143,3 +143,48 @@ describe("history-v2 context normalization", () => {
     assert.ok(captured[0].sql.includes("context = 'self'"));
   });
 });
+
+describe("history-v2 navigation.position aggregate", () => {
+  async function capturePositionSql(aggregate: string): Promise<string> {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-01-01T01:00:00Z" },
+      resolution: 60,
+      pathSpecs: [{ path: "navigation.position", aggregate, parameter: [] }],
+    } as any);
+
+    return captured[0].sql;
+  }
+
+  it("uses first(lat)/first(lon) for aggregate 'first'", async () => {
+    const sql = await capturePositionSql("first");
+    assert.ok(
+      sql.includes("first(lat)") && sql.includes("first(lon)"),
+      `Expected first(lat)/first(lon), got: ${sql}`,
+    );
+  });
+
+  it("honors aggregate 'last' with last(lat)/last(lon)", async () => {
+    const sql = await capturePositionSql("last");
+    assert.ok(
+      sql.includes("last(lat)") && sql.includes("last(lon)"),
+      `Expected last(lat)/last(lon), got: ${sql}`,
+    );
+  });
+
+  it("falls back to first for non-pair-preserving aggregates", async () => {
+    for (const aggregate of ["average", "min", "max", "mid", "middle_index"]) {
+      const sql = await capturePositionSql(aggregate);
+      assert.ok(
+        sql.includes("first(lat)") && sql.includes("first(lon)"),
+        `Expected first(lat)/first(lon) for '${aggregate}', got: ${sql}`,
+      );
+    }
+  });
+});
