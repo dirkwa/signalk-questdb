@@ -498,7 +498,13 @@ module.exports = (app: App) => {
     app.setPluginStatus("Creating tables...");
     await queryClient.ensureTables();
 
-    writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg));
+    writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg), {
+      // Surface a flapping ILP connection instead of leaving the status line
+      // stuck on a cheerful "Recording" while every sample is dropped.
+      onUnhealthy: (msg) => app.setPluginError(msg),
+      onHealthy: () =>
+        app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`),
+    });
     await writer.connect();
 
     const v2Provider = createHistoryProviderV2(queryClient, app.selfContext);
