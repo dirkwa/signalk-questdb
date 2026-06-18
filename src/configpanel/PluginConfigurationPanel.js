@@ -464,11 +464,16 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               broken transaction:
               <code style={S.warnBannerCode}>
                 {suspendedTables
-                  .map(
-                    (t) =>
-                      `ALTER TABLE ${t.name} RESUME WAL FROM TXN ${t.writerTxn + 1};` +
-                      `  -- ${formatNumber(t.txnLag)} txns behind`,
-                  )
+                  .map((t) => {
+                    // Double-quote the identifier (escaping embedded quotes) so
+                    // the copy-pasted SQL is valid even for table names with
+                    // spaces or other special characters.
+                    const ident = `"${String(t.name).replace(/"/g, '""')}"`;
+                    return (
+                      `ALTER TABLE ${ident} RESUME WAL FROM TXN ${t.writerTxn + 1};` +
+                      `  -- ${formatNumber(t.txnLag)} txns behind`
+                    );
+                  })
                   .join("\n")}
               </code>
             </div>

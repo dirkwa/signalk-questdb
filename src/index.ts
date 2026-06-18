@@ -687,7 +687,7 @@ module.exports = (app: App) => {
           }[] = [];
           try {
             const walResult = await queryClient.exec(
-              "SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true",
+              "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true",
             );
             suspendedTables = queryClient.toObjects(walResult).map((row) => {
               const writerTxn = Number(row.writerTxn ?? 0);
