@@ -149,9 +149,14 @@ export function createHistoryProviderV2(
 
       if (isPosition) {
         const where = buildRangeWhere(range, safeContext);
+        // Position is an object-valued lat/lon pair. Only first/last keep a
+        // real, co-recorded coordinate; per-axis avg/min/max/mid would
+        // fabricate a point the vessel never occupied, so they fall back to
+        // first. A silent caller also gets first (the server default).
+        const posAgg = spec.aggregate === "last" ? "last" : "first";
         let sql: string;
         if (query.resolution && query.resolution > 0) {
-          sql = `SELECT ts, first(lat) as lat, first(lon) as lon FROM ${table} WHERE ${where} SAMPLE BY ${Math.floor(query.resolution)}s FILL(NULL) ORDER BY ts`;
+          sql = `SELECT ts, ${posAgg}(lat) as lat, ${posAgg}(lon) as lon FROM ${table} WHERE ${where} SAMPLE BY ${Math.floor(query.resolution)}s FILL(NULL) ORDER BY ts`;
         } else {
           sql = `SELECT ts, lat, lon FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
         }
