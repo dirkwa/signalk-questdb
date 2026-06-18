@@ -36,6 +36,11 @@ export class ILPWriter {
   private buffer: string[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  // Fires once a fresh connection has stayed up for stableConnectionMs. That is
+  // what marks the connection healthy and resets the backoff — NOT the close
+  // handler, so a connection that recovers and simply stays connected (never
+  // closing again) still clears the unhealthy state.
+  private stableTimer: NodeJS.Timeout | null = null;
   private reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
   private connected = false;
   private connecting = false;
@@ -106,10 +111,11 @@ export class ILPWriter {
         this.connectedAt = Date.now();
         // NOTE: do NOT reset reconnectDelay here. A successful TCP connect is
         // not proof the connection is usable — QuestDB accepts the handshake
-        // then drops us when it is overloaded. The delay is only reset once the
-        // connection proves stable (survives STABLE_CONNECTION_MS), handled in
-        // the `close` branch below.
+        // then drops us when it is overloaded. The delay is reset, and the
+        // connection marked healthy, only once it survives stableConnectionMs
+        // (the stability timer below) — independent of any later `close`.
         this.debug(`ILP connected to ${this.host}:${this.port}`);
+        this.startStabilityTimer(socket);
         this.startFlushTimer();
         resolve();
       });
@@ -128,24 +134,21 @@ export class ILPWriter {
       // lives here — the connect() rejection path deliberately does NOT also
       // reschedule, which would double-count flaps and run two timers.
       socket.on("close", () => {
-        const wasConnected = this.connected;
+        const wasStable = this.connected && !this.stableTimer;
         const upForMs = this.connectedAt ? Date.now() - this.connectedAt : 0;
         this.connected = false;
         this.connecting = false;
         this.connectedAt = 0;
+        this.stopStabilityTimer();
         this.stopFlushTimer();
         if (this.stopped) return;
 
-        // A connection that survived past the stability threshold is treated as
-        // a healthy session that happened to end: reset the backoff and flap
-        // counter so an occasional restart reconnects promptly. Anything
-        // shorter (including a never-fully-connected socket) is a flap — grow
-        // the backoff so we stop hammering an unhealthy QuestDB.
-        if (wasConnected && upForMs >= this.stableConnectionMs) {
-          this.reconnectDelay = this.initialReconnectDelay;
-          this.consecutiveFlaps = 0;
-          this.markHealthy();
-        } else {
+        // If the stability timer had already fired (wasStable), this was a
+        // healthy session that simply ended — backoff/flaps were already reset
+        // by the timer, so just reconnect promptly. Otherwise the connection
+        // dropped before proving stable: a flap — grow the backoff so we stop
+        // hammering an unhealthy QuestDB.
+        if (!wasStable) {
           this.consecutiveFlaps++;
           this.reconnectDelay = Math.min(
             this.reconnectDelay * 2,
@@ -161,6 +164,27 @@ export class ILPWriter {
         this.scheduleReconnect();
       });
     });
+  }
+
+  // Mark the connection healthy once it has stayed up for stableConnectionMs.
+  // Guarded on socket identity so a stale timer from a previous socket can't
+  // clear the state of a newer connection.
+  private startStabilityTimer(socket: net.Socket): void {
+    this.stopStabilityTimer();
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = null;
+      if (this.stopped || !this.connected || this.socket !== socket) return;
+      this.reconnectDelay = this.initialReconnectDelay;
+      this.consecutiveFlaps = 0;
+      this.markHealthy();
+    }, this.stableConnectionMs);
+  }
+
+  private stopStabilityTimer(): void {
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = null;
+    }
   }
 
   private markUnhealthy(): void {
@@ -235,16 +259,31 @@ export class ILPWriter {
 
   private enqueue(line: string): void {
     this.buffer.push(line);
-    // Bound the buffer so a long QuestDB outage can't exhaust memory. Drop from
-    // the head (oldest samples) — the newest data is the most useful to retain
-    // for a live history feed. Count drops so markUnhealthy can report them.
+    this.enforceBufferCap();
+    if (this.buffer.length >= FLUSH_BATCH_SIZE) {
+      this.flush();
+    }
+  }
+
+  // Put a failed flush's lines back at the FRONT (they precede anything enqueued
+  // since) and re-apply the cap. Going through the same per-line cap as
+  // enqueue() keeps MAX_BUFFER_LINES honest across repeated flap cycles —
+  // re-queuing the whole batch as one element would let the buffer grow without
+  // bound and undercount drops.
+  private requeueFront(lines: string[]): void {
+    if (lines.length === 0) return;
+    this.buffer.unshift(...lines);
+    this.enforceBufferCap();
+  }
+
+  // Bound the buffer so a long QuestDB outage can't exhaust memory. Drop from
+  // the head (oldest samples) — the newest data is the most useful to retain
+  // for a live history feed. Count drops so markUnhealthy can report them.
+  private enforceBufferCap(): void {
     if (this.buffer.length > MAX_BUFFER_LINES) {
       const overflow = this.buffer.length - MAX_BUFFER_LINES;
       this.buffer.splice(0, overflow);
       this.droppedLines += overflow;
-    }
-    if (this.buffer.length >= FLUSH_BATCH_SIZE) {
-      this.flush();
     }
   }
 
@@ -255,13 +294,16 @@ export class ILPWriter {
     this.buffer = [];
 
     // The write callback reports failure (e.g. ERR_STREAM_DESTROYED when
-    // QuestDB drops the connection mid-flush). Re-prepend the batch so the next
-    // flush retries it on the reconnected socket instead of silently losing it.
-    // QuestDB sorts/dedups by the designated `ts`, so the resulting out-of-order
-    // ingestion is harmless.
+    // QuestDB drops the connection mid-flush). Re-queue the batch's lines so the
+    // next flush retries them on the reconnected socket instead of silently
+    // losing them. QuestDB sorts/dedups by the designated `ts`, so the resulting
+    // out-of-order ingestion is harmless. Splitting back into lines (keeping the
+    // trailing newline on each) means the re-queued data counts toward
+    // MAX_BUFFER_LINES per line, preserving the bound across flap cycles.
+    const lines = data.length > 0 ? data.split(/(?<=\n)/) : [];
     const canWrite = this.socket.write(data, (err) => {
       if (err) {
-        this.buffer.unshift(data);
+        this.requeueFront(lines);
         this.debug(`ILP write failed, re-queued batch: ${err.message}`);
       }
     });
@@ -287,6 +329,7 @@ export class ILPWriter {
   async disconnect(): Promise<void> {
     this.stopped = true;
     this.stopFlushTimer();
+    this.stopStabilityTimer();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

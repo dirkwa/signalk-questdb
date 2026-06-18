@@ -146,7 +146,7 @@ describe("ILPWriter", () => {
     // re-flush of the retained batch onto the second socket.
     await new Promise((resolve) => setTimeout(resolve, 1200));
     await writer.disconnect();
-    server.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
 
     const all = received.join("");
     assert.ok(
@@ -183,13 +183,71 @@ describe("ILPWriter", () => {
     // 3 flaps at ~20-40ms backoff each resolve well within this window.
     await new Promise((resolve) => setTimeout(resolve, 600));
     await writer.disconnect();
-    server.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
 
     assert.ok(
       unhealthyMsg !== null,
       "onUnhealthy should fire after repeated flaps",
     );
     assert.match(unhealthyMsg!, /dropping the write connection/);
+  });
+
+  it("recovers health when a connection stays up, without a later close", async () => {
+    // First few connections instant-drop (driving the writer unhealthy), then
+    // the server stops dropping and just holds the socket open. Health must be
+    // restored by the stability timer alone — there is no subsequent close to
+    // trigger it. This is the exact regression CR caught: markHealthy gated on
+    // the close handler would leave the writer stuck unhealthy forever.
+    let connCount = 0;
+    const heldSockets: net.Socket[] = [];
+    const server = net.createServer((socket) => {
+      connCount++;
+      if (connCount <= 3) {
+        socket.destroy();
+      } else {
+        // Keep the socket open so the connection proves stable.
+        heldSockets.push(socket);
+        socket.on("data", () => {});
+      }
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    let unhealthyMsg: string | null = null;
+    let healthyFired = false;
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      onUnhealthy: (msg) => {
+        unhealthyMsg = msg;
+      },
+      onHealthy: () => {
+        healthyFired = true;
+      },
+      timing: {
+        initialReconnectDelay: 20,
+        maxReconnectDelay: 40,
+        stableConnectionMs: 150,
+        unhealthyAfterFlaps: 3,
+      },
+    });
+    await writer.connect().catch(() => {});
+
+    // Window covers: 3 flaps (~20-40ms each) → unhealthy, then a connection
+    // that survives stableConnectionMs (150ms) → onHealthy via the timer.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await writer.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    heldSockets.forEach((s) => s.destroy());
+
+    assert.ok(
+      unhealthyMsg !== null,
+      "writer should have gone unhealthy from the initial flaps",
+    );
+    assert.ok(
+      healthyFired,
+      "onHealthy should fire once a connection stays up past stableConnectionMs, with no subsequent close",
+    );
   });
 
   it("escapes special characters in tags", async () => {
