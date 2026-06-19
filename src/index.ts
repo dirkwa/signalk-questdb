@@ -507,6 +507,10 @@ module.exports = (app: App) => {
         );
 
         app.setPluginStatus("Starting QuestDB container...");
+        // Clear any prior clamp so a run that no longer clamps (e.g. the host
+        // limit was raised) doesn't leave a stale warning; onUlimitClamped
+        // re-sets it if this run clamps again.
+        ulimitClamp = null;
         await containers.ensureRunning(
           QUESTDB_CONTAINER_NAME,
           containerConfig,
@@ -661,6 +665,10 @@ module.exports = (app: App) => {
         clearInterval(retentionTimer);
         retentionTimer = null;
       }
+
+      // Clear the clamp warning so it doesn't survive into the next start
+      // (e.g. a switch to external/unmanaged mode that never calls ensureRunning).
+      ulimitClamp = null;
 
       if (writer) {
         await writer.disconnect();
@@ -996,6 +1004,9 @@ module.exports = (app: App) => {
             QUESTDB_CONTAINER_NAME,
             updateConfig,
           );
+          // Clear any prior clamp before re-running so a no-longer-clamping
+          // update doesn't leave a stale warning.
+          ulimitClamp = null;
           await containers.ensureRunning(QUESTDB_CONTAINER_NAME, updateConfig, {
             onUlimitClamped,
           });
