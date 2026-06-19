@@ -498,10 +498,20 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               {formatNumber(ulimitClamp.requested)}, but this host only allows{" "}
               {formatNumber(ulimitClamp.granted)}, so it was capped. QuestDB is
               running on the lower limit. To grant the full value, raise the
-              limit for the user running the container runtime (e.g.{" "}
-              <code>/etc/security/limits.conf</code> and the systemd{" "}
-              <code>user@.service</code> <code>LimitNOFILE</code>), then restart
-              the QuestDB container.
+              host limit for the user running the container runtime — under
+              rootless Podman that means a systemd <code>user@.service</code>{" "}
+              <code>LimitNOFILE</code> drop-in (editing{" "}
+              <code>/etc/security/limits.conf</code> alone is usually not
+              enough) — then restart the QuestDB container.{" "}
+              <a
+                href="https://github.com/dirkwa/signalk-container#raising-the-open-files-limit-nofile"
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "#92400e", textDecoration: "underline" }}
+              >
+                Step-by-step instructions
+              </a>
+              .
             </div>
           )}
           <div style={S.card}>
