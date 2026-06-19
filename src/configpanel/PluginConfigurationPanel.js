@@ -48,6 +48,16 @@ const S = {
     lineHeight: 1.5,
   },
   warnBannerTitle: { fontWeight: 700, marginBottom: 4 },
+  infoBanner: {
+    padding: "12px 16px",
+    background: "#fffbeb",
+    border: "1px solid #fde68a",
+    borderRadius: 10,
+    marginBottom: 12,
+    fontSize: 13,
+    color: "#92400e",
+    lineHeight: 1.5,
+  },
   warnBannerCode: {
     display: "block",
     marginTop: 8,
@@ -438,6 +448,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const isRunning = dbStatus && dbStatus.status === "running";
   const suspendedTables = (isRunning && dbStatus.suspendedTables) || [];
   const walSuspended = suspendedTables.length > 0;
+  const ulimitClamp = (isRunning && dbStatus.ulimitClamp) || null;
 
   // Build version options: latest first, then pre-releases, then stable
   const stableVersions = versions.filter((v) => !v.prerelease).slice(0, 3);
@@ -476,6 +487,21 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                   })
                   .join("\n")}
               </code>
+            </div>
+          )}
+          {ulimitClamp && (
+            <div style={S.infoBanner}>
+              <div style={S.warnBannerTitle}>
+                QuestDB open-files limit capped by the host
+              </div>
+              QuestDB requested a <code>{ulimitClamp.ulimit}</code> limit of{" "}
+              {formatNumber(ulimitClamp.requested)}, but this host only allows{" "}
+              {formatNumber(ulimitClamp.granted)}, so it was capped. QuestDB is
+              running on the lower limit. To grant the full value, raise the
+              limit for the user running the container runtime (e.g.{" "}
+              <code>/etc/security/limits.conf</code> and the systemd{" "}
+              <code>user@.service</code> <code>LimitNOFILE</code>), then restart
+              the QuestDB container.
             </div>
           )}
           <div style={S.card}>

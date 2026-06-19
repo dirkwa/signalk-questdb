@@ -75,10 +75,28 @@ interface ContainerConfig {
       };
 }
 
+// Mirror of signalk-container's `UlimitClamp` event (signalk-container ≥
+// 1.18.0). The plugin can't import the type — signalk-container is an optional
+// peer reached via globalThis — so it is redeclared here.
+interface UlimitClamp {
+  ulimit: string;
+  requested: number;
+  granted: number;
+  reason: string;
+}
+
+interface EnsureRunningOptions {
+  onUlimitClamped?: (event: UlimitClamp) => void;
+}
+
 interface ContainerManagerApi {
   getRuntime: () => { runtime: string; version: string } | null;
   whenReady: () => Promise<void>;
-  ensureRunning: (name: string, config: ContainerConfig) => Promise<void>;
+  ensureRunning: (
+    name: string,
+    config: ContainerConfig,
+    options?: EnsureRunningOptions,
+  ) => Promise<void>;
   stop: (name: string) => Promise<void>;
   remove: (name: string) => Promise<void>;
   ensureNetwork: (name: string) => Promise<void>;
@@ -200,6 +218,21 @@ module.exports = (app: App) => {
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
   let currentConfig: Config | null = null;
+  // Last nofile-ulimit clamp reported by signalk-container, surfaced in
+  // /api/status and the config panel so the operator can see the host limit
+  // capped QuestDB's requested value. Null until a clamp happens (or on a
+  // signalk-container older than 1.18.0, which doesn't emit the event).
+  let ulimitClamp: UlimitClamp | null = null;
+
+  // Record a clamp event so /api/status and the config-panel banner can
+  // surface it. (The plugin status line is not used — it is driven by the
+  // recording state and would immediately overwrite a warning set here.)
+  // Wired into both ensureRunning call sites so an in-place update keeps the
+  // warning current.
+  const onUlimitClamped = (event: UlimitClamp): void => {
+    ulimitClamp = event;
+    app.debug(event.reason);
+  };
   // The HTTP/ILP endpoints the Signal K process uses to reach QuestDB. In
   // managed mode signalk-container resolves these (loopback bare-metal,
   // container DNS when SK is containerized); in external mode they come from
@@ -474,7 +507,17 @@ module.exports = (app: App) => {
         );
 
         app.setPluginStatus("Starting QuestDB container...");
-        await containers.ensureRunning(QUESTDB_CONTAINER_NAME, containerConfig);
+        // Clear any prior clamp so a run that no longer clamps (e.g. the host
+        // limit was raised) doesn't leave a stale warning; onUlimitClamped
+        // re-sets it if this run clamps again.
+        ulimitClamp = null;
+        await containers.ensureRunning(
+          QUESTDB_CONTAINER_NAME,
+          containerConfig,
+          {
+            onUlimitClamped,
+          },
+        );
         app.debug("QuestDB container ready");
 
         questdbEndpoints = await resolveEndpoints();
@@ -623,6 +666,10 @@ module.exports = (app: App) => {
         retentionTimer = null;
       }
 
+      // Clear the clamp warning so it doesn't survive into the next start
+      // (e.g. a switch to external/unmanaged mode that never calls ensureRunning).
+      ulimitClamp = null;
+
       if (writer) {
         await writer.disconnect();
         writer = null;
@@ -720,6 +767,7 @@ module.exports = (app: App) => {
             activePathsToday,
             walSuspended: suspendedTables.length > 0,
             suspendedTables,
+            ulimitClamp,
             endpoint: questdbEndpoints
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
               : null,
@@ -956,7 +1004,12 @@ module.exports = (app: App) => {
             QUESTDB_CONTAINER_NAME,
             updateConfig,
           );
-          await containers.ensureRunning(QUESTDB_CONTAINER_NAME, updateConfig);
+          // Clear any prior clamp before re-running so a no-longer-clamping
+          // update doesn't leave a stale warning.
+          ulimitClamp = null;
+          await containers.ensureRunning(QUESTDB_CONTAINER_NAME, updateConfig, {
+            onUlimitClamped,
+          });
 
           // Re-resolve so the export endpoints and status line reflect the
           // current endpoint. The version bump keeps the same container name
