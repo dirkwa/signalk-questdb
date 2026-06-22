@@ -4,7 +4,40 @@ import {
   validateIdentifier,
   validateTimestamp,
   isReadOnlySQL,
+  QueryClient,
 } from "../query-client";
+import type { QuestDBResult } from "../query-client";
+
+// Build a QueryClient whose exec() is stubbed: every call records the SQL and
+// returns the next canned result (a single-column `column` dataset for the
+// designated-timestamp introspection, or an empty dataset for DDL). Lets us
+// test the schema-heal logic without a live QuestDB.
+function stubClient(responder: (sql: string) => QuestDBResult): {
+  client: QueryClient;
+  sql: string[];
+} {
+  const client = new QueryClient("127.0.0.1", 9000);
+  const sql: string[] = [];
+  (client as unknown as { exec: (q: string) => Promise<QuestDBResult> }).exec =
+    (q: string) => {
+      sql.push(q);
+      return Promise.resolve(responder(q));
+    };
+  return { client, sql };
+}
+
+const tsRow = (column: string): QuestDBResult => ({
+  columns: [{ name: "column", type: "STRING" }],
+  dataset: [[column]],
+  count: 1,
+  timestamp: -1,
+});
+const emptyResult: QuestDBResult = {
+  columns: [{ name: "column", type: "STRING" }],
+  dataset: [],
+  count: 0,
+  timestamp: -1,
+};
 
 describe("validateIdentifier", () => {
   it("accepts valid Signal K paths", () => {
@@ -81,6 +114,79 @@ describe("isReadOnlySQL", () => {
     assert.ok(
       !isReadOnlySQL("SELECT 1; DROP TABLE signalk"),
       "Should block DROP even after SELECT",
+    );
+  });
+});
+
+describe("QueryClient schema heal", () => {
+  it("reports the designated timestamp column", async () => {
+    const { client } = stubClient(() => tsRow("ts"));
+    assert.equal(await client.designatedTimestamp("signalk"), "ts");
+  });
+
+  it("returns null when the table has no designated timestamp / is missing", async () => {
+    const { client } = stubClient(() => emptyResult);
+    assert.equal(await client.designatedTimestamp("signalk"), null);
+  });
+
+  it("treats a `ts` designated timestamp as no mismatch", async () => {
+    const { client } = stubClient(() => tsRow("ts"));
+    assert.equal(await client.hasSchemaMismatch("signalk"), false);
+  });
+
+  it("flags a `timestamp` (ILP auto-created) designated timestamp as a mismatch", async () => {
+    const { client } = stubClient(() => tsRow("timestamp"));
+    assert.equal(await client.hasSchemaMismatch("signalk"), true);
+  });
+
+  it("treats a missing table as no mismatch", async () => {
+    const { client } = stubClient(() => emptyResult);
+    assert.equal(await client.hasSchemaMismatch("signalk"), false);
+  });
+
+  it("treats introspection failure as no mismatch (swallowed)", async () => {
+    const { client } = stubClient(() => {
+      throw new Error("table does not exist");
+    });
+    assert.equal(await client.hasSchemaMismatch("signalk"), false);
+  });
+
+  it("healSchema is a no-op on a correct table", async () => {
+    const { client, sql } = stubClient(() => tsRow("ts"));
+    assert.equal(await client.healSchema("signalk"), false);
+    // Only the introspection query ran — no DROP, no CREATE.
+    assert.ok(sql.every((q) => !/DROP TABLE|CREATE TABLE/i.test(q)));
+  });
+
+  it("healSchema drops and recreates a wrong-schema table", async () => {
+    // First introspection says `timestamp` (mismatch); after the rebuild the
+    // CREATE TABLE statements just return empty.
+    let firstIntrospection = true;
+    const { client, sql } = stubClient((q) => {
+      if (/table_columns/.test(q)) {
+        if (firstIntrospection) {
+          firstIntrospection = false;
+          return tsRow("timestamp");
+        }
+        return tsRow("ts");
+      }
+      return emptyResult;
+    });
+    assert.equal(await client.healSchema("signalk"), true);
+    assert.ok(
+      sql.some((q) => /DROP TABLE IF EXISTS signalk/i.test(q)),
+      "should drop the wrong-schema table",
+    );
+    assert.ok(
+      sql.some((q) => /CREATE TABLE IF NOT EXISTS signalk\b/i.test(q)),
+      "should recreate via ensureTables",
+    );
+  });
+
+  it("rejects an invalid table identifier", async () => {
+    const { client } = stubClient(() => emptyResult);
+    await assert.rejects(() =>
+      client.designatedTimestamp("signalk; DROP TABLE x"),
     );
   });
 });
