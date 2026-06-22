@@ -33,6 +33,7 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 - **Image Version** -- dropdown with latest, pre-releases, and last 3 stable releases
 - **Connection** -- managed container toggle, host/ports, PostgreSQL port for Grafana
 - **Recording** -- record self, record AIS targets, retention days
+- **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns (e.g. exclude `navigation.position`)
 - **Compression** (collapsible) -- LZ4/ZSTD codec selection for on-disk storage
 - **InfluxDB Migration** (collapsible) -- auto-detect with manual URL for remote instances
 - **Data Export** (collapsible) -- date range picker, Parquet/CSV format, download button
@@ -103,24 +104,26 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 
 ## Configuration
 
-| Setting            | Default      | Description                                                       |
-| ------------------ | ------------ | ----------------------------------------------------------------- |
-| QuestDB version    | `latest`     | Docker image tag (dropdown shows stable + pre-releases)           |
-| Managed container  | `true`       | Let signalk-container manage QuestDB, or connect to external      |
-| QuestDB host       | `127.0.0.1`  | External QuestDB host (only used when managed=false)              |
-| HTTP port          | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on   |
-| ILP port           | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on   |
-| PostgreSQL port    | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on        |
-| Sampling rate (ms) | `2000`       | Default min ms between writes per path (0 = every update)         |
-| Memory limit       | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)      |
-| CPU limit (cores)  | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                     |
-| Record own vessel  | `true`       | Record self context                                               |
-| Record AIS targets | `false`      | Record other vessels                                              |
-| Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                     |
-| Compression codec  | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                 |
-| Compression level  | `3`          | ZSTD level 1-22 (only when codec is zstd)                         |
-| Container network  | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0) |
-| Bind to 0.0.0.0    | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)        |
+| Setting            | Default      | Description                                                                         |
+| ------------------ | ------------ | ----------------------------------------------------------------------------------- |
+| QuestDB version    | `latest`     | Docker image tag (dropdown shows stable + pre-releases)                             |
+| Managed container  | `true`       | Let signalk-container manage QuestDB, or connect to external                        |
+| QuestDB host       | `127.0.0.1`  | External QuestDB host (only used when managed=false)                                |
+| HTTP port          | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                     |
+| ILP port           | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                     |
+| PostgreSQL port    | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                          |
+| Sampling rate (ms) | `2000`       | Default min ms between writes per path (0 = every update)                           |
+| Memory limit       | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)                        |
+| CPU limit (cores)  | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                                       |
+| Record own vessel  | `true`       | Record self context                                                                 |
+| Record AIS targets | `false`      | Record other vessels                                                                |
+| Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                                       |
+| Path filter mode   | `exclude`    | `exclude` matching paths, or `include` only matching paths                          |
+| Path filter paths  | _(empty)_    | Glob patterns, one per line (e.g. `navigation.position`); empty = record everything |
+| Compression codec  | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                                   |
+| Compression level  | `3`          | ZSTD level 1-22 (only when codec is zstd)                                           |
+| Container network  | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0)                   |
+| Bind to 0.0.0.0    | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)                          |
 
 ## Connectivity
 
