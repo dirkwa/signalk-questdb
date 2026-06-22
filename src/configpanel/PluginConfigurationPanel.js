@@ -490,6 +490,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const isRunning = dbStatus && dbStatus.status === "running";
   const suspendedTables = (isRunning && dbStatus.suspendedTables) || [];
   const walSuspended = suspendedTables.length > 0;
+  const schemaMismatch = (isRunning && dbStatus.schemaMismatch) || false;
   const ulimitClamp = (isRunning && dbStatus.ulimitClamp) || null;
 
   // Build version options: latest first, then pre-releases, then stable
@@ -529,6 +530,20 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                   })
                   .join("\n")}
               </code>
+            </div>
+          )}
+          {schemaMismatch && (
+            <div style={S.warnBanner}>
+              <div style={S.warnBannerTitle}>
+                QuestDB table schema mismatch — data not readable
+              </div>
+              A QuestDB table was re-created by ILP ingestion with the wrong
+              timestamp column, so rows are being stored but reads filtering on
+              time (history, Grafana, and the counts above) return nothing. The
+              plugin rebuilds the affected table with the correct schema
+              automatically within a minute; if this persists, restart the
+              plugin. (The few rows written into the wrong-schema table are lost
+              — they were unreadable anyway.)
             </div>
           )}
           {ulimitClamp && (

@@ -203,6 +203,11 @@ const QUESTDB_HEALTHCHECK = {
 // user's hard limit), so this is safe even where the host limit is lower.
 const QUESTDB_ULIMITS = { nofile: 1048576 };
 
+// How often to re-check that the owned tables still have the correct `ts`
+// schema (and rebuild any ILP auto-created with the wrong shape). 60s is far
+// faster than a human would notice "recording broke" yet negligible load.
+const SCHEMA_HEAL_INTERVAL_MS = 60_000;
+
 function buildResourceLimits(config: Config): ContainerResourceLimits {
   return {
     memory: config.questdbMemoryLimit?.trim() || null,
@@ -217,7 +222,12 @@ module.exports = (app: App) => {
   let writer: ILPWriter | null = null;
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
+  let schemaHealTimer: NodeJS.Timeout | null = null;
   let currentConfig: Config | null = null;
+  // True when the `signalk` table exists with the wrong (ILP-auto-created)
+  // schema — rows ingest but reads filtering on `ts` see nothing. Surfaced in
+  // /api/status; the heal heartbeat clears it once the table is rebuilt.
+  let schemaMismatch = false;
   // Last nofile-ulimit clamp reported by signalk-container, surfaced in
   // /api/status and the config panel so the operator can see the host limit
   // capped QuestDB's requested value. Null until a clamp happens (or on a
@@ -232,6 +242,42 @@ module.exports = (app: App) => {
   const onUlimitClamped = (event: UlimitClamp): void => {
     ulimitClamp = event;
     app.debug(event.reason);
+  };
+
+  // Tables the plugin owns; each is rebuilt if ILP auto-created it with the
+  // wrong designated-timestamp schema. (signalk_position uses `ts` too.)
+  const OWNED_TABLES = ["signalk", "signalk_str", "signalk_position"];
+
+  // Guard so a slow heal (DROP + recreate) on one heartbeat can't overlap the
+  // next tick.
+  let healing = false;
+
+  // Detect and repair any owned table that ILP auto-created with the wrong
+  // schema, updating the `schemaMismatch` flag that /api/status reports. Runs
+  // at startup and on a heartbeat so a table dropped while the plugin is live
+  // is rebuilt with the correct `ts` schema. Best-effort: introspection/heal
+  // errors are logged, not thrown, so they never break the lifecycle.
+  const healSchemaTables = async (): Promise<void> => {
+    if (!queryClient || healing) return;
+    healing = true;
+    try {
+      let mismatch = false;
+      for (const table of OWNED_TABLES) {
+        if (await queryClient.healSchema(table)) {
+          app.debug(
+            `Rebuilt ${table}: ILP had auto-created it with a wrong schema`,
+          );
+        }
+        if (await queryClient.hasSchemaMismatch(table)) mismatch = true;
+      }
+      schemaMismatch = mismatch;
+    } catch (err) {
+      app.debug(
+        `schema heal check failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      healing = false;
+    }
   };
   // The HTTP/ILP endpoints the Signal K process uses to reach QuestDB. In
   // managed mode signalk-container resolves these (loopback bare-metal,
@@ -550,6 +596,10 @@ module.exports = (app: App) => {
 
     app.setPluginStatus("Creating tables...");
     await queryClient.ensureTables();
+    // A prior crash/drop may have left an ILP-auto-created `signalk` table with
+    // the wrong (`timestamp`, not `ts`) schema; heal it before the writer can
+    // ingest into the broken shape.
+    await healSchemaTables();
 
     writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg), {
       // Surface a flapping ILP connection instead of leaving the status line
@@ -631,6 +681,13 @@ module.exports = (app: App) => {
       );
     }
 
+    // Heartbeat: catch and repair a table that gets dropped (e.g. a manual
+    // WAL recovery) and re-auto-created by ILP with the wrong schema, so
+    // recording silently breaking heals itself instead of needing a restart.
+    schemaHealTimer = setInterval(() => {
+      void healSchemaTables();
+    }, SCHEMA_HEAL_INTERVAL_MS);
+
     app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
   }
 
@@ -665,6 +722,12 @@ module.exports = (app: App) => {
         clearInterval(retentionTimer);
         retentionTimer = null;
       }
+
+      if (schemaHealTimer) {
+        clearInterval(schemaHealTimer);
+        schemaHealTimer = null;
+      }
+      schemaMismatch = false;
 
       // Clear the clamp warning so it doesn't survive into the next start
       // (e.g. a switch to external/unmanaged mode that never calls ensureRunning).
@@ -767,6 +830,7 @@ module.exports = (app: App) => {
             activePathsToday,
             walSuspended: suspendedTables.length > 0,
             suspendedTables,
+            schemaMismatch,
             ulimitClamp,
             endpoint: questdbEndpoints
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
