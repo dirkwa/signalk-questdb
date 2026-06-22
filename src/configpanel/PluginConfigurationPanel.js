@@ -208,7 +208,12 @@ function CollapsibleSection({ title, children }) {
   const [open, setOpen] = useState(false);
   return (
     <div>
-      <div
+      {/* A real <button> so keyboard users can toggle with Enter/Space and
+          screen readers announce expanded state; the style resets the default
+          button chrome so it still reads as a section title. */}
+      <button
+        type="button"
+        aria-expanded={open}
         style={{
           ...S.sectionTitle,
           cursor: "pointer",
@@ -216,6 +221,11 @@ function CollapsibleSection({ title, children }) {
           display: "flex",
           alignItems: "center",
           gap: 6,
+          width: "100%",
+          textAlign: "left",
+          background: "none",
+          border: "none",
+          padding: 0,
         }}
         onClick={() => setOpen(!open)}
       >
@@ -229,7 +239,7 @@ function CollapsibleSection({ title, children }) {
           {"\u25b6"}
         </span>
         {title}
-      </div>
+      </button>
       {open && <div style={{ marginBottom: 16 }}>{children}</div>}
     </div>
   );
@@ -267,13 +277,18 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     cfg.defaultSamplingRate ?? 2000,
   );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
+  // Hydrate defensively: a hand-edited or corrupted config could carry a bad
+  // mode or a non-array `paths`, and an unguarded `.join()` would crash the
+  // whole panel render.
   const [filterMode, setFilterMode] = useState(
-    cfg.pathFilter?.mode || "exclude",
+    cfg.pathFilter?.mode === "include" ? "include" : "exclude",
   );
   // One glob per line in the textarea; round-tripped to/from the schema's
   // pathFilter.paths string array.
   const [filterPaths, setFilterPaths] = useState(
-    (cfg.pathFilter?.paths || []).join("\n"),
+    (Array.isArray(cfg.pathFilter?.paths) ? cfg.pathFilter.paths : []).join(
+      "\n",
+    ),
   );
   const [compression, setCompression] = useState(cfg.compression || "lz4");
   const [compressionLevel, setCompressionLevel] = useState(
