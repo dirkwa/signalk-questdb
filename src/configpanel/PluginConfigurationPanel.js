@@ -143,6 +143,19 @@ const S = {
   },
   checkbox: { width: 16, height: 16, accentColor: "#3b82f6" },
   hint: { fontSize: 11, color: "#aaa", marginLeft: 8 },
+  textarea: {
+    padding: "6px 10px",
+    borderRadius: 6,
+    border: "1px solid #ccc",
+    fontSize: 13,
+    fontFamily: "monospace",
+    background: "#fff",
+    color: "#333",
+    width: "100%",
+    minHeight: 70,
+    boxSizing: "border-box",
+    resize: "vertical",
+  },
   empty: {
     textAlign: "center",
     padding: "30px 16px",
@@ -254,6 +267,14 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     cfg.defaultSamplingRate ?? 2000,
   );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
+  const [filterMode, setFilterMode] = useState(
+    cfg.pathFilter?.mode || "exclude",
+  );
+  // One glob per line in the textarea; round-tripped to/from the schema's
+  // pathFilter.paths string array.
+  const [filterPaths, setFilterPaths] = useState(
+    (cfg.pathFilter?.paths || []).join("\n"),
+  );
   const [compression, setCompression] = useState(cfg.compression || "lz4");
   const [compressionLevel, setCompressionLevel] = useState(
     cfg.compressionLevel || 3,
@@ -404,7 +425,13 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       compressionLevel,
       networkName,
       exposeToContainers,
-      pathFilter: cfg.pathFilter || { mode: "exclude", paths: [] },
+      pathFilter: {
+        mode: filterMode,
+        paths: filterPaths
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      },
       samplingRates: cfg.samplingRates || {},
     });
     setActionStatus("Saved! Plugin will restart with new configuration.");
@@ -827,6 +854,37 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         />
         <span style={S.hint}>0 = keep forever</span>
       </div>
+
+      <CollapsibleSection title="Path filtering">
+        <div style={S.fieldRow}>
+          <span style={S.label}>Filter mode</span>
+          <select
+            style={S.select}
+            value={filterMode}
+            onChange={(e) => setFilterMode(e.target.value)}
+          >
+            <option value="exclude">Exclude matching paths</option>
+            <option value="include">Include only matching paths</option>
+          </select>
+        </div>
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ ...S.label, width: "auto", marginBottom: 6 }}>
+            Path patterns (one per line, glob supported)
+          </div>
+          <textarea
+            style={S.textarea}
+            value={filterPaths}
+            onChange={(e) => setFilterPaths(e.target.value)}
+            placeholder={"navigation.position\nnavigation.*\nnotifications.*"}
+          />
+          <div style={S.hint}>
+            {filterMode === "exclude"
+              ? "These paths are NOT recorded; everything else is."
+              : "ONLY these paths are recorded; everything else is dropped."}{" "}
+            Leave empty to record everything.
+          </div>
+        </div>
+      </CollapsibleSection>
 
       <CollapsibleSection title="Compression (on-disk)">
         <div style={S.fieldRow}>
