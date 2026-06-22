@@ -189,4 +189,11 @@ describe("QueryClient schema heal", () => {
       client.designatedTimestamp("signalk; DROP TABLE x"),
     );
   });
+
+  it("hasSchemaMismatch rejects an invalid identifier instead of swallowing it", async () => {
+    const { client } = stubClient(() => emptyResult);
+    await assert.rejects(() =>
+      client.hasSchemaMismatch("signalk; DROP TABLE x"),
+    );
+  });
 });

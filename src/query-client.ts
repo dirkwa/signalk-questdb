@@ -148,6 +148,9 @@ export class QueryClient {
   // `ts` (i.e. ILP auto-created it). A missing table is NOT a mismatch —
   // ensureTables creates it correctly.
   async hasSchemaMismatch(table: string): Promise<boolean> {
+    // Validate up front so an invalid identifier rejects loudly instead of
+    // being swallowed below as "no mismatch".
+    validateIdentifier(table);
     try {
       const ts = await this.designatedTimestamp(table);
       return ts !== null && ts !== "ts";

@@ -537,12 +537,13 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               <div style={S.warnBannerTitle}>
                 QuestDB table schema mismatch — data not readable
               </div>
-              The <code>signalk</code> table was re-created by ILP ingestion
-              with the wrong timestamp column, so rows are being stored but
-              history and Grafana read nothing. The plugin rebuilds the table
-              with the correct schema automatically within a minute; if this
-              persists, restart the plugin. (The few rows written into the
-              wrong-schema table are lost — they were unreadable anyway.)
+              A QuestDB table was re-created by ILP ingestion with the wrong
+              timestamp column, so rows are being stored but reads filtering on
+              time (history, Grafana, and the counts above) return nothing. The
+              plugin rebuilds the affected table with the correct schema
+              automatically within a minute; if this persists, restart the
+              plugin. (The few rows written into the wrong-schema table are lost
+              — they were unreadable anyway.)
             </div>
           )}
           {ulimitClamp && (
