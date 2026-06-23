@@ -1350,6 +1350,13 @@ module.exports = (app: App) => {
                 "appears wedged. Proceeding with teardown to make progress.",
             );
             await teardown();
+            // The wedged start still owns the old chain (its promise never
+            // settled), so reset the gate to a fresh resolved promise —
+            // otherwise every future lifecycle op (e.g. the asyncStart when the
+            // operator re-enables the plugin) would queue behind the dead chain
+            // forever. The abandoned start's own resources are already aborted.
+            lifecycleChain = Promise.resolve();
+            startAbort = null;
           }
 
           app.setPluginStatus(
