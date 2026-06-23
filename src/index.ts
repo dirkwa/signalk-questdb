@@ -247,11 +247,23 @@ module.exports = (app: App) => {
   // capped QuestDB's requested value. Null until a clamp happens (or on a
   // signalk-container older than 1.18.0, which doesn't emit the event).
   let ulimitClamp: UlimitClamp | null = null;
-  // Bumped whenever a teardown (stop, purge-data) invalidates an in-flight
-  // start. asyncStart captures the value at entry and bails before (re)creating
-  // resources if it changed mid-flight, so a purge during the startup window
-  // can't be resurrected by the start it raced.
-  let lifecycleGeneration = 0;
+  // Serializes the lifecycle operations that create or destroy QuestDB
+  // resources — asyncStart, /api/update/apply, and /api/purge-data — so they
+  // can never interleave. Without this, a purge (or update) issued while a
+  // multi-second asyncStart is awaiting whenReady()/ensureRunning()/connect()
+  // could tear down resources the start is about to (re)create, or the start
+  // could resurrect a just-purged container. A simple promise-chain mutex:
+  // each call waits for the previous to settle, then runs.
+  let lifecycleChain: Promise<unknown> = Promise.resolve();
+  const withLifecycleLock = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = lifecycleChain.then(fn, fn);
+    // Keep the chain alive regardless of this op's outcome.
+    lifecycleChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
 
   // Record a clamp event so /api/status and the config-panel banner can
   // surface it. (The plugin status line is not used — it is driven by the
@@ -477,10 +489,9 @@ module.exports = (app: App) => {
     return false;
   }
 
-  async function asyncStart(config: Config) {
-    const myGeneration = lifecycleGeneration;
-    // True once a teardown (stop/purge) has superseded this start attempt.
-    const superseded = () => lifecycleGeneration !== myGeneration;
+  // Runs the actual startup. Always invoked through the lifecycle lock (see
+  // asyncStart) so a purge/update can't interleave with it.
+  async function runStart(config: Config) {
     currentConfig = config;
     // External mode: the configured host/ports are authoritative. Managed mode
     // overwrites this below with the endpoints signalk-container resolves.
@@ -601,13 +612,6 @@ module.exports = (app: App) => {
     const { host: httpHost, port: httpPort } = questdbEndpoints.http;
     const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
 
-    // A teardown (stop / purge-data) during the container-start window above
-    // supersedes this attempt; don't (re)create resources it just cleared.
-    if (superseded()) {
-      app.debug("startup superseded by a teardown; not connecting");
-      return;
-    }
-
     app.debug("connecting to QuestDB at %s:%d", httpHost, httpPort);
     queryClient = new QueryClient(httpHost, httpPort);
 
@@ -629,12 +633,6 @@ module.exports = (app: App) => {
     // the wrong (`timestamp`, not `ts`) schema; heal it before the writer can
     // ingest into the broken shape.
     await healSchemaTables();
-
-    if (superseded()) {
-      app.debug("startup superseded by a teardown; not connecting writer");
-      queryClient = null;
-      return;
-    }
 
     writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg), {
       // Surface a flapping ILP connection instead of leaving the status line
@@ -726,6 +724,12 @@ module.exports = (app: App) => {
     app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
   }
 
+  // Public entry: serialize startup behind the lifecycle lock so a purge or
+  // update can't interleave with it.
+  function asyncStart(config: Config): Promise<void> {
+    return withLifecycleLock(() => runStart(config));
+  }
+
   const plugin = {
     id: "signalk-questdb",
     name: "QuestDB History",
@@ -744,9 +748,6 @@ module.exports = (app: App) => {
     },
 
     async stop() {
-      // Supersede any in-flight asyncStart so a stop during the startup window
-      // doesn't leave a half-connected writer/queryClient behind.
-      lifecycleGeneration += 1;
       for (const unsub of unsubscribes) {
         try {
           unsub();
@@ -1051,95 +1052,104 @@ module.exports = (app: App) => {
           }
           const newTag = stable.tag_name;
 
-          app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
-          await containers.pullImage(`questdb/questdb:${newTag}`);
+          // Run the mutating update under the lifecycle lock so a concurrent
+          // purge/start can't interleave with the pull + recreate + reconnect.
+          const ilp = await withLifecycleLock(async () => {
+            app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
+            await containers.pullImage(`questdb/questdb:${newTag}`);
 
-          if (currentConfig) {
-            currentConfig.questdbVersion = newTag;
-            await new Promise<void>((resolve, reject) => {
-              app.savePluginOptions({ ...currentConfig! }, (err) => {
-                if (err) reject(err);
-                else resolve();
+            if (currentConfig) {
+              currentConfig.questdbVersion = newTag;
+              await new Promise<void>((resolve, reject) => {
+                app.savePluginOptions({ ...currentConfig! }, (err) => {
+                  if (err) reject(err);
+                  else resolve();
+                });
               });
-            });
-          }
+            }
 
-          const updateVolumeSource =
-            await resolveQuestdbVolumeSource(containers);
-          app.setPluginStatus(`Starting QuestDB ${newTag}...`);
-          const updateConfig: ContainerConfig = {
-            image: "questdb/questdb",
-            tag: newTag,
-            volumes: {
-              "/var/lib/questdb": updateVolumeSource,
-            },
-            env: {
-              QDB_TELEMETRY_ENABLED: "false",
-              QDB_HTTP_ENABLED: "true",
-              QDB_LINE_TCP_ENABLED: "true",
-              ...(currentConfig?.compression &&
-              currentConfig.compression !== "none"
-                ? {
-                    QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
-                      currentConfig.compression === "zstd" ? "ZSTD" : "LZ4",
-                    ...(currentConfig.compression === "zstd" &&
-                    currentConfig.compressionLevel
-                      ? {
-                          QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
-                            currentConfig.compressionLevel,
-                          ),
-                        }
-                      : {}),
-                  }
-                : {}),
-            },
-            restart: "unless-stopped",
-            resources: currentConfig
-              ? buildResourceLimits(currentConfig)
-              : undefined,
-            ulimits: QUESTDB_ULIMITS,
-            healthcheck: QUESTDB_HEALTHCHECK,
-          };
-          const resolveUpdateEndpoints = await applyQuestdbNetworking(
-            currentConfig ?? ({} as Config),
-            containers,
-            QUESTDB_CONTAINER_NAME,
-            updateConfig,
-          );
-          // Clear any prior clamp before re-running so a no-longer-clamping
-          // update doesn't leave a stale warning.
-          ulimitClamp = null;
-          await containers.ensureRunning(QUESTDB_CONTAINER_NAME, updateConfig, {
-            onUlimitClamped,
+            const updateVolumeSource =
+              await resolveQuestdbVolumeSource(containers);
+            app.setPluginStatus(`Starting QuestDB ${newTag}...`);
+            const updateConfig: ContainerConfig = {
+              image: "questdb/questdb",
+              tag: newTag,
+              volumes: {
+                "/var/lib/questdb": updateVolumeSource,
+              },
+              env: {
+                QDB_TELEMETRY_ENABLED: "false",
+                QDB_HTTP_ENABLED: "true",
+                QDB_LINE_TCP_ENABLED: "true",
+                ...(currentConfig?.compression &&
+                currentConfig.compression !== "none"
+                  ? {
+                      QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
+                        currentConfig.compression === "zstd" ? "ZSTD" : "LZ4",
+                      ...(currentConfig.compression === "zstd" &&
+                      currentConfig.compressionLevel
+                        ? {
+                            QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
+                              currentConfig.compressionLevel,
+                            ),
+                          }
+                        : {}),
+                    }
+                  : {}),
+              },
+              restart: "unless-stopped",
+              resources: currentConfig
+                ? buildResourceLimits(currentConfig)
+                : undefined,
+              ulimits: QUESTDB_ULIMITS,
+              healthcheck: QUESTDB_HEALTHCHECK,
+            };
+            const resolveUpdateEndpoints = await applyQuestdbNetworking(
+              currentConfig ?? ({} as Config),
+              containers,
+              QUESTDB_CONTAINER_NAME,
+              updateConfig,
+            );
+            // Clear any prior clamp before re-running so a no-longer-clamping
+            // update doesn't leave a stale warning.
+            ulimitClamp = null;
+            await containers.ensureRunning(
+              QUESTDB_CONTAINER_NAME,
+              updateConfig,
+              {
+                onUlimitClamped,
+              },
+            );
+
+            // Re-resolve so the export endpoints and status line reflect the
+            // current endpoint. The version bump keeps the same container name
+            // and networking, so the endpoint is stable — the existing
+            // QueryClient/ILPWriter stay valid (and the registered history
+            // providers keep their reference).
+            questdbEndpoints = await resolveUpdateEndpoints();
+            const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
+
+            // Wait for the recreated container to answer, then reconnect ILP.
+            if (queryClient) {
+              const deadline = Date.now() + 30000;
+              while (Date.now() < deadline) {
+                if (await queryClient.isHealthy()) break;
+                await new Promise((resolve) => setTimeout(resolve, 500));
+              }
+            }
+            if (writer) {
+              try {
+                await writer.disconnect();
+              } catch {
+                /* ignore */
+              }
+              await writer.connect();
+            }
+            return { ilpHost, ilpPort };
           });
 
-          // Re-resolve so the export endpoints and status line reflect the
-          // current endpoint. The version bump keeps the same container name
-          // and networking, so the endpoint is stable — the existing
-          // QueryClient/ILPWriter stay valid (and the registered history
-          // providers keep their reference).
-          questdbEndpoints = await resolveUpdateEndpoints();
-          const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
-
-          // Wait for the recreated container to answer, then reconnect ILP.
-          if (queryClient) {
-            const deadline = Date.now() + 30000;
-            while (Date.now() < deadline) {
-              if (await queryClient.isHealthy()) break;
-              await new Promise((resolve) => setTimeout(resolve, 500));
-            }
-          }
-          if (writer) {
-            try {
-              await writer.disconnect();
-            } catch {
-              /* ignore */
-            }
-            await writer.connect();
-          }
-
           app.setPluginStatus(
-            `Recording to QuestDB ${newTag} at ${ilpHost}:${ilpPort}`,
+            `Recording to QuestDB ${newTag} at ${ilp.ilpHost}:${ilp.ilpPort}`,
           );
 
           res.json({
@@ -1186,35 +1196,37 @@ module.exports = (app: App) => {
             return;
           }
 
-          // Invalidate any in-flight asyncStart so it won't recreate the
-          // resources we're about to tear down (purge during the start window).
-          lifecycleGeneration += 1;
-
-          // Stop all activity against the container before it and its data go
-          // away — otherwise the retention timer keeps issuing DROP PARTITION
-          // against a removed container and the writer keeps trying to connect.
-          if (schemaHealTimer) {
-            clearInterval(schemaHealTimer);
-            schemaHealTimer = null;
-          }
-          if (retentionTimer) {
-            clearInterval(retentionTimer);
-            retentionTimer = null;
-          }
-          if (writer) {
-            try {
-              await writer.disconnect();
-            } catch {
-              /* ignore */
+          // Run under the lifecycle lock so an in-flight start/update can't
+          // interleave and recreate what we tear down (and vice versa).
+          await withLifecycleLock(async () => {
+            // Stop all activity against the container before it and its data go
+            // away — otherwise the retention timer keeps issuing DROP PARTITION
+            // against a removed container and the writer keeps trying to connect.
+            if (schemaHealTimer) {
+              clearInterval(schemaHealTimer);
+              schemaHealTimer = null;
             }
-            writer = null;
-          }
-          queryClient = null;
+            if (retentionTimer) {
+              clearInterval(retentionTimer);
+              retentionTimer = null;
+            }
+            if (writer) {
+              try {
+                await writer.disconnect();
+              } catch {
+                /* ignore */
+              }
+              writer = null;
+            }
+            queryClient = null;
 
-          const hostPath = await resolveQuestdbVolumeSource(containers);
-          app.setPluginStatus("Removing QuestDB container and data...");
-          await containers.removeManagedData(QUESTDB_CONTAINER_NAME, hostPath, {
-            ownerPluginId: "signalk-questdb",
+            const hostPath = await resolveQuestdbVolumeSource(containers);
+            app.setPluginStatus("Removing QuestDB container and data...");
+            await containers.removeManagedData!(
+              QUESTDB_CONTAINER_NAME,
+              hostPath,
+              { ownerPluginId: "signalk-questdb" },
+            );
           });
 
           app.setPluginStatus(
