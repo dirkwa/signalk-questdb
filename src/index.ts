@@ -247,6 +247,11 @@ module.exports = (app: App) => {
   // capped QuestDB's requested value. Null until a clamp happens (or on a
   // signalk-container older than 1.18.0, which doesn't emit the event).
   let ulimitClamp: UlimitClamp | null = null;
+  // Bumped whenever a teardown (stop, purge-data) invalidates an in-flight
+  // start. asyncStart captures the value at entry and bails before (re)creating
+  // resources if it changed mid-flight, so a purge during the startup window
+  // can't be resurrected by the start it raced.
+  let lifecycleGeneration = 0;
 
   // Record a clamp event so /api/status and the config-panel banner can
   // surface it. (The plugin status line is not used — it is driven by the
@@ -473,6 +478,9 @@ module.exports = (app: App) => {
   }
 
   async function asyncStart(config: Config) {
+    const myGeneration = lifecycleGeneration;
+    // True once a teardown (stop/purge) has superseded this start attempt.
+    const superseded = () => lifecycleGeneration !== myGeneration;
     currentConfig = config;
     // External mode: the configured host/ports are authoritative. Managed mode
     // overwrites this below with the endpoints signalk-container resolves.
@@ -593,6 +601,13 @@ module.exports = (app: App) => {
     const { host: httpHost, port: httpPort } = questdbEndpoints.http;
     const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
 
+    // A teardown (stop / purge-data) during the container-start window above
+    // supersedes this attempt; don't (re)create resources it just cleared.
+    if (superseded()) {
+      app.debug("startup superseded by a teardown; not connecting");
+      return;
+    }
+
     app.debug("connecting to QuestDB at %s:%d", httpHost, httpPort);
     queryClient = new QueryClient(httpHost, httpPort);
 
@@ -614,6 +629,12 @@ module.exports = (app: App) => {
     // the wrong (`timestamp`, not `ts`) schema; heal it before the writer can
     // ingest into the broken shape.
     await healSchemaTables();
+
+    if (superseded()) {
+      app.debug("startup superseded by a teardown; not connecting writer");
+      queryClient = null;
+      return;
+    }
 
     writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg), {
       // Surface a flapping ILP connection instead of leaving the status line
@@ -723,6 +744,9 @@ module.exports = (app: App) => {
     },
 
     async stop() {
+      // Supersede any in-flight asyncStart so a stop during the startup window
+      // doesn't leave a half-connected writer/queryClient behind.
+      lifecycleGeneration += 1;
       for (const unsub of unsubscribes) {
         try {
           unsub();
@@ -1136,6 +1160,17 @@ module.exports = (app: App) => {
       // remove); removeManagedData wipes them from inside the userns.
       router.post("/api/purge-data", async (_req, res) => {
         try {
+          // External mode is a config fact independent of the runtime, so
+          // answer it first — an external-mode install without signalk-container
+          // should get the clear 400, not a 503 about a missing container
+          // manager it doesn't need.
+          if (currentConfig?.managedContainer === false) {
+            res.status(400).json({
+              error:
+                "QuestDB is not managed by this plugin (external mode); nothing to remove.",
+            });
+            return;
+          }
           const containers = (globalThis as any).__signalk_containerManager as
             | ContainerManagerApi
             | undefined;
@@ -1150,13 +1185,10 @@ module.exports = (app: App) => {
             });
             return;
           }
-          if (currentConfig?.managedContainer === false) {
-            res.status(400).json({
-              error:
-                "QuestDB is not managed by this plugin (external mode); nothing to remove.",
-            });
-            return;
-          }
+
+          // Invalidate any in-flight asyncStart so it won't recreate the
+          // resources we're about to tear down (purge during the start window).
+          lifecycleGeneration += 1;
 
           // Stop all activity against the container before it and its data go
           // away — otherwise the retention timer keeps issuing DROP PARTITION

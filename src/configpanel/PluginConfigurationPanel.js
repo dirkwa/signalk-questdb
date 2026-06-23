@@ -1103,7 +1103,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         </button>
       </CollapsibleSection>
 
-      {managedContainer && (
+      {cfg.managedContainer !== false && (
         <CollapsibleSection title="Danger zone">
           <div style={{ fontSize: 13, color: "#555", marginBottom: 10 }}>
             Remove the QuestDB container and permanently delete all recorded
