@@ -1103,24 +1103,26 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         </button>
       </CollapsibleSection>
 
-      <CollapsibleSection title="Danger zone">
-        <div style={{ fontSize: 13, color: "#555", marginBottom: 10 }}>
-          Remove the QuestDB container and permanently delete all recorded data.
-          Use this to fully reset QuestDB — Signal K's plugin-uninstall cannot
-          delete this data on rootless Podman. This cannot be undone.
-        </div>
-        <button
-          style={{
-            ...S.btn,
-            ...S.btnDanger,
-            ...(purging ? S.btnDisabled : {}),
-          }}
-          onClick={purgeData}
-          disabled={purging}
-        >
-          {purging ? "Removing..." : "Remove container & all data"}
-        </button>
-      </CollapsibleSection>
+      {managedContainer && (
+        <CollapsibleSection title="Danger zone">
+          <div style={{ fontSize: 13, color: "#555", marginBottom: 10 }}>
+            Remove the QuestDB container and permanently delete all recorded
+            data. Use this to fully reset QuestDB — Signal K's plugin-uninstall
+            cannot delete this data on rootless Podman. This cannot be undone.
+          </div>
+          <button
+            style={{
+              ...S.btn,
+              ...S.btnDanger,
+              ...(purging ? S.btnDisabled : {}),
+            }}
+            onClick={purgeData}
+            disabled={purging}
+          >
+            {purging ? "Removing..." : "Remove container & all data"}
+          </button>
+        </CollapsibleSection>
+      )}
 
       {/* Status */}
       {actionStatus && (

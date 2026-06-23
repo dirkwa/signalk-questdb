@@ -1158,10 +1158,16 @@ module.exports = (app: App) => {
             return;
           }
 
-          // Stop writing before the container and its data go away.
+          // Stop all activity against the container before it and its data go
+          // away — otherwise the retention timer keeps issuing DROP PARTITION
+          // against a removed container and the writer keeps trying to connect.
           if (schemaHealTimer) {
             clearInterval(schemaHealTimer);
             schemaHealTimer = null;
+          }
+          if (retentionTimer) {
+            clearInterval(retentionTimer);
+            retentionTimer = null;
           }
           if (writer) {
             try {
@@ -1171,6 +1177,7 @@ module.exports = (app: App) => {
             }
             writer = null;
           }
+          queryClient = null;
 
           const hostPath = await resolveQuestdbVolumeSource(containers);
           app.setPluginStatus("Removing QuestDB container and data...");
