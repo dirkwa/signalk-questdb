@@ -265,6 +265,19 @@ module.exports = (app: App) => {
     return run;
   };
 
+  // AbortController for the start currently in flight (null when no start is
+  // running). /api/purge-data — the recovery action — aborts it so a wedged
+  // start releases the lock instead of pinning purge behind it forever.
+  // runStart checks this signal after each long/external await and bails
+  // without creating resources, so an aborted start can't resurrect a
+  // just-purged container.
+  let startAbort: AbortController | null = null;
+
+  // How long purge waits to acquire the lifecycle lock before proceeding
+  // anyway. After this it forces its teardown through even if a hung start
+  // never released the lock (see PURGE_LOCK_TIMEOUT_MS use below).
+  const PURGE_LOCK_TIMEOUT_MS = 30000;
+
   // Record a clamp event so /api/status and the config-panel banner can
   // surface it. (The plugin status line is not used — it is driven by the
   // recording state and would immediately overwrite a warning set here.)
@@ -491,7 +504,28 @@ module.exports = (app: App) => {
 
   // Runs the actual startup. Always invoked through the lifecycle lock (see
   // asyncStart) so a purge/update can't interleave with it.
+  //
+  // Abortable: a fresh AbortController is published in `startAbort` at entry so
+  // /api/purge-data can preempt a slow start. The container API mirror exposes
+  // no AbortSignal, so we can't cancel an in-flight whenReady()/ensureRunning()
+  // — instead we check `signal.aborted` after each long/external await and bail
+  // before registering any resources, so an aborted (preempted) start never
+  // resurrects what purge is about to remove. (Purge's own bounded lock-acquire
+  // covers the case where such a call truly never settles.)
   async function runStart(config: Config) {
+    const abort = new AbortController();
+    startAbort = abort;
+    const { signal } = abort;
+    try {
+      await runStartInner(config, signal);
+    } finally {
+      // Only clear if we're still the in-flight start; a later start may have
+      // already replaced us.
+      if (startAbort === abort) startAbort = null;
+    }
+  }
+
+  async function runStartInner(config: Config, signal: AbortSignal) {
     currentConfig = config;
     // External mode: the configured host/ports are authoritative. Managed mode
     // overwrites this below with the endpoints signalk-container resolves.
@@ -521,6 +555,9 @@ module.exports = (app: App) => {
 
       app.setPluginStatus("Waiting for container runtime detection...");
       await containers.whenReady();
+      // Purge may have preempted us while whenReady() was pending; bail before
+      // touching the runtime so we don't recreate what purge is removing.
+      if (signal.aborted) return;
 
       if (!containers.getRuntime()) {
         app.debug("container runtime not detected");
@@ -566,6 +603,7 @@ module.exports = (app: App) => {
         };
 
         const volumeSource = await resolveQuestdbVolumeSource(containers);
+        if (signal.aborted) return;
         const containerConfig: ContainerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
@@ -584,6 +622,7 @@ module.exports = (app: App) => {
           QUESTDB_CONTAINER_NAME,
           containerConfig,
         );
+        if (signal.aborted) return;
 
         app.setPluginStatus("Starting QuestDB container...");
         // Clear any prior clamp so a run that no longer clamps (e.g. the host
@@ -597,6 +636,10 @@ module.exports = (app: App) => {
             onUlimitClamped,
           },
         );
+        // ensureRunning() just (re)created the container. If purge preempted us
+        // while it ran, return now so we don't proceed to resolve endpoints and
+        // wire up a writer against a container purge is about to remove.
+        if (signal.aborted) return;
         app.debug("QuestDB container ready");
 
         questdbEndpoints = await resolveEndpoints();
@@ -618,8 +661,17 @@ module.exports = (app: App) => {
     app.setPluginStatus("Waiting for QuestDB to become ready...");
     const deadline = Date.now() + 30000;
     while (Date.now() < deadline) {
+      if (signal.aborted) {
+        queryClient = null;
+        return;
+      }
       if (await queryClient.isHealthy()) break;
       await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    if (signal.aborted) {
+      queryClient = null;
+      return;
     }
 
     if (!(await queryClient.isHealthy())) {
@@ -642,6 +694,20 @@ module.exports = (app: App) => {
         app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`),
     });
     await writer.connect();
+
+    // Last abort checkpoint before we register providers, the stream
+    // subscription, and the retention/heal timers — none of which is wired up
+    // yet, so tearing down here is just nulling the writer/client we created.
+    if (signal.aborted) {
+      try {
+        await writer.disconnect();
+      } catch {
+        /* ignore */
+      }
+      writer = null;
+      queryClient = null;
+      return;
+    }
 
     const v2Provider = createHistoryProviderV2(queryClient, app.selfContext);
     app.registerHistoryApiProvider(v2Provider);
@@ -1196,9 +1262,16 @@ module.exports = (app: App) => {
             return;
           }
 
-          // Run under the lifecycle lock so an in-flight start/update can't
-          // interleave and recreate what we tear down (and vice versa).
-          await withLifecycleLock(async () => {
+          // The actual teardown + data removal. Normally runs under the
+          // lifecycle lock; the timeout fallback below may run it unlocked.
+          // `teardownStarted` makes it run at most once: if the timeout
+          // fallback runs the teardown while a wedged start still holds the
+          // lock, the locked attempt becomes a no-op once the start finally
+          // releases it (so removeManagedData isn't invoked twice).
+          let teardownStarted = false;
+          const teardown = async () => {
+            if (teardownStarted) return;
+            teardownStarted = true;
             // Stop all activity against the container before it and its data go
             // away — otherwise the retention timer keeps issuing DROP PARTITION
             // against a removed container and the writer keeps trying to connect.
@@ -1227,7 +1300,57 @@ module.exports = (app: App) => {
               hostPath,
               { ownerPluginId: "signalk-questdb" },
             );
+          };
+
+          // Purge is the RECOVERY action, so it must make progress even when a
+          // start is wedged on a never-settling container call. Step 1: signal
+          // any in-flight start to bail (its post-await checks return without
+          // creating resources). Step 2: try to acquire the lifecycle lock so
+          // we still serialize against a start/update that IS progressing —
+          // but only for a bounded time. If the lock isn't free within
+          // PURGE_LOCK_TIMEOUT_MS (a truly hung start that ignored the abort
+          // and never released it), run the teardown anyway. Interleaving risk
+          // is minimal because we already aborted the start, so any start that
+          // later wakes up returns early instead of recreating the container.
+          startAbort?.abort();
+
+          let lockedTeardownSettled = false;
+          let lockedTeardownError: unknown;
+          const lockedTeardown = withLifecycleLock(teardown).then(
+            () => {
+              lockedTeardownSettled = true;
+            },
+            (err) => {
+              // Capture rather than rethrow: in the timeout branch nothing
+              // awaits this promise, so a rethrow would surface as an
+              // unhandled rejection. The locked branch re-throws it below.
+              lockedTeardownSettled = true;
+              lockedTeardownError = err;
+            },
+          );
+          let timeoutTimer: NodeJS.Timeout | undefined;
+          const timeout = new Promise<"timeout">((resolve) => {
+            timeoutTimer = setTimeout(
+              () => resolve("timeout"),
+              PURGE_LOCK_TIMEOUT_MS,
+            );
           });
+          const outcome = await Promise.race([
+            lockedTeardown.then(() => "locked" as const),
+            timeout,
+          ]);
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (outcome === "locked") {
+            // The lock-held teardown completed (or failed). Propagate its error
+            // to the outer catch so the client sees the real failure.
+            if (lockedTeardownError) throw lockedTeardownError;
+          } else if (!lockedTeardownSettled) {
+            app.debug(
+              "purge: lifecycle lock not acquired within timeout; a start " +
+                "appears wedged. Proceeding with teardown to make progress.",
+            );
+            await teardown();
+          }
 
           app.setPluginStatus(
             "QuestDB data removed. Disable and re-enable the plugin to start fresh.",
