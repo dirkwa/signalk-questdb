@@ -37,6 +37,7 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 - **Compression** (collapsible) -- LZ4/ZSTD codec selection for on-disk storage
 - **InfluxDB Migration** (collapsible) -- auto-detect with manual URL for remote instances
 - **Data Export** (collapsible) -- date range picker, Parquet/CSV format, download button
+- **Danger zone** (collapsible) -- "Remove container & all data" to fully reset QuestDB (deletes data Signal K's plugin-uninstall can't, on rootless Podman)
 
 ## QuestDB Schema
 
@@ -87,6 +88,7 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | GET    | `/versions`                              | QuestDB releases from GitHub (for version picker)                                        |
 | GET    | `/update/check`                          | Compare running version against latest release                                           |
 | POST   | `/update/apply`                          | Pull latest image, recreate container, reconnect                                         |
+| POST   | `/purge-data`                            | Remove the QuestDB container and delete all its data (rootless-Podman-safe)              |
 | GET    | `/migration/detect`                      | Auto-detect InfluxDB (supports `?url=` for remote)                                       |
 | GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)               |
 | GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                   |

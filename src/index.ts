@@ -99,6 +99,20 @@ interface ContainerManagerApi {
   ) => Promise<void>;
   stop: (name: string) => Promise<void>;
   remove: (name: string) => Promise<void>;
+  /**
+   * Remove the managed container AND delete its bind-mount data at `hostPath`,
+   * working around the rootless-Podman subuid-ownership trap (data written by
+   * the container is owned by a subuid the Signal K user can't delete). Used by
+   * the "Remove all data" action so a user can fully reset QuestDB — Signal K's
+   * own plugin-uninstall can't delete this data. Optional: requires
+   * signalk-container >= 1.19.0; the plugin degrades (reports unsupported) on
+   * older versions.
+   */
+  removeManagedData?: (
+    name: string,
+    hostPath: string,
+    options?: { ownerPluginId?: string },
+  ) => Promise<void>;
   ensureNetwork: (name: string) => Promise<void>;
   /**
    * Attach an existing managed container to a user-defined network so other
@@ -1108,6 +1122,69 @@ module.exports = (app: App) => {
             status: "updated",
             newVersion: newTag,
             message: `Updated to QuestDB ${newTag}. Container running.`,
+          });
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+
+      // Remove the QuestDB container AND delete all its data. Exists because
+      // Signal K's own plugin-uninstall can't delete the data dir on rootless
+      // Podman (the container writes files as a subuid the SK user can't
+      // remove); removeManagedData wipes them from inside the userns.
+      router.post("/api/purge-data", async (_req, res) => {
+        try {
+          const containers = (globalThis as any).__signalk_containerManager as
+            | ContainerManagerApi
+            | undefined;
+          if (!containers || !containers.getRuntime()) {
+            res.status(503).json({ error: "Container manager not available" });
+            return;
+          }
+          if (!containers.removeManagedData) {
+            res.status(501).json({
+              error:
+                "Data removal requires signalk-container 1.19.0 or newer. Update it, or delete the QuestDB data directory manually.",
+            });
+            return;
+          }
+          if (currentConfig?.managedContainer === false) {
+            res.status(400).json({
+              error:
+                "QuestDB is not managed by this plugin (external mode); nothing to remove.",
+            });
+            return;
+          }
+
+          // Stop writing before the container and its data go away.
+          if (schemaHealTimer) {
+            clearInterval(schemaHealTimer);
+            schemaHealTimer = null;
+          }
+          if (writer) {
+            try {
+              await writer.disconnect();
+            } catch {
+              /* ignore */
+            }
+            writer = null;
+          }
+
+          const hostPath = await resolveQuestdbVolumeSource(containers);
+          app.setPluginStatus("Removing QuestDB container and data...");
+          await containers.removeManagedData(QUESTDB_CONTAINER_NAME, hostPath, {
+            ownerPluginId: "signalk-questdb",
+          });
+
+          app.setPluginStatus(
+            "QuestDB data removed. Disable and re-enable the plugin to start fresh.",
+          );
+          res.json({
+            status: "removed",
+            message:
+              "QuestDB container and all data removed. Re-enable the plugin to start a fresh database.",
           });
         } catch (err) {
           res.status(500).json({

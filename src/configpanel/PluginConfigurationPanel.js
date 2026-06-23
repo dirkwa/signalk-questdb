@@ -313,6 +313,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [updateInfo, setUpdateInfo] = useState(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
+  const [purging, setPurging] = useState(false);
 
   const fetchVersions = useCallback(async () => {
     setVersionsLoading(true);
@@ -381,6 +382,36 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       setStatusError(true);
     }
     setUpdating(false);
+  };
+
+  const purgeData = async () => {
+    if (
+      !window.confirm(
+        "Remove the QuestDB container and DELETE ALL recorded data? This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    setPurging(true);
+    setActionStatus("Removing QuestDB container and data...");
+    setStatusError(false);
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/purge-data", {
+        method: "POST",
+      });
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (res.ok) {
+        setActionStatus(data.message);
+        fetchStatus();
+      } else {
+        setActionStatus(`Remove failed: ${data.error}`);
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus(`Remove failed: ${e.message}`);
+      setStatusError(true);
+    }
+    setPurging(false);
   };
 
   const detectMigration = async () => {
@@ -1069,6 +1100,25 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           disabled={exporting}
         >
           {exporting ? "Exporting..." : "Export Data"}
+        </button>
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Danger zone">
+        <div style={{ fontSize: 13, color: "#555", marginBottom: 10 }}>
+          Remove the QuestDB container and permanently delete all recorded data.
+          Use this to fully reset QuestDB — Signal K's plugin-uninstall cannot
+          delete this data on rootless Podman. This cannot be undone.
+        </div>
+        <button
+          style={{
+            ...S.btn,
+            ...S.btnDanger,
+            ...(purging ? S.btnDisabled : {}),
+          }}
+          onClick={purgeData}
+          disabled={purging}
+        >
+          {purging ? "Removing..." : "Remove container & all data"}
         </button>
       </CollapsibleSection>
 
