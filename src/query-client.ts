@@ -44,7 +44,12 @@ export class QueryClient {
   async exec(sql: string): Promise<QuestDBResult> {
     const url = new URL("/exec", this.baseUrl);
     url.searchParams.set("query", sql);
-    url.searchParams.set("nm", "true");
+    // Do NOT pass nm=true: it tells QuestDB to omit the `columns` metadata,
+    // which `toObjects` needs to map each row to a named object. Without the
+    // names, toObjects throws on any non-empty result — silently breaking
+    // every consumer that reads rows by name (history playback, /api/query,
+    // the suspended-WAL status probe). The metadata is small; correctness
+    // wins over the few bytes saved.
 
     const res = await fetch(url.toString(), {
       signal: AbortSignal.timeout(30000),
@@ -173,10 +178,15 @@ export class QueryClient {
   }
 
   toObjects(result: QuestDBResult): Record<string, unknown>[] {
+    // Defend against a result without column metadata (e.g. a QuestDB response
+    // that omits `columns`): without names there is nothing to key by, so
+    // degrade to an empty list rather than throwing inside a caller's catch.
+    const columns = result.columns;
+    if (!columns) return [];
     return result.dataset.map((row) => {
       const obj: Record<string, unknown> = {};
-      for (let i = 0; i < result.columns.length; i++) {
-        obj[result.columns[i].name] = row[i];
+      for (let i = 0; i < columns.length; i++) {
+        obj[columns[i].name] = row[i];
       }
       return obj;
     });
