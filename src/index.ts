@@ -2,6 +2,7 @@ import { IRouter } from "express";
 import { minimatch } from "minimatch";
 import { ILPWriter } from "./ilp-writer";
 import { QueryClient, isReadOnlySQL } from "./query-client";
+import type { QuestDBResult } from "./query-client";
 import { Config, ConfigSchema } from "./config/schema";
 import { createHistoryProviderV2 } from "./history-v2";
 import { createHistoryProviderV1 } from "./history-v1";
@@ -247,6 +248,11 @@ module.exports = (app: App) => {
   // capped QuestDB's requested value. Null until a clamp happens (or on a
   // signalk-container older than 1.18.0, which doesn't emit the event).
   let ulimitClamp: UlimitClamp | null = null;
+  // Whether this QuestDB's wal_tables() exposes the errorTag/errorMessage
+  // columns (present on current builds, absent on an older pinned version).
+  // Probed once via the richer status query and cached so an old build does
+  // not throw-and-fall-back on every /api/status call. Null = not yet probed.
+  let walTablesHasErrorColumns: boolean | null = null;
   // Serializes the lifecycle operations that create or destroy QuestDB
   // resources — asyncStart, /api/update/apply, and /api/purge-data — so they
   // can never interleave. Without this, a purge (or update) issued while a
@@ -527,6 +533,12 @@ module.exports = (app: App) => {
 
   async function runStartInner(config: Config, signal: AbortSignal) {
     currentConfig = config;
+    // A start may connect to a different QuestDB than the previous run —
+    // notably external mode repointed at a new host/build — so drop any cached
+    // wal_tables() capability flag and let /api/status re-probe. The
+    // update/apply path resets it too, for the in-place recreate that does not
+    // re-enter this function.
+    walTablesHasErrorColumns = null;
     // External mode: the configured host/ports are authoritative. Managed mode
     // overwrites this below with the endpoints signalk-container resolves.
     questdbEndpoints = {
@@ -909,11 +921,41 @@ module.exports = (app: App) => {
             writerTxn: number;
             sequencerTxn: number;
             txnLag: number;
+            errorTag: string;
+            errorMessage: string;
           }[] = [];
+          // errorTag/errorMessage carry QuestDB's reason for the suspension
+          // (e.g. an out-of-memory or disk error during WAL apply). They are
+          // empty on a healthy table; surfacing them lets the panel — and a
+          // bug report — show WHY ingestion stalled instead of just THAT it
+          // did, without needing to catch the live wal_tables() state by hand
+          // before the data is reset.
+          //
+          // The columns are absent on an older pinned QuestDB. Probe for them
+          // ONCE (the richer query throws if they're missing), cache the
+          // result in `walTablesHasErrorColumns`, and thereafter run the query
+          // the build actually supports — so an old build does not throw and
+          // fall back on every /api/status call. Detection never regresses;
+          // only the diagnostic columns are dropped on old builds.
+          const RICH_WAL_QUERY =
+            "SELECT name, writerTxn, sequencerTxn, errorTag, errorMessage FROM wal_tables() WHERE suspended = true";
+          const BASIC_WAL_QUERY =
+            "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true";
           try {
-            const walResult = await queryClient.exec(
-              "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true",
-            );
+            let walResult: QuestDBResult;
+            if (walTablesHasErrorColumns === null) {
+              try {
+                walResult = await queryClient.exec(RICH_WAL_QUERY);
+                walTablesHasErrorColumns = true;
+              } catch {
+                walResult = await queryClient.exec(BASIC_WAL_QUERY);
+                walTablesHasErrorColumns = false;
+              }
+            } else {
+              walResult = await queryClient.exec(
+                walTablesHasErrorColumns ? RICH_WAL_QUERY : BASIC_WAL_QUERY,
+              );
+            }
             suspendedTables = queryClient.toObjects(walResult).map((row) => {
               const writerTxn = Number(row.writerTxn ?? 0);
               const sequencerTxn = Number(row.sequencerTxn ?? 0);
@@ -922,11 +964,14 @@ module.exports = (app: App) => {
                 writerTxn,
                 sequencerTxn,
                 txnLag: Math.max(0, sequencerTxn - writerTxn),
+                errorTag: String(row.errorTag ?? ""),
+                errorMessage: String(row.errorMessage ?? ""),
               };
             });
           } catch {
-            // wal_tables() is unavailable on non-WAL/older QuestDB, or the
-            // tables don't exist yet during startup — treat as "not suspended".
+            // wal_tables() itself is unavailable on non-WAL/older QuestDB, or
+            // the tables don't exist yet during startup — treat as "not
+            // suspended".
           }
 
           res.json({
@@ -1186,6 +1231,13 @@ module.exports = (app: App) => {
                 onUlimitClamped,
               },
             );
+
+            // The QuestDB version just changed, so the cached wal_tables()
+            // column shape may no longer match (the errorTag/errorMessage
+            // columns could appear on an upgrade or disappear on a downgrade).
+            // Force the next /api/status to re-probe instead of trusting a
+            // stale capability flag.
+            walTablesHasErrorColumns = null;
 
             // Re-resolve so the export endpoints and status line reflect the
             // current endpoint. The version bump keeps the same container name

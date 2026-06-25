@@ -543,10 +543,11 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                 QuestDB WAL suspended — recording stalled
               </div>
               Rows are arriving but no longer commit, so the counts below have
-              stopped advancing. This usually follows a torn write (often a low
-              host <code>fs.file-max</code> limit). Resume each suspended table
-              in the QuestDB SQL console (<code>:9000</code>), skipping the
-              broken transaction:
+              stopped advancing. This follows an error while QuestDB applied the
+              write-ahead log — see the reason reported per table below. Resume
+              each suspended table in the QuestDB SQL console (
+              <code>:9000</code>
+              ), skipping the broken transaction:
               <code style={S.warnBannerCode}>
                 {suspendedTables
                   .map((t) => {
@@ -554,9 +555,18 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                     // the copy-pasted SQL is valid even for table names with
                     // spaces or other special characters.
                     const ident = `"${String(t.name).replace(/"/g, '""')}"`;
+                    // Show QuestDB's own reason when it reports one, so the
+                    // operator can tell a transient resource error (resumable
+                    // losslessly) from a poison transaction. Flatten any
+                    // control characters: the reason is appended after `--`, so
+                    // an embedded newline would split the copied statement and
+                    // the remainder could paste as live, unintended SQL.
+                    const reason = String(
+                      t.errorMessage || t.errorTag || "reason not reported",
+                    ).replace(/[\r\n]+/g, " ");
                     return (
                       `ALTER TABLE ${ident} RESUME WAL FROM TXN ${t.writerTxn + 1};` +
-                      `  -- ${formatNumber(t.txnLag)} txns behind`
+                      `  -- ${formatNumber(t.txnLag)} txns behind; ${reason}`
                     );
                   })
                   .join("\n")}

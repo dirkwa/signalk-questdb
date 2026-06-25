@@ -206,3 +206,37 @@ describe("QueryClient schema heal", () => {
     );
   });
 });
+
+describe("QueryClient.toObjects", () => {
+  const client = new QueryClient("127.0.0.1", 9000);
+
+  it("maps a populated dataset to named objects", () => {
+    const objs = client.toObjects({
+      columns: [
+        { name: "name", type: "STRING" },
+        { name: "suspended", type: "BOOLEAN" },
+        { name: "errorMessage", type: "STRING" },
+      ],
+      dataset: [["signalk", true, "OUT_OF_MEMORY: mmap failed"]],
+      count: 1,
+      timestamp: -1,
+    });
+    assert.deepEqual(objs, [
+      {
+        name: "signalk",
+        suspended: true,
+        errorMessage: "OUT_OF_MEMORY: mmap failed",
+      },
+    ]);
+  });
+
+  it("returns [] when the result carries rows but no column metadata", () => {
+    // QuestDB omits `columns` when queried with nm=true. A non-empty dataset
+    // in that shape previously threw; it must degrade to [] instead.
+    const result = {
+      dataset: [["signalk", true]],
+      count: 1,
+    } as unknown as QuestDBResult;
+    assert.deepEqual(client.toObjects(result), []);
+  });
+});
