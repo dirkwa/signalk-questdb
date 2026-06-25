@@ -124,6 +124,15 @@ describe("QueryClient schema heal", () => {
     assert.equal(await client.designatedTimestamp("signalk"), "ts");
   });
 
+  it("double-quotes the `column` keyword in the introspection query", async () => {
+    // `column` is a SQL keyword in QuestDB; an unquoted `SELECT column` is
+    // rejected at parse time. The stub matches blind, so guard the exact SQL.
+    const { client, sql } = stubClient(() => tsRow("ts"));
+    await client.designatedTimestamp("signalk");
+    assert.match(sql[0], /SELECT "column" FROM table_columns\(/);
+    assert.doesNotMatch(sql[0], /SELECT column\b/);
+  });
+
   it("returns null when the table has no designated timestamp / is missing", async () => {
     const { client } = stubClient(() => emptyResult);
     assert.equal(await client.designatedTimestamp("signalk"), null);

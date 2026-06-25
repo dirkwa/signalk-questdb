@@ -138,8 +138,13 @@ export class QueryClient {
   // name of the designated-timestamp column, or null if the table is missing
   // (or has no designated timestamp).
   async designatedTimestamp(table: string): Promise<string | null> {
+    // `column` is a SQL keyword in QuestDB, so the column reference must be
+    // double-quoted — `SELECT column` is rejected at parse time. Without the
+    // quotes this query always threw, which `hasSchemaMismatch` swallowed as
+    // "no mismatch", silently disabling the self-heal and flooding the log
+    // once per heartbeat.
     const result = await this.exec(
-      `SELECT column FROM table_columns('${validateIdentifier(table)}') WHERE designated = true`,
+      `SELECT "column" FROM table_columns('${validateIdentifier(table)}') WHERE designated = true`,
     );
     return result.dataset.length > 0 ? (result.dataset[0][0] as string) : null;
   }
