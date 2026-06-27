@@ -182,6 +182,79 @@ The plugin is optimized for Raspberry Pi and similar low-power devices:
 - Per-path overrides allow faster rates for critical paths (e.g. `{ "environment.wind.*": 200 }`) while keeping slow-changing paths throttled
 - Set the memory limit to empty or CPU limit to `0` to disable the cap entirely on roomier hosts
 
+## Troubleshooting
+
+### "QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory"
+
+This status appears when the plugin's ILP writer connects to QuestDB, gets
+dropped within a few seconds, and retries — repeatedly. It is QuestDB itself
+being unhealthy (typically OOM-killed and restart-looping), not a problem with
+the plugin or with a single table. The most common cause on a Raspberry Pi or
+other low-RAM host is that QuestDB is hitting a memory ceiling. There are two
+variants, and the cgroup check below tells them apart.
+
+**1. Is the cgroup `memory` controller delegated?**
+
+```bash
+cat /sys/fs/cgroup/cgroup.controllers
+#   ...memory...   present  -> memory delegation is available, so the cap can be enforced (see B)
+#   memory ABSENT           -> the cap is silently dropped (see A)
+```
+
+When Signal K's containers run under rootless Podman, the kernel only enforces
+a resource limit whose cgroup controller has been delegated to the user
+session. Many distributions delegate `cpu`, `cpuset`, `io`, and `pids` by
+default but **not** `memory`. signalk-container drops a limit whose controller
+is missing rather than failing the container, so a configured cap can silently
+have no effect.
+
+**A. `memory` not delegated — the cap is silently dropped.** QuestDB grows
+without bound and the host kernel's OOM killer eventually kills it under
+whole-system memory pressure; it restarts and the cycle repeats. Enable memory
+delegation on the host (one-time, needs sudo), then **recreate** the QuestDB
+container (a restart is not enough — the limit is set at create time):
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d
+sudo tee /etc/systemd/system/user@.service.d/delegate.conf >/dev/null <<'EOF'
+[Service]
+Delegate=cpu cpuset io memory pids
+EOF
+sudo systemctl daemon-reload
+```
+
+`daemon-reload` reloads the drop-in file but does not re-apply `Delegate=` to
+the already-running user manager, so the new delegation only takes effect after
+the **user session restarts**. On a headless box a reboot is simplest (and is
+required anyway if you edit `cmdline.txt` below); otherwise restart the user
+manager with `sudo systemctl restart user@$(id -u).service` (this stops all of
+that user's containers, so let them come back before recreating QuestDB).
+
+```bash
+# On older Raspberry Pi kernels the memory controller is off at boot; add to
+# /boot/cmdline.txt (one line) and reboot:
+#   cgroup_enable=memory cgroup_memory=1
+```
+
+After the session restart, recreate the QuestDB container so the cap applies.
+
+**B. `memory` is delegated — the 768 MB cap is enforced but too tight.** As the
+database grows, QuestDB's peak memory (JVM heap plus off-heap memory-mapped
+files, which spike during out-of-order merges) exceeds 768 MB and the cgroup
+OOM-kills it. Raise **Memory limit** in the plugin config (e.g. `1g` or `1.5g`,
+or empty to remove the cap on a roomier host), which recreates the container.
+
+**Confirm the diagnosis:**
+
+```bash
+podman inspect sk-signalk-questdb \
+  --format 'OOMKilled={{.State.OOMKilled}} RestartCount={{.RestartCount}} cap={{.HostConfig.Memory}}'
+#   cap=805306368  -> 768 MB cap is in place (variant B)
+#   cap=0          -> no cap applied (variant A, or cap intentionally removed)
+podman events --since 2h --stream=false --filter container=sk-signalk-questdb \
+  --filter event=oom --filter event=died
+```
+
 ## History API Provider
 
 QuestDB automatically registers as the **default** Signal K v2 History API provider. Any app or Grafana plugin that queries `/signalk/v2/api/history/` uses QuestDB.
