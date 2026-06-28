@@ -554,8 +554,7 @@ module.exports = (app: App) => {
 
     if (config.managedContainer !== false) {
       const containers = (globalThis as any).__signalk_containerManager as
-        | ContainerManagerApi
-        | undefined;
+        ContainerManagerApi | undefined;
 
       if (!containers) {
         app.debug("containerManager not found");
@@ -862,8 +861,7 @@ module.exports = (app: App) => {
       // Stop the managed container when plugin is disabled
       if (currentConfig?.managedContainer !== false) {
         const containers = (globalThis as any).__signalk_containerManager as
-          | ContainerManagerApi
-          | undefined;
+          ContainerManagerApi | undefined;
         if (containers) {
           try {
             await containers.stop(QUESTDB_CONTAINER_NAME);
@@ -1132,8 +1130,7 @@ module.exports = (app: App) => {
       router.post("/api/update/apply", async (_req, res) => {
         try {
           const containers = (globalThis as any).__signalk_containerManager as
-            | ContainerManagerApi
-            | undefined;
+            ContainerManagerApi | undefined;
           if (!containers || !containers.getRuntime()) {
             res.status(503).json({ error: "Container manager not available" });
             return;
@@ -1300,8 +1297,7 @@ module.exports = (app: App) => {
             return;
           }
           const containers = (globalThis as any).__signalk_containerManager as
-            | ContainerManagerApi
-            | undefined;
+            ContainerManagerApi | undefined;
           if (!containers || !containers.getRuntime()) {
             res.status(503).json({ error: "Container manager not available" });
             return;

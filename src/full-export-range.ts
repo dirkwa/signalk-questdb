@@ -3,8 +3,7 @@
 // the full plugin.
 
 export type FullExportRangeResult =
-  | { ok: true; where: string }
-  | { ok: false; error: string };
+  { ok: true; where: string } | { ok: false; error: string };
 
 /**
  * Build a SQL `WHERE ts >= … AND ts < …` clause from optional from/to query
