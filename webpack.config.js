@@ -15,7 +15,16 @@ module.exports = {
         test: /\.jsx?$/,
         loader: "babel-loader",
         exclude: /node_modules/,
-        options: { presets: ["@babel/preset-react"] },
+        // runtime "classic" is load-bearing: Babel 8 changed preset-react's
+        // default to the "automatic" runtime, whose emitted code imports
+        // react/jsx-runtime. That module is not in the Module Federation
+        // `shared` scope below, so webpack bundles a private copy of React's
+        // jsx runtime into the remote — a second React instance in the host
+        // page — and the Admin UI's panel loader fails. Classic emits
+        // React.createElement against the shared singleton React.
+        options: {
+          presets: [["@babel/preset-react", { runtime: "classic" }]],
+        },
       },
     ],
   },
