@@ -1283,6 +1283,85 @@ module.exports = (app: App) => {
       // Signal K's own plugin-uninstall can't delete the data dir on rootless
       // Podman (the container writes files as a subuid the SK user can't
       // remove); removeManagedData wipes them from inside the userns.
+      // Lossless recovery for a suspended WAL: one plain `RESUME WAL` per
+      // suspended plugin table. Deliberately a SINGLE attempt each, no
+      // retries — QuestDB's own HTTP console parks a busy ALTER and retries
+      // it server-side once per second indefinitely, and several console
+      // tabs doing that produced a self-sustaining retry storm in the field.
+      // A busy/failed table is reported to the caller instead. `ALTER` is
+      // DDL, so this cannot go through /api/query (isReadOnlySQL blocks it).
+      //
+      // No lifecycle lock: the resumes mutate no plugin-side state and are
+      // idempotent, so racing a concurrent start/update/purge at worst
+      // yields a per-table error the caller sees — while taking the lock
+      // could park this request behind a wedged start forever.
+      router.post("/api/resume-wal", async (_req, res) => {
+        try {
+          const client = queryClient;
+          if (!client) {
+            res
+              .status(503)
+              .json({ error: "QuestDB connection not initialized" });
+            return;
+          }
+          const walResult = await client.exec(
+            "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true",
+            10_000,
+          );
+          const suspended = client
+            .toObjects(walResult)
+            .filter((row) => FULL_EXPORT_TABLE_SET.has(String(row.name)));
+
+          const results: {
+            table: string;
+            ok: boolean;
+            error?: string;
+            writerTxn: number;
+            sequencerTxn: number;
+          }[] = [];
+          for (const row of suspended) {
+            const table = String(row.name);
+            const base = {
+              table,
+              writerTxn: Number(row.writerTxn ?? 0),
+              sequencerTxn: Number(row.sequencerTxn ?? 0),
+            };
+            try {
+              // Plain RESUME WAL replays from the next unapplied txn — it
+              // skips nothing, so no data is lost. 10s deadline: a busy
+              // table parks the request server-side (see above), and one
+              // bounded attempt that reports "busy" beats waiting.
+              await client.exec(
+                `ALTER TABLE "${table.replace(/"/g, '""')}" RESUME WAL`,
+                10_000,
+              );
+              results.push({ ...base, ok: true });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              results.push({
+                ...base,
+                ok: false,
+                error: /abort|timeout/i.test(msg)
+                  ? "table busy — the writer is held (likely by the WAL apply job or a stuck operation); if this persists, restart the QuestDB container"
+                  : msg,
+              });
+            }
+          }
+          res.json({
+            results,
+            resumed: results.filter((r) => r.ok).length,
+            message:
+              results.length === 0
+                ? "No suspended tables found"
+                : `Resumed ${results.filter((r) => r.ok).length} of ${results.length} suspended table(s)`,
+          });
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
       router.post("/api/purge-data", async (_req, res) => {
         try {
           // External mode is a config fact independent of the runtime, so
