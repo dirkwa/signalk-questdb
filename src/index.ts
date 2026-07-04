@@ -703,6 +703,7 @@ module.exports = (app: App) => {
       onUnhealthy: (msg) => app.setPluginError(msg),
       onHealthy: () =>
         app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`),
+      flushIntervalMs: config.ilpFlushIntervalMs,
     });
     await writer.connect();
 

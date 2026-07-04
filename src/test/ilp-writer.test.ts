@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as net from "net";
-import { ILPWriter } from "../ilp-writer";
+import { ILPWriter, DEFAULT_FLUSH_INTERVAL_MS } from "../ilp-writer";
 
 describe("ILPWriter", () => {
   it("sends correctly formatted ILP lines over TCP", async () => {
@@ -18,14 +18,16 @@ describe("ILPWriter", () => {
     );
     const port = (server.address() as net.AddressInfo).port;
 
-    const writer = new ILPWriter("127.0.0.1", port);
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
     await writer.connect();
 
     const ts = new Date("2024-06-15T12:00:00.000Z");
     writer.write("navigation.speedOverGround", "self", 6.4, ts);
 
     // Wait for flush timer
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await writer.disconnect();
 
     server.close();
@@ -54,13 +56,15 @@ describe("ILPWriter", () => {
     );
     const port = (server.address() as net.AddressInfo).port;
 
-    const writer = new ILPWriter("127.0.0.1", port);
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
     await writer.connect();
 
     const ts = new Date("2024-06-15T12:00:00.000Z");
     writer.writeString("navigation.state", "self", "motoring", ts);
 
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await writer.disconnect();
 
     server.close();
@@ -88,7 +92,9 @@ describe("ILPWriter", () => {
     );
     const port = (server.address() as net.AddressInfo).port;
 
-    const writer = new ILPWriter("127.0.0.1", port);
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
     await writer.connect();
 
     const ts = new Date("2024-06-15T12:00:00.000Z");
@@ -99,7 +105,7 @@ describe("ILPWriter", () => {
       ts,
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await writer.disconnect();
 
     server.close();
@@ -135,6 +141,7 @@ describe("ILPWriter", () => {
     const port = (server.address() as net.AddressInfo).port;
 
     const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
       timing: { initialReconnectDelay: 100, stableConnectionMs: 50 },
     });
     await writer.connect();
@@ -181,7 +188,7 @@ describe("ILPWriter", () => {
     await writer.connect().catch(() => {});
 
     // 3 flaps at ~20-40ms backoff each resolve well within this window.
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await writer.disconnect();
     await new Promise<void>((resolve) => server.close(() => resolve()));
 
@@ -264,13 +271,15 @@ describe("ILPWriter", () => {
     );
     const port = (server.address() as net.AddressInfo).port;
 
-    const writer = new ILPWriter("127.0.0.1", port);
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
     await writer.connect();
 
     const ts = new Date("2024-06-15T12:00:00.000Z");
     writer.write("path with spaces", "ctx,with,commas", 1.0, ts);
 
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await writer.disconnect();
 
     server.close();
@@ -284,5 +293,56 @@ describe("ILPWriter", () => {
       all.includes("ctx\\,with\\,commas"),
       `Commas should be escaped in: ${all}`,
     );
+  });
+
+  it("defaults the flush interval to 5s (batching, not the old 500ms)", async () => {
+    assert.equal(DEFAULT_FLUSH_INTERVAL_MS, 5000);
+
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (data) => received.push(data.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    // No flushIntervalMs option: nothing may be flushed inside a window that
+    // the previous 500ms default would have flushed in.
+    const writer = new ILPWriter("127.0.0.1", port);
+    await writer.connect();
+    writer.write("navigation.speedOverGround", "self", 6.4, new Date());
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(
+      received.join(""),
+      "",
+      "default-configured writer must not flush within 700ms",
+    );
+    await writer.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("honors a custom flushIntervalMs", async () => {
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (data) => received.push(data.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
+    await writer.connect();
+    writer.write("navigation.speedOverGround", "self", 6.4, new Date());
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.ok(
+      received.join("").includes("navigation.speedOverGround"),
+      "custom 100ms interval should have flushed within 300ms",
+    );
+    await writer.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });

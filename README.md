@@ -178,7 +178,7 @@ The plugin is optimized for Raspberry Pi and similar low-power devices:
 - **Default sampling rate** of 2000ms limits each path to 1 write per 2 seconds, keeping write volume modest on busy NMEA 2000 buses
 - **Resource caps** of 768 MB RAM and 1.5 CPU cores (cgroup limits via signalk-container) keep QuestDB from squeezing co-resident containers like Grafana, mayara, or signalk-backup. The JVM auto-sizes its heap to a fraction of the memory cap, so total footprint (heap + off-heap) is bounded
 - **QuestDB worker threads** reduced to 1 each (WAL, shared, ILP) to minimize CPU usage
-- **ILP batching** at 500ms intervals with 1000-row batches reduces TCP overhead
+- **ILP batching** commits every 5s (configurable via "Write batch interval"; a large backlog of buffered rows commits early). Each commit is one WAL transaction per table, and with deduplicated tables the apply cost of a transaction grows with partition size — frequent tiny commits eventually outpace what a Pi can apply and recording stalls. Bigger batches keep the WAL healthy; the cost is that at most one interval of buffered samples is lost on a hard crash
 - Per-path overrides allow faster rates for critical paths (e.g. `{ "environment.wind.*": 200 }`) while keeping slow-changing paths throttled
 - Set the memory limit to empty or CPU limit to `0` to disable the cap entirely on roomier hosts
 

@@ -69,6 +69,15 @@ export const ConfigSchema = Type.Object({
       "Minimum ms between writes for any path (0 = write every update). 2000ms is a sensible default for Pi/Cerbo-class hardware; lower it per-path via samplingRates when you need finer resolution.",
   }),
 
+  ilpFlushIntervalMs: Type.Number({
+    default: 5000,
+    minimum: 500,
+    maximum: 60000,
+    title: "Write batch interval (ms)",
+    description:
+      "How often buffered samples are committed to QuestDB. Each commit is one WAL transaction per table, so short intervals create huge numbers of tiny transactions whose apply cost eventually stalls recording on Pi-class hardware — QuestDB recommends >100 rows per transaction. Longer intervals mean at most this many ms of buffered data is lost on a hard crash.",
+  }),
+
   samplingRates: Type.Record(Type.String(), Type.Number(), {
     default: {},
     title: "Per-path sampling rates (ms)",
