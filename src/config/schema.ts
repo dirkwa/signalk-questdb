@@ -130,3 +130,24 @@ export const ConfigSchema = Type.Object({
 });
 
 export type Config = Static<typeof ConfigSchema>;
+
+/**
+ * Fill in config keys that older saved configs may lack. Signal K hands the
+ * plugin its stored configuration verbatim — TypeBox defaults are only
+ * applied by the Admin UI form, so a config saved before an option existed
+ * (or hand-edited) simply misses the key. The delta pipeline dereferences
+ * `pathFilter.paths` and `Object.entries(samplingRates)` on every delta, so
+ * a missing key crashed the stream subscription and recording silently
+ * stopped. Normalize once at the config boundary instead of guarding every
+ * consumer.
+ */
+export function normalizeConfig(config: Config): Config {
+  return {
+    ...config,
+    pathFilter: {
+      mode: config.pathFilter?.mode ?? "exclude",
+      paths: config.pathFilter?.paths ?? [],
+    },
+    samplingRates: config.samplingRates ?? {},
+  };
+}

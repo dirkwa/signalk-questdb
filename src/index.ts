@@ -3,7 +3,7 @@ import { minimatch } from "minimatch";
 import { ILPWriter } from "./ilp-writer";
 import { QueryClient, isReadOnlySQL } from "./query-client";
 import type { QuestDBResult } from "./query-client";
-import { Config, ConfigSchema } from "./config/schema";
+import { Config, ConfigSchema, normalizeConfig } from "./config/schema";
 import { createHistoryProviderV2 } from "./history-v2";
 import { createHistoryProviderV1 } from "./history-v1";
 import { startRetention } from "./retention";
@@ -532,6 +532,10 @@ module.exports = (app: App) => {
   }
 
   async function runStartInner(config: Config, signal: AbortSignal) {
+    // Older saved configs miss keys added since (pathFilter, samplingRates);
+    // the per-delta pipeline dereferences them per delta, so normalize once
+    // at the boundary.
+    config = normalizeConfig(config);
     currentConfig = config;
     // A start may connect to a different QuestDB than the previous run —
     // notably external mode repointed at a new host/build — so drop any cached
