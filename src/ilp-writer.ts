@@ -1,6 +1,15 @@
 import * as net from "net";
 
-const FLUSH_INTERVAL_MS = 500;
+// Every flush that carries lines becomes one WAL transaction per touched
+// table, and with DEDUP tables each transaction pays a dedup pass on apply
+// whose cost grows with partition size. Flushing twice a second produced
+// ~173K tiny (~30-row) transactions per table per day in the field — enough
+// that by day two the WAL apply on a Pi could no longer keep up with the
+// commit rate and tables stalled. Fewer, larger transactions are dramatically
+// cheaper to apply; QuestDB's own guidance is >100 rows per transaction. The
+// trade-off is bounded staleness: at most this many ms of buffered samples
+// are lost on a hard crash (a normal stop flushes first).
+export const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const FLUSH_BATCH_SIZE = 1000;
 const INITIAL_RECONNECT_DELAY_MS = 1000;
 const MAX_RECONNECT_DELAY_MS = 30000;
@@ -68,6 +77,10 @@ export class ILPWriter {
   private readonly maxReconnectDelay: number;
   private readonly stableConnectionMs: number;
   private readonly unhealthyAfterFlaps: number;
+  // How often buffered lines are committed. Unlike `timing`, this is a real
+  // production knob (wired to the plugin's ilpFlushIntervalMs config) — see
+  // the DEFAULT_FLUSH_INTERVAL_MS comment for the batching rationale.
+  private readonly flushIntervalMs: number;
 
   constructor(
     private host: string,
@@ -76,6 +89,7 @@ export class ILPWriter {
     callbacks?: {
       onUnhealthy?: (msg: string) => void;
       onHealthy?: () => void;
+      flushIntervalMs?: number;
       timing?: {
         initialReconnectDelay?: number;
         maxReconnectDelay?: number;
@@ -87,6 +101,8 @@ export class ILPWriter {
     this.debug = debug ?? (() => {});
     this.onUnhealthy = callbacks?.onUnhealthy ?? (() => {});
     this.onHealthy = callbacks?.onHealthy ?? (() => {});
+    this.flushIntervalMs =
+      callbacks?.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
     const t = callbacks?.timing ?? {};
     this.initialReconnectDelay =
       t.initialReconnectDelay ?? INITIAL_RECONNECT_DELAY_MS;
@@ -316,7 +332,7 @@ export class ILPWriter {
 
   private startFlushTimer(): void {
     this.stopFlushTimer();
-    this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+    this.flushTimer = setInterval(() => this.flush(), this.flushIntervalMs);
   }
 
   private stopFlushTimer(): void {

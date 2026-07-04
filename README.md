@@ -106,26 +106,27 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 
 ## Configuration
 
-| Setting            | Default      | Description                                                                         |
-| ------------------ | ------------ | ----------------------------------------------------------------------------------- |
-| QuestDB version    | `latest`     | Docker image tag (dropdown shows stable + pre-releases)                             |
-| Managed container  | `true`       | Let signalk-container manage QuestDB, or connect to external                        |
-| QuestDB host       | `127.0.0.1`  | External QuestDB host (only used when managed=false)                                |
-| HTTP port          | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                     |
-| ILP port           | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                     |
-| PostgreSQL port    | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                          |
-| Sampling rate (ms) | `2000`       | Default min ms between writes per path (0 = every update)                           |
-| Memory limit       | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)                        |
-| CPU limit (cores)  | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                                       |
-| Record own vessel  | `true`       | Record self context                                                                 |
-| Record AIS targets | `false`      | Record other vessels                                                                |
-| Retention (days)   | `0`          | Auto-delete old partitions (0 = keep forever)                                       |
-| Path filter mode   | `exclude`    | `exclude` matching paths, or `include` only matching paths                          |
-| Path filter paths  | _(empty)_    | Glob patterns, one per line (e.g. `navigation.position`); empty = record everything |
-| Compression codec  | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                                   |
-| Compression level  | `3`          | ZSTD level 1-22 (only when codec is zstd)                                           |
-| Container network  | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0)                   |
-| Bind to 0.0.0.0    | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)                          |
+| Setting                   | Default      | Description                                                                                           |
+| ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
+| QuestDB version           | `latest`     | Docker image tag (dropdown shows stable + pre-releases)                                               |
+| Managed container         | `true`       | Let signalk-container manage QuestDB, or connect to external                                          |
+| QuestDB host              | `127.0.0.1`  | External QuestDB host (only used when managed=false)                                                  |
+| HTTP port                 | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                                       |
+| ILP port                  | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                                       |
+| PostgreSQL port           | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                                            |
+| Sampling rate (ms)        | `2000`       | Default min ms between writes per path (0 = every update)                                             |
+| Write batch interval (ms) | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance) |
+| Memory limit              | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)                                          |
+| CPU limit (cores)         | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                                                         |
+| Record own vessel         | `true`       | Record self context                                                                                   |
+| Record AIS targets        | `false`      | Record other vessels                                                                                  |
+| Retention (days)          | `0`          | Auto-delete old partitions (0 = keep forever)                                                         |
+| Path filter mode          | `exclude`    | `exclude` matching paths, or `include` only matching paths                                            |
+| Path filter paths         | _(empty)_    | Glob patterns, one per line (e.g. `navigation.position`); empty = record everything                   |
+| Compression codec         | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                                                     |
+| Compression level         | `3`          | ZSTD level 1-22 (only when codec is zstd)                                                             |
+| Container network         | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0)                                     |
+| Bind to 0.0.0.0           | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)                                            |
 
 ## Connectivity
 
@@ -178,7 +179,7 @@ The plugin is optimized for Raspberry Pi and similar low-power devices:
 - **Default sampling rate** of 2000ms limits each path to 1 write per 2 seconds, keeping write volume modest on busy NMEA 2000 buses
 - **Resource caps** of 768 MB RAM and 1.5 CPU cores (cgroup limits via signalk-container) keep QuestDB from squeezing co-resident containers like Grafana, mayara, or signalk-backup. The JVM auto-sizes its heap to a fraction of the memory cap, so total footprint (heap + off-heap) is bounded
 - **QuestDB worker threads** reduced to 1 each (WAL, shared, ILP) to minimize CPU usage
-- **ILP batching** at 500ms intervals with 1000-row batches reduces TCP overhead
+- **ILP batching** commits every 5s (configurable via "Write batch interval"; a large backlog of buffered rows commits early). Each commit is one WAL transaction per table, and with deduplicated tables the apply cost of a transaction grows with partition size — frequent tiny commits eventually outpace what a Pi can apply and recording stalls. Bigger batches keep the WAL healthy; the cost is that at most one interval of buffered samples is lost on a hard crash
 - Per-path overrides allow faster rates for critical paths (e.g. `{ "environment.wind.*": 200 }`) while keeping slow-changing paths throttled
 - Set the memory limit to empty or CPU limit to `0` to disable the cap entirely on roomier hosts
 
