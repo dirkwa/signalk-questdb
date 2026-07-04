@@ -41,7 +41,7 @@ export class QueryClient {
     this.baseUrl = `http://${host}:${port}`;
   }
 
-  async exec(sql: string): Promise<QuestDBResult> {
+  async exec(sql: string, timeoutMs = 30000): Promise<QuestDBResult> {
     const url = new URL("/exec", this.baseUrl);
     url.searchParams.set("query", sql);
     // Do NOT pass nm=true: it tells QuestDB to omit the `columns` metadata,
@@ -50,9 +50,14 @@ export class QueryClient {
     // every consumer that reads rows by name (history playback, /api/query,
     // the suspended-WAL status probe). The metadata is small; correctness
     // wins over the few bytes saved.
+    //
+    // `timeoutMs` matters for statements QuestDB's HTTP endpoint can PARK:
+    // an ALTER against a busy table is retried server-side once per second
+    // with the response held open ("JsonQueryProcessor resource busy, will
+    // retry"), so without a deadline the call would wait the full default.
 
     const res = await fetch(url.toString(), {
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     if (!res.ok) {

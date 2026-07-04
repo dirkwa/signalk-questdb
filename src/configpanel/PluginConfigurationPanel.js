@@ -314,6 +314,8 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [purging, setPurging] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const [resumeOutcome, setResumeOutcome] = useState("");
 
   const fetchVersions = useCallback(async () => {
     setVersionsLoading(true);
@@ -412,6 +414,32 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       setStatusError(true);
     }
     setPurging(false);
+  };
+
+  const handleResumeWal = async () => {
+    setResuming(true);
+    setResumeOutcome("");
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/resume-wal", {
+        method: "POST",
+      });
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (res.ok) {
+        const failed = (data.results || []).filter((r) => !r.ok);
+        setResumeOutcome(
+          failed.length === 0
+            ? `${data.message}. Recording resumes as the backlog drains — the banner clears once tables catch up.`
+            : `${data.message}. ` +
+                failed.map((r) => `${r.table}: ${r.error}`).join(" · "),
+        );
+        fetchStatus();
+      } else {
+        setResumeOutcome(`Resume failed: ${data.error}`);
+      }
+    } catch (e) {
+      setResumeOutcome(`Resume failed: ${e.message}`);
+    }
+    setResuming(false);
   };
 
   const detectMigration = async () => {
@@ -544,35 +572,54 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               </div>
               Rows are arriving but no longer commit, so the counts below have
               stopped advancing. This follows an error while QuestDB applied the
-              write-ahead log — see the reason reported per table below. Resume
-              each suspended table in the QuestDB SQL console (
-              <code>:9000</code>
-              ), skipping the broken transaction:
+              write-ahead log — see the reason reported per table below.
+              Resuming replays every pending transaction, so no data is lost.
               <code style={S.warnBannerCode}>
                 {suspendedTables
                   .map((t) => {
-                    // Double-quote the identifier (escaping embedded quotes) so
-                    // the copy-pasted SQL is valid even for table names with
-                    // spaces or other special characters.
-                    const ident = `"${String(t.name).replace(/"/g, '""')}"`;
                     // Show QuestDB's own reason when it reports one, so the
-                    // operator can tell a transient resource error (resumable
-                    // losslessly) from a poison transaction. Flatten any
-                    // control characters: the reason is appended after `--`, so
-                    // an embedded newline would split the copied statement and
-                    // the remainder could paste as live, unintended SQL.
+                    // operator can tell a transient resource error from a
+                    // poison transaction. Flatten any control characters —
+                    // the reason renders on one line per table.
                     const reason = String(
                       t.errorMessage || t.errorTag || "reason not reported",
                     ).replace(/[\r\n]+/g, " ");
-                    return (
-                      `ALTER TABLE ${ident} RESUME WAL FROM TXN ${t.writerTxn + 1};` +
-                      `  -- ${formatNumber(t.txnLag)} txns behind; ${reason}`
-                    );
+                    return `${t.name}: ${formatNumber(t.txnLag)} txns behind — ${reason}`;
                   })
                   .join("\n")}
               </code>
+              <div style={{ marginTop: 10 }}>
+                <button
+                  style={{
+                    ...S.btn,
+                    ...S.btnPrimary,
+                    ...(resuming ? S.btnDisabled : {}),
+                  }}
+                  disabled={resuming}
+                  onClick={handleResumeWal}
+                >
+                  {resuming ? "Resuming..." : "Resume recording"}
+                </button>
+              </div>
+              <div style={{ marginTop: 8, fontSize: 12 }}>
+                Manual fallback in the QuestDB SQL console (<code>:9000</code>
+                ), one statement at a time — avoid running it from several tabs,
+                the console retries a busy statement forever:
+                <code style={S.warnBannerCode}>
+                  {suspendedTables
+                    .map(
+                      (t) =>
+                        `ALTER TABLE "${String(t.name).replace(/"/g, '""')}" RESUME WAL;`,
+                    )
+                    .join("\n")}
+                </code>
+              </div>
             </div>
           )}
+          {/* Rendered outside the suspended banner: a successful resume clears
+              walSuspended on the very next status fetch, which unmounts the
+              banner — the confirmation must survive that. */}
+          {resumeOutcome && <div style={S.infoBanner}>{resumeOutcome}</div>}
           {schemaMismatch && (
             <div style={S.warnBanner}>
               <div style={S.warnBannerTitle}>
