@@ -753,7 +753,7 @@ module.exports = (app: App) => {
     const bus = app.streambundle.getBus();
     const unsub = bus.onValue((delta: any) => {
       if (!writer) return;
-      const { path, value, context, timestamp } = delta;
+      const { path, value, context } = delta;
       if (!path || value === undefined || value === null) return;
 
       const isSelf = context === app.selfContext;
@@ -770,20 +770,31 @@ module.exports = (app: App) => {
       )
         return;
 
-      const ts = timestamp ? new Date(timestamp) : new Date();
+      // Rows are stamped with the server receive time, deliberately NOT the
+      // delta's own timestamp: a boat is a set of independent clocks (GPS
+      // time, RTC-less devices, gateway latencies), and storing per-source
+      // timestamps makes commits land out of order. QuestDB then rewrites
+      // partition tails on every merge — observed in the field as >3000x
+      // write amplification (physical rows rewritten per row inserted),
+      // grinding SD cards and, before batching, stalling the WAL outright.
+      // The writer assigns the actual timestamp (strictly monotonic to the
+      // microsecond, so same-millisecond writes don't collide on the dedup
+      // key), so every commit is a pure append. A device with a broken clock
+      // even gets *more* accurate history. Re-sent ILP batches keep their
+      // original stamps (baked at write() time), so replay-idempotency holds.
       const ctx = isSelf ? "self" : context;
 
       if (typeof value === "number") {
-        writer.write(path, ctx, value, ts);
+        writer.write(path, ctx, value);
       } else if (typeof value === "string") {
-        writer.writeString(path, ctx, value, ts);
+        writer.writeString(path, ctx, value);
       } else if (
         value &&
         typeof value === "object" &&
         "latitude" in value &&
         "longitude" in value
       ) {
-        writer.writePosition(path, ctx, value, ts);
+        writer.writePosition(path, ctx, value);
       }
     });
     unsubscribes.push(unsub);

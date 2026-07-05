@@ -54,6 +54,17 @@ export class ILPWriter {
   private connected = false;
   private connecting = false;
   private stopped = false;
+  // Last timestamp handed out, in nanoseconds. Rows are stamped at write time
+  // with the server clock (see the delta handler), but `Date` is only
+  // millisecond-resolution while the `signalk`/`signalk_str` tables dedup on
+  // KEYS(ts, path, context). Two writes for the same path within one
+  // millisecond would collide and the later would upsert over the earlier —
+  // silent data loss for unthrottled (samplingRate 0) or bursty paths. QuestDB
+  // stores microsecond resolution, so advancing this counter by at least 1µs
+  // per write keeps every row's `ts` distinct without moving the visible
+  // millisecond. It only ratchets forward: a same/earlier wall-clock reading
+  // is bumped past the last one, so ingestion also stays strictly ordered.
+  private lastNanos = 0n;
   // Wall-clock ms when the current socket's connect callback fired. Read in the
   // `close` handler to decide whether the connection was stable (reset backoff)
   // or an instant flap (grow backoff). Reset to 0 on every close.
@@ -242,8 +253,28 @@ export class ILPWriter {
     }, this.reconnectDelay);
   }
 
-  write(path: string, context: string, value: number, timestamp: Date): void {
-    const ts = BigInt(timestamp.getTime()) * 1000000n;
+  // Strictly-increasing nanosecond timestamp for the next row. Starts from the
+  // server clock but never repeats or goes backwards within one writer, so
+  // same-millisecond writes to a dedup table don't collide (see `lastNanos`).
+  // An explicit `Date` (used by tests that assert exact ILP lines) is honoured
+  // verbatim, but still advances the floor so it can't collide with a later
+  // omitted-timestamp write.
+  private nextNanos(explicit?: Date): bigint {
+    if (explicit) {
+      const explicitNanos = BigInt(explicit.getTime()) * 1_000_000n;
+      if (explicitNanos > this.lastNanos) this.lastNanos = explicitNanos;
+      return explicitNanos;
+    }
+    const nowNanos = BigInt(Date.now()) * 1_000_000n;
+    // Advance by at least 1µs (QuestDB's storage resolution) past the last
+    // value so the microsecond QuestDB persists is always distinct.
+    this.lastNanos =
+      nowNanos > this.lastNanos ? nowNanos : this.lastNanos + 1_000n;
+    return this.lastNanos;
+  }
+
+  write(path: string, context: string, value: number, timestamp?: Date): void {
+    const ts = this.nextNanos(timestamp);
     this.enqueue(
       `signalk,path=${escapeTag(path)},context=${escapeTag(context)} value=${value} ${ts}\n`,
     );
@@ -253,9 +284,9 @@ export class ILPWriter {
     path: string,
     context: string,
     value: string,
-    timestamp: Date,
+    timestamp?: Date,
   ): void {
-    const ts = BigInt(timestamp.getTime()) * 1000000n;
+    const ts = this.nextNanos(timestamp);
     this.enqueue(
       `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)} value_str="${escapeFieldString(value)}" ${ts}\n`,
     );
@@ -265,9 +296,9 @@ export class ILPWriter {
     path: string,
     context: string,
     position: { latitude: number; longitude: number },
-    timestamp: Date,
+    timestamp?: Date,
   ): void {
-    const ts = BigInt(timestamp.getTime()) * 1000000n;
+    const ts = this.nextNanos(timestamp);
     this.enqueue(
       `signalk_position,context=${escapeTag(context)} lat=${position.latitude},lon=${position.longitude} ${ts}\n`,
     );
