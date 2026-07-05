@@ -345,4 +345,80 @@ describe("ILPWriter", () => {
     await writer.disconnect();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
+
+  it("assigns strictly increasing microsecond timestamps to same-ms writes", async () => {
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (data) => received.push(data.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
+    await writer.connect();
+
+    // A burst of writes to the SAME path within one tick. Without a monotonic
+    // tie-breaker these share a millisecond timestamp and collide on the
+    // signalk dedup key KEYS(ts, path, context); the later would upsert over
+    // the earlier. Each must get a distinct timestamp instead.
+    for (let i = 0; i < 5; i++) {
+      writer.write("navigation.speedOverGround", "self", i, undefined);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await writer.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    // Parse the trailing nanosecond timestamp of each emitted line.
+    const timestamps = received
+      .join("")
+      .trim()
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => BigInt(l.slice(l.lastIndexOf(" ") + 1)));
+    assert.equal(timestamps.length, 5, "all five rows must be sent");
+    for (let i = 1; i < timestamps.length; i++) {
+      assert.ok(
+        timestamps[i] > timestamps[i - 1],
+        `timestamps must strictly increase, got ${timestamps[i - 1]} then ${timestamps[i]}`,
+      );
+      // Distinct at microsecond resolution (QuestDB's storage granularity),
+      // not merely at nanosecond resolution.
+      assert.ok(
+        timestamps[i] / 1000n > timestamps[i - 1] / 1000n,
+        "timestamps must differ by at least 1µs",
+      );
+    }
+  });
+
+  it("honours an explicit timestamp verbatim (no monotonic bump)", async () => {
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (data) => received.push(data.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
+    await writer.connect();
+
+    const ts = new Date("2024-06-15T12:00:00.000Z");
+    writer.write("navigation.speedOverGround", "self", 6.4, ts);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await writer.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    const expectedNanos = BigInt(ts.getTime()) * 1_000_000n;
+    assert.ok(
+      received.join("").includes(` ${expectedNanos}\n`),
+      `explicit timestamp must be used verbatim (${expectedNanos})`,
+    );
+  });
 });
