@@ -257,9 +257,14 @@ export class ILPWriter {
   // server clock but never repeats or goes backwards within one writer, so
   // same-millisecond writes to a dedup table don't collide (see `lastNanos`).
   // An explicit `Date` (used by tests that assert exact ILP lines) is honoured
-  // verbatim without the monotonic bump.
+  // verbatim, but still advances the floor so it can't collide with a later
+  // omitted-timestamp write.
   private nextNanos(explicit?: Date): bigint {
-    if (explicit) return BigInt(explicit.getTime()) * 1_000_000n;
+    if (explicit) {
+      const explicitNanos = BigInt(explicit.getTime()) * 1_000_000n;
+      if (explicitNanos > this.lastNanos) this.lastNanos = explicitNanos;
+      return explicitNanos;
+    }
     const nowNanos = BigInt(Date.now()) * 1_000_000n;
     // Advance by at least 1µs (QuestDB's storage resolution) past the last
     // value so the microsecond QuestDB persists is always distinct.

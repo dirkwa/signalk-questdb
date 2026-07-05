@@ -421,4 +421,43 @@ describe("ILPWriter", () => {
       `explicit timestamp must be used verbatim (${expectedNanos})`,
     );
   });
+
+  it("floors monotonic timestamps against a prior explicit timestamp", async () => {
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (data) => received.push(data.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
+    await writer.connect();
+
+    // An explicit timestamp far in the future, then an omitted-timestamp
+    // write. The omitted write's receive-time ns is well below the explicit
+    // one, so without flooring it would emit a smaller ts and collide with a
+    // future replay. It must instead advance past the explicit value.
+    const future = new Date("2099-01-01T00:00:00.000Z");
+    writer.write("navigation.speedOverGround", "self", 1, future);
+    writer.write("navigation.speedOverGround", "self", 2, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await writer.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    const timestamps = received
+      .join("")
+      .trim()
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => BigInt(l.slice(l.lastIndexOf(" ") + 1)));
+    assert.equal(timestamps.length, 2);
+    assert.ok(
+      timestamps[1] > timestamps[0],
+      `omitted-timestamp write must advance past a prior explicit one, got ${timestamps[0]} then ${timestamps[1]}`,
+    );
+  });
 });
