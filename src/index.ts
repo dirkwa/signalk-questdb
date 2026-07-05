@@ -753,7 +753,7 @@ module.exports = (app: App) => {
     const bus = app.streambundle.getBus();
     const unsub = bus.onValue((delta: any) => {
       if (!writer) return;
-      const { path, value, context, timestamp } = delta;
+      const { path, value, context } = delta;
       if (!path || value === undefined || value === null) return;
 
       const isSelf = context === app.selfContext;
@@ -770,7 +770,19 @@ module.exports = (app: App) => {
       )
         return;
 
-      const ts = timestamp ? new Date(timestamp) : new Date();
+      // Server receive time, deliberately NOT the delta's own timestamp: a
+      // boat is a set of independent clocks (GPS time, RTC-less devices,
+      // gateway latencies), and storing per-source timestamps makes commits
+      // land out of order. QuestDB then rewrites partition tails on every
+      // merge — observed in the field as >3000x write amplification
+      // (physical rows rewritten per row inserted), grinding SD cards and,
+      // before batching, stalling the WAL outright. Receive-time stamps are
+      // monotonic by construction, so every commit is a pure append. The
+      // millisecond skew this introduces is far below the sampling
+      // resolution; a device with a broken clock even gets *more* accurate
+      // history. Re-sent ILP batches keep their original stamps (assigned
+      // at write() time), so dedup replay-idempotency is unaffected.
+      const ts = new Date();
       const ctx = isSelf ? "self" : context;
 
       if (typeof value === "number") {

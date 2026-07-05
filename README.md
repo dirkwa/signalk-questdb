@@ -49,6 +49,13 @@ Three tables, all with WAL mode, daily partitioning, and deduplication:
 | `signalk_str`      | String values  | `ts`, `path` (SYMBOL), `context` (SYMBOL), `value_str` (VARCHAR) |
 | `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)         |
 
+`ts` is the **server receive time**, not the timestamp a source claims. Marine
+sources carry independent clocks, and storing their timestamps makes commits
+land out of order — QuestDB then rewrites partition tails on every merge
+(observed as >3000x write amplification). Receive time keeps ingestion
+append-only; the millisecond difference is far below the sampling resolution,
+and a device with a broken clock gets more accurate history, not less.
+
 ## History API
 
 ### v2 (REST -- `/signalk/v2/api/history/`)
