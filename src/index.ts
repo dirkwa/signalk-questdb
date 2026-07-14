@@ -262,6 +262,13 @@ module.exports = (app: App) => {
   // could resurrect a just-purged container. A simple promise-chain mutex:
   // each call waits for the previous to settle, then runs.
   let lifecycleChain: Promise<unknown> = Promise.resolve();
+  // Bumped by stop() and purge before they tear down. Lifecycle work captures
+  // the value when it is ENQUEUED and re-checks it when it actually runs (and
+  // after its long awaits): startAbort can only cancel the start that is
+  // currently executing, so without this a start/update still waiting behind
+  // the chain — or one parked in a long await — would run to completion after
+  // teardown and resurrect the resources that were just torn down.
+  let lifecycleGeneration = 0;
   const withLifecycleLock = <T>(fn: () => Promise<T>): Promise<T> => {
     const run = lifecycleChain.then(fn, fn);
     // Keep the chain alive regardless of this op's outcome.
@@ -395,12 +402,15 @@ module.exports = (app: App) => {
    *     QuestDB is not published beyond loopback / the shared network.
    *   - on: publish the configured host ports on 0.0.0.0 (for LAN / separate-
    *     Docker Grafana) on the shared `networkName`; the Signal K process
-   *     reaches them on the host loopback (bare-metal) or via the
-   *     host.containers.internal gateway (containerized SK).
+   *     reaches them on the host loopback (bare-metal) or — containerized —
+   *     on whichever of loopback/host.containers.internal actually answers
+   *     (probed, since the right one depends on the SK container's network
+   *     mode; see resolveLanExposureHost).
    *
-   * `endpoints` is resolved AFTER ensureRunning() on the signalkAccessiblePorts
-   * path (the host port is allocated by then); on the LAN path it is already
-   * known, so the returned resolver just echoes it.
+   * `endpoints` is resolved AFTER ensureRunning() on both paths: the
+   * signalkAccessiblePorts path needs the allocated host port, and the LAN
+   * path's probe needs a running QuestDB. The returned resolver defers the
+   * work into the closure (memoized on the LAN path) for exactly that reason.
    */
   async function applyQuestdbNetworking(
     config: Config,
@@ -433,14 +443,24 @@ module.exports = (app: App) => {
         await containers.ensureNetwork(config.networkName);
         containerConfig.networkMode = config.networkName;
       }
-      // A 0.0.0.0-published port is reachable from a containerized SK via the
-      // host gateway; a loopback-only one (or any bare-metal/old-container
-      // case) is reached on 127.0.0.1.
-      const skHost = config.exposeToContainers
-        ? await resolveLanExposureHost(containers, (msg) => app.debug(msg))
-        : "127.0.0.1";
-      const endpoints = lanExposureEndpoints(skHost, httpPort, ilpPort);
-      return async () => endpoints;
+      // A 0.0.0.0-published port is reached on 127.0.0.1 or via the host
+      // gateway depending on how a containerized SK is networked — resolved
+      // by probing, which only works once QuestDB is up. The resolver runs
+      // after ensureRunning() on both call sites, so defer the probe into
+      // the closure (and memoize: the endpoint can't change while the
+      // container config that produced it is live).
+      let endpoints: { http: Endpoint; ilp: Endpoint } | null = null;
+      return async () => {
+        if (!endpoints) {
+          const skHost = config.exposeToContainers
+            ? await resolveLanExposureHost(containers, httpPort, (msg) =>
+                app.debug(msg),
+              )
+            : "127.0.0.1";
+          endpoints = lanExposureEndpoints(skHost, httpPort, ilpPort);
+        }
+        return endpoints;
+      };
     }
 
     // Default path: signalk-container owns the networking. After the container
@@ -658,7 +678,12 @@ module.exports = (app: App) => {
         if (signal.aborted) return;
         app.debug("QuestDB container ready");
 
-        questdbEndpoints = await resolveEndpoints();
+        // The LAN path probes for the reachable host in here (up to its
+        // retry deadline), so this await is long enough for a stop/purge to
+        // preempt us — re-check before committing the result.
+        const resolved = await resolveEndpoints();
+        if (signal.aborted) return;
+        questdbEndpoints = resolved;
       } catch (err) {
         app.debug("ensureRunning failed:", err);
         app.setPluginError(
@@ -818,9 +843,19 @@ module.exports = (app: App) => {
   }
 
   // Public entry: serialize startup behind the lifecycle lock so a purge or
-  // update can't interleave with it.
+  // update can't interleave with it. The generation is captured at enqueue: a
+  // stop()/purge landing while this start is still queued invalidates it
+  // before it begins — the window startAbort cannot cover, since the abort
+  // controller only exists once runStart() is executing.
   function asyncStart(config: Config): Promise<void> {
-    return withLifecycleLock(() => runStart(config));
+    const generation = lifecycleGeneration;
+    return withLifecycleLock(async () => {
+      if (generation !== lifecycleGeneration) {
+        app.debug("skipping queued start: plugin stopped while it waited");
+        return;
+      }
+      await runStart(config);
+    });
   }
 
   const plugin = {
@@ -841,6 +876,15 @@ module.exports = (app: App) => {
     },
 
     async stop() {
+      // Preempt lifecycle work: bump the generation so anything still queued
+      // behind the lifecycle chain (or parked in a long await that re-checks
+      // it) bails, and abort the currently-executing start so its post-await
+      // signal checks return before registering resources. Together these
+      // keep a slow start/update (container pull, LAN-host probe) from
+      // resurrecting a writer/client after this teardown ran.
+      lifecycleGeneration++;
+      startAbort?.abort();
+
       for (const unsub of unsubscribes) {
         try {
           unsub();
@@ -1178,9 +1222,20 @@ module.exports = (app: App) => {
 
           // Run the mutating update under the lifecycle lock so a concurrent
           // purge/start can't interleave with the pull + recreate + reconnect.
+          // Generation captured at enqueue, re-checked at entry and after the
+          // long awaits: a stop() during the pull or the LAN-host probe must
+          // not let this resume, reassign endpoints, and report success for a
+          // container the teardown already dealt with.
+          const updateGeneration = lifecycleGeneration;
           const ilp = await withLifecycleLock(async () => {
+            const assertNotStopped = () => {
+              if (updateGeneration !== lifecycleGeneration)
+                throw new Error("plugin stopped while the update was running");
+            };
+            assertNotStopped();
             app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
             await containers.pullImage(`questdb/questdb:${newTag}`);
+            assertNotStopped();
 
             if (currentConfig) {
               currentConfig.questdbVersion = newTag;
@@ -1235,7 +1290,10 @@ module.exports = (app: App) => {
               updateConfig,
             );
             // Clear any prior clamp before re-running so a no-longer-clamping
-            // update doesn't leave a stale warning.
+            // update doesn't leave a stale warning. The recreate must not
+            // happen after a stop/purge teardown, so gate it on the
+            // generation one more time.
+            assertNotStopped();
             ulimitClamp = null;
             await containers.ensureRunning(
               QUESTDB_CONTAINER_NAME,
@@ -1244,6 +1302,7 @@ module.exports = (app: App) => {
                 onUlimitClamped,
               },
             );
+            assertNotStopped();
 
             // The QuestDB version just changed, so the cached wal_tables()
             // column shape may no longer match (the errorTag/errorMessage
@@ -1256,25 +1315,38 @@ module.exports = (app: App) => {
             // current endpoint. The version bump keeps the same container name
             // and networking, so the endpoint is stable — the existing
             // QueryClient/ILPWriter stay valid (and the registered history
-            // providers keep their reference).
-            questdbEndpoints = await resolveUpdateEndpoints();
+            // providers keep their reference). On the LAN path this await
+            // probes for the reachable host, so it's long enough for a stop()
+            // to land mid-flight — re-check before touching plugin state.
+            const updatedEndpoints = await resolveUpdateEndpoints();
+            assertNotStopped();
+            questdbEndpoints = updatedEndpoints;
             const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
 
             // Wait for the recreated container to answer, then reconnect ILP.
-            if (queryClient) {
+            // Locals are captured because stop() nulls the module bindings:
+            // reading them again mid-loop would throw, and the generation
+            // checks after every await are what keep a concurrent teardown
+            // from being resurrected by the reconnect.
+            const client = queryClient;
+            if (client) {
               const deadline = Date.now() + 30000;
               while (Date.now() < deadline) {
-                if (await queryClient.isHealthy()) break;
+                assertNotStopped();
+                if (await client.isHealthy()) break;
                 await new Promise((resolve) => setTimeout(resolve, 500));
               }
             }
-            if (writer) {
+            assertNotStopped();
+            const ilpWriter = writer;
+            if (ilpWriter) {
               try {
-                await writer.disconnect();
+                await ilpWriter.disconnect();
               } catch {
                 /* ignore */
               }
-              await writer.connect();
+              assertNotStopped();
+              await ilpWriter.connect();
             }
             return { ilpHost, ilpPort };
           });
@@ -1448,13 +1520,16 @@ module.exports = (app: App) => {
           // Purge is the RECOVERY action, so it must make progress even when a
           // start is wedged on a never-settling container call. Step 1: signal
           // any in-flight start to bail (its post-await checks return without
-          // creating resources). Step 2: try to acquire the lifecycle lock so
+          // creating resources) and bump the generation so a start/update
+          // still QUEUED behind the chain bails at entry instead of running
+          // after the teardown. Step 2: try to acquire the lifecycle lock so
           // we still serialize against a start/update that IS progressing —
           // but only for a bounded time. If the lock isn't free within
           // PURGE_LOCK_TIMEOUT_MS (a truly hung start that ignored the abort
           // and never released it), run the teardown anyway. Interleaving risk
           // is minimal because we already aborted the start, so any start that
           // later wakes up returns early instead of recreating the container.
+          lifecycleGeneration++;
           startAbort?.abort();
 
           let lockedTeardownSettled = false;
