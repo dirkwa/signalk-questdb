@@ -160,8 +160,10 @@ QuestDB you point it at via `QuestDB host` + the HTTP/ILP ports.
 
 ## QuestDB Web Console
 
-QuestDB ships a web console (SQL editor + import UI) on its HTTP port. On the
-Signal K host it is at:
+QuestDB ships a web console (SQL editor + import UI) on its HTTP port. See the
+**[Web Console user guide](doc/web-console.md)** for an end-user walkthrough
+with ready-to-paste sample queries (speed in knots, temperatures in °C,
+distance per day, track export, and more). On the Signal K host it is at:
 
 ```
 http://localhost:9000
