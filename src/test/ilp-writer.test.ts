@@ -98,12 +98,7 @@ describe("ILPWriter", () => {
     await writer.connect();
 
     const ts = new Date("2024-06-15T12:00:00.000Z");
-    writer.writePosition(
-      "navigation.position",
-      "self",
-      { latitude: 52.5, longitude: 13.4 },
-      ts,
-    );
+    writer.writePosition("self", { latitude: 52.5, longitude: 13.4 }, ts);
 
     await new Promise((resolve) => setTimeout(resolve, 300));
     await writer.disconnect();

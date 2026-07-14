@@ -292,8 +292,9 @@ export class ILPWriter {
     );
   }
 
+  // signalk_position has no path column — it holds navigation.position rows
+  // exclusively (the caller enforces that), keyed on ts+context.
   writePosition(
-    path: string,
     context: string,
     position: { latitude: number; longitude: number },
     timestamp?: Date,
