@@ -15,7 +15,7 @@ The console runs on QuestDB's HTTP port (default **9000**).
 - **From another computer** (e.g. your laptop), you have two options:
   - Tunnel over SSH (keeps QuestDB private):
 
-    ```
+    ```shell
     ssh -L 9000:127.0.0.1:9000 <user>@<signalk-host>
     ```
 
@@ -23,9 +23,10 @@ The console runs on QuestDB's HTTP port (default **9000**).
 
   - Or enable **"Bind to 0.0.0.0"** in the plugin config and open
     `http://<signalk-host-ip>:9000`. This exposes QuestDB to your whole
-    network, and anyone who can reach port 9000 can not only read but also
-    **modify or delete** your history — the SSH tunnel is the safer default;
-    only bind to 0.0.0.0 behind a firewall you trust.
+    network: port 9000 carries not just this console but also QuestDB's REST
+    API and data ingestion, with no authentication by default — anyone who
+    can reach it can read, **modify or delete** your history. The SSH tunnel
+    is the safer default; only bind to 0.0.0.0 behind a firewall you trust.
 
 ## A Quick Tour
 
@@ -78,7 +79,9 @@ minutes.
 ### What is being recorded?
 
 Lists every recorded numeric path with its sample count and time range — a
-good first query to discover the exact path names on _your_ boat:
+good first query to discover the exact path names on _your_ boat (this one
+deliberately has no `context` filter, so with AIS recording enabled the
+counts include all vessels):
 
 ```sql
 SELECT path, count() AS samples,
@@ -111,6 +114,7 @@ SELECT ts, lat, lon
 FROM signalk_position
 WHERE context = 'self'
   AND lat IS NOT NULL
+  AND lon IS NOT NULL
 ORDER BY ts DESC
 LIMIT 1;
 ```
@@ -152,6 +156,7 @@ SELECT ts,
 FROM signalk
 WHERE path = 'environment.outside.temperature'
   AND context = 'self'
+  AND ts > dateadd('d', -30, now())
 SAMPLE BY 1d;
 ```
 
@@ -178,6 +183,7 @@ SELECT ts, min(value) AS min_v, max(value) AS max_v
 FROM signalk
 WHERE path = 'electrical.batteries.66.voltage'
   AND context = 'self'
+  AND ts > dateadd('d', -30, now())
 SAMPLE BY 1d;
 ```
 
@@ -191,6 +197,7 @@ SELECT ts, (last(value) - first(value)) / 1852.0 AS nm_travelled
 FROM signalk
 WHERE path = 'navigation.log'
   AND context = 'self'
+  AND ts > dateadd('d', -30, now())
 SAMPLE BY 1d
 ORDER BY ts DESC;
 ```
@@ -204,6 +211,7 @@ SELECT ts, last(lat) AS lat, last(lon) AS lon
 FROM signalk_position
 WHERE context = 'self'
   AND lat IS NOT NULL
+  AND lon IS NOT NULL
   AND ts > dateadd('d', -7, now())
 SAMPLE BY 10m;
 ```
@@ -218,18 +226,23 @@ SELECT value_str, count()
 FROM signalk_str
 WHERE path = 'navigation.gnss.methodQuality'
   AND context = 'self'
+  AND ts > dateadd('d', -30, now())
 GROUP BY value_str;
 ```
 
 ### How much data is stored?
 
-Samples per day, and disk usage per daily partition:
+Samples per day — unlike the examples above, this one deliberately scans
+**all** retained history, so it can take a few seconds on a large database:
 
 ```sql
 SELECT ts, count() AS samples
 FROM signalk
 SAMPLE BY 1d;
 ```
+
+Disk usage per daily partition — this reads only partition metadata, so it is
+fast regardless of database size:
 
 ```sql
 SELECT name, numRows, diskSizeHuman
