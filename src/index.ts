@@ -4,6 +4,7 @@ import { ILPWriter } from "./ilp-writer";
 import { QueryClient, isReadOnlySQL } from "./query-client";
 import type { QuestDBResult } from "./query-client";
 import { Config, ConfigSchema, normalizeConfig } from "./config/schema";
+import { routeDeltaValue } from "./delta-routing";
 import { createHistoryProviderV2 } from "./history-v2";
 import { createHistoryProviderV1 } from "./history-v1";
 import { startRetention } from "./retention";
@@ -784,17 +785,16 @@ module.exports = (app: App) => {
       // original stamps (baked at write() time), so replay-idempotency holds.
       const ctx = isSelf ? "self" : context;
 
-      if (typeof value === "number") {
-        writer.write(path, ctx, value);
-      } else if (typeof value === "string") {
-        writer.writeString(path, ctx, value);
-      } else if (
-        value &&
-        typeof value === "object" &&
-        "latitude" in value &&
-        "longitude" in value
-      ) {
-        writer.writePosition(path, ctx, value);
+      const route = routeDeltaValue(path, value);
+      if (route === "number") {
+        writer.write(path, ctx, value as number);
+      } else if (route === "string") {
+        writer.writeString(path, ctx, value as string);
+      } else if (route === "position") {
+        writer.writePosition(
+          ctx,
+          value as { latitude: number; longitude: number },
+        );
       }
     });
     unsubscribes.push(unsub);
