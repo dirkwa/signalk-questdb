@@ -1347,6 +1347,17 @@ module.exports = (app: App) => {
               }
               assertNotStopped();
               await ilpWriter.connect();
+              // A stop() that landed during connect() has already nulled
+              // `writer`, so nothing would ever disconnect this fresh
+              // connection — close it ourselves before failing the update.
+              if (updateGeneration !== lifecycleGeneration) {
+                try {
+                  await ilpWriter.disconnect();
+                } catch {
+                  /* ignore */
+                }
+                assertNotStopped();
+              }
             }
             return { ilpHost, ilpPort };
           });
