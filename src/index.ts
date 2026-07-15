@@ -1189,6 +1189,10 @@ module.exports = (app: App) => {
 
       router.post("/api/update/apply", async (_req, res) => {
         try {
+          // Captured at route entry, before ANY await: a stop() that lands
+          // during the release fetch below must already invalidate this
+          // update, not just one that lands after the lock is acquired.
+          const updateGeneration = lifecycleGeneration;
           const containers = (globalThis as any).__signalk_containerManager as
             ContainerManagerApi | undefined;
           if (!containers || !containers.getRuntime()) {
@@ -1222,11 +1226,11 @@ module.exports = (app: App) => {
 
           // Run the mutating update under the lifecycle lock so a concurrent
           // purge/start can't interleave with the pull + recreate + reconnect.
-          // Generation captured at enqueue, re-checked at entry and after the
-          // long awaits: a stop() during the pull or the LAN-host probe must
-          // not let this resume, reassign endpoints, and report success for a
-          // container the teardown already dealt with.
-          const updateGeneration = lifecycleGeneration;
+          // The route-entry generation is re-checked at lock entry and after
+          // the long awaits: a stop() during the release fetch, the pull, or
+          // the LAN-host probe must not let this resume, reassign endpoints,
+          // and report success for a container the teardown already dealt
+          // with.
           const ilp = await withLifecycleLock(async () => {
             const assertNotStopped = () => {
               if (updateGeneration !== lifecycleGeneration)
