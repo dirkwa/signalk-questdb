@@ -143,26 +143,132 @@ export interface DeploymentResolver {
 }
 
 /**
- * The host a containerized Signal K must use to reach a port published on the
- * host. Returns `HOST_GATEWAY` when SK runs in a container, otherwise the host
- * loopback. `doctor.selfDeployment` is feature-detected and non-fatal — any
- * absence/throw degrades to loopback, the historical default.
+ * True when QuestDB answers its `/ping` liveness endpoint at host:port with
+ * the documented empty 204. Requiring that exact status keeps an unrelated
+ * service or proxy error page on a candidate host from winning the probe;
+ * DNS failure, refused connection, timeout, and any other status are all
+ * simply `false`.
+ */
+export async function probeQuestdbPing(
+  host: string,
+  port: number,
+  timeoutMs = 3000,
+): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`http://${host}:${port}/ping`, {
+      signal: controller.signal,
+    });
+    return response.status === 204;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Per-candidate budget for one probe attempt, and the floor it never drops
+// below even when the overall deadline is nearly spent — a too-small window
+// would fail a perfectly reachable host and fall through to the wrong one.
+const PROBE_TIMEOUT_MS = 3000;
+const MIN_PROBE_TIMEOUT_MS = 1000;
+
+export interface LanExposureProbeOptions {
+  probe?: (host: string, port: number, timeoutMs?: number) => Promise<boolean>;
+  // Keep retrying the candidate pair until this deadline before giving up on
+  // probing; QuestDB may still be warming up when the first round runs.
+  deadlineMs?: number;
+  intervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+/**
+ * The host the Signal K process must use to reach a QuestDB port published on
+ * the host (LAN-exposure path).
+ *
+ * Bare-metal SK (or no doctor API to tell): the host loopback, as always.
+ *
+ * Containerized SK is resolved by PROBING, not inference, because the right
+ * answer depends on the container's network mode, which `selfDeployment()`
+ * doesn't expose (issue #67):
+ *   - host-networked SK shares the host's namespace, so the published port is
+ *     on its own loopback — and under Docker the `host.containers.internal`
+ *     alias doesn't even resolve there (nothing injects it into a container
+ *     we didn't create), which left the old inference-based resolution
+ *     unhealthy forever;
+ *   - bridge-networked SK has its own namespace, so loopback is wrong and the
+ *     gateway alias (native on podman, injected by signalk-container on
+ *     Docker) is right.
+ * Loopback is probed first — a false positive would need something else
+ * inside the SK container listening on QuestDB's exact host port. The pair is
+ * retried until `deadlineMs` in case QuestDB is still starting; if nothing
+ * ever answers we fall back to the gateway (the historical containerized
+ * default), leaving the health check to report the real connectivity problem.
  */
 export async function resolveLanExposureHost(
   containers: DeploymentResolver,
+  httpPort: number,
   debug?: (msg: string) => void,
+  options: LanExposureProbeOptions = {},
 ): Promise<string> {
   const selfDeployment = containers.doctor?.selfDeployment;
   if (typeof selfDeployment !== "function") return "127.0.0.1";
+
+  let containerized: boolean;
   try {
-    const dep = await selfDeployment();
-    return dep.isContainerized ? HOST_GATEWAY : "127.0.0.1";
+    containerized = (await selfDeployment()).isContainerized;
   } catch (err) {
     debug?.(
       `doctor.selfDeployment threw, assuming bare-metal (127.0.0.1): ${String(err)}`,
     );
     return "127.0.0.1";
   }
+  if (!containerized) return "127.0.0.1";
+
+  const probe = options.probe ?? probeQuestdbPing;
+  const deadlineMs = options.deadlineMs ?? 30_000;
+  const intervalMs = options.intervalMs ?? 2000;
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const now = options.now ?? Date.now;
+
+  const deadline = now() + deadlineMs;
+  // Each candidate's probe budget is clamped to the remaining deadline (with
+  // a floor — see MIN_PROBE_TIMEOUT_MS), so a round that starts late can
+  // overshoot the deadline by at most ~2x the floor rather than by two full
+  // probe timeouts.
+  const tryRound = async (): Promise<string | null> => {
+    for (const host of ["127.0.0.1", HOST_GATEWAY]) {
+      const budget = Math.max(
+        Math.min(PROBE_TIMEOUT_MS, deadline - now()),
+        MIN_PROBE_TIMEOUT_MS,
+      );
+      if (await probe(host, httpPort, budget)) {
+        debug?.(`LAN-exposure host resolved by probe: ${host}:${httpPort}`);
+        return host;
+      }
+    }
+    return null;
+  };
+
+  // The first round runs unconditionally — probing is the whole point, even
+  // with a zero deadline. Retry rounds never start after the deadline, and
+  // the between-round sleep is clamped to the remaining budget.
+  let winner = await tryRound();
+  while (!winner && now() < deadline) {
+    await sleep(Math.min(intervalMs, deadline - now()));
+    if (now() >= deadline) break;
+    winner = await tryRound();
+  }
+  if (winner) return winner;
+
+  debug?.(
+    `no LAN-exposure candidate answered /ping on port ${httpPort} within ` +
+      `${deadlineMs}ms; falling back to ${HOST_GATEWAY}`,
+  );
+  return HOST_GATEWAY;
 }
 
 /**
