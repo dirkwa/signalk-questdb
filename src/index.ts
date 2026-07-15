@@ -1237,6 +1237,12 @@ module.exports = (app: App) => {
                 throw new Error("plugin stopped while the update was running");
             };
             assertNotStopped();
+            // A generation match only proves no stop() happened since route
+            // entry — it can't tell that the plugin was already stopped when
+            // the request arrived. queryClient is the running sentinel (set
+            // by a completed start, nulled by stop/purge/aborted starts), so
+            // gate on it before pulling or recreating anything.
+            if (!queryClient) throw new Error("plugin is not running");
             app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
             await containers.pullImage(`questdb/questdb:${newTag}`);
             assertNotStopped();
