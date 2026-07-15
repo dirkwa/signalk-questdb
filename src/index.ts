@@ -269,6 +269,13 @@ module.exports = (app: App) => {
   // the chain — or one parked in a long await — would run to completion after
   // teardown and resurrect the resources that were just torn down.
   let lifecycleGeneration = 0;
+  // True only between a FULLY completed start (providers, stream
+  // subscription, and timers all registered) and the next stop/purge.
+  // queryClient/writer are not usable as a running sentinel: they are
+  // created partway through startup, so a start that fails after that point
+  // (health-wait exhausted, ensureTables/connect threw) leaves them non-null
+  // on a plugin that never came up.
+  let pluginRunning = false;
   const withLifecycleLock = <T>(fn: () => Promise<T>): Promise<T> => {
     const run = lifecycleChain.then(fn, fn);
     // Keep the chain alive regardless of this op's outcome.
@@ -553,6 +560,9 @@ module.exports = (app: App) => {
   }
 
   async function runStartInner(config: Config, signal: AbortSignal) {
+    // Not running until THIS start completes — a restart that reuses the
+    // slot must not leave a stale true from the previous run.
+    pluginRunning = false;
     // Older saved configs miss keys added since (pathFilter, samplingRates);
     // the per-delta pipeline dereferences them per delta, so normalize once
     // at the boundary.
@@ -840,6 +850,10 @@ module.exports = (app: App) => {
     }, SCHEMA_HEAL_INTERVAL_MS);
 
     app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
+    // Everything is registered — only now does the plugin count as running.
+    // Any earlier return/throw leaves the flag false, so a half-started
+    // plugin rejects lifecycle-dependent requests like /api/update/apply.
+    pluginRunning = true;
   }
 
   // Public entry: serialize startup behind the lifecycle lock so a purge or
@@ -884,6 +898,7 @@ module.exports = (app: App) => {
       // resurrecting a writer/client after this teardown ran.
       lifecycleGeneration++;
       startAbort?.abort();
+      pluginRunning = false;
 
       for (const unsub of unsubscribes) {
         try {
@@ -1238,11 +1253,10 @@ module.exports = (app: App) => {
             };
             assertNotStopped();
             // A generation match only proves no stop() happened since route
-            // entry — it can't tell that the plugin was already stopped when
-            // the request arrived. queryClient is the running sentinel (set
-            // by a completed start, nulled by stop/purge/aborted starts), so
-            // gate on it before pulling or recreating anything.
-            if (!queryClient) throw new Error("plugin is not running");
+            // entry — it can't tell that the plugin was already stopped (or
+            // never fully started) when the request arrived. Gate on the
+            // completed-start sentinel before pulling or recreating anything.
+            if (!pluginRunning) throw new Error("plugin is not running");
             app.setPluginStatus(`Pulling QuestDB ${newTag}...`);
             await containers.pullImage(`questdb/questdb:${newTag}`);
             assertNotStopped();
@@ -1508,6 +1522,7 @@ module.exports = (app: App) => {
           const teardown = async () => {
             if (teardownStarted) return;
             teardownStarted = true;
+            pluginRunning = false;
             // Stop all activity against the container before it and its data go
             // away — otherwise the retention timer keeps issuing DROP PARTITION
             // against a removed container and the writer keeps trying to connect.
