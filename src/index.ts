@@ -10,6 +10,14 @@ import { createHistoryProviderV1 } from "./history-v1";
 import { startRetention } from "./retention";
 import { buildFullExportWhere } from "./full-export-range";
 import {
+  WalMonitor,
+  buildPendingSegmentsSQL,
+  computeSkipPlan,
+  extractApplyError,
+  type PendingSegment,
+  type SuspendedTable,
+} from "./wal-monitor";
+import {
   QUESTDB_INTERNAL_HTTP_PORT,
   QUESTDB_INTERNAL_ILP_PORT,
   QUESTDB_INTERNAL_PG_PORT,
@@ -25,6 +33,7 @@ interface App {
   error: (...args: unknown[]) => void;
   setPluginStatus: (msg: string) => void;
   setPluginError: (msg: string) => void;
+  handleMessage: (pluginId: string, delta: unknown) => void;
   selfContext: string;
   selfId: string;
   streambundle: {
@@ -172,6 +181,18 @@ interface ContainerManagerApi {
   resolveHostPath?: (
     absPath: string,
   ) => Promise<{ source: string; subPath: string } | null>;
+  /**
+   * One-shot container log fetch (combined stdout+stderr). Used to capture
+   * the WAL apply job's real failure reason: wal_tables() reports no
+   * errorTag for a raw Java error, and the engine-side detail is in-memory
+   * only — the log is the single place the cause survives long enough to
+   * diagnose. Optional so the plugin degrades gracefully on an older
+   * signalk-container (diagnosis then omits the engine error).
+   */
+  getLogs?: (
+    name: string,
+    options?: { tail?: number; since?: number },
+  ) => Promise<string[]>;
 }
 
 // The managed QuestDB container's name. signalk-container prefixes it with
@@ -224,6 +245,12 @@ const QUESTDB_ULIMITS = { nofile: 1048576 };
 // faster than a human would notice "recording broke" yet negligible load.
 const SCHEMA_HEAL_INTERVAL_MS = 60_000;
 
+// How long the guided-skip endpoint waits after a RESUME WAL before
+// re-reading wal_tables(). An apply attempt against unreadable segment data
+// fails within milliseconds (observed ~3ms in the field), so a few seconds
+// cleanly separates "re-suspended at the same txn" from "healthily replaying".
+const SKIP_RECHECK_DELAY_MS = 3_000;
+
 function buildResourceLimits(config: Config): ContainerResourceLimits {
   return {
     memory: config.questdbMemoryLimit?.trim() || null,
@@ -254,6 +281,10 @@ module.exports = (app: App) => {
   // Probed once via the richer status query and cached so an old build does
   // not throw-and-fall-back on every /api/status call. Null = not yet probed.
   let walTablesHasErrorColumns: boolean | null = null;
+  // Watches for WAL suspensions, auto-applies the lossless remedy once per
+  // stall point, and raises/clears the Signal K notification. Lives from a
+  // completed start to the next stop/purge.
+  let walMonitor: WalMonitor | null = null;
   // Serializes the lifecycle operations that create or destroy QuestDB
   // resources — asyncStart, /api/update/apply, and /api/purge-data — so they
   // can never interleave. Without this, a purge (or update) issued while a
@@ -534,6 +565,141 @@ module.exports = (app: App) => {
     }
 
     return false;
+  }
+
+  const WAL_NOTIFICATION_PATH = "notifications.signalk-questdb.walSuspended";
+  // Dedupe key of the last emitted notification. The monitor reports every
+  // check cycle; the delta only goes out when the key changes, so clients
+  // aren't spammed with a fresh alert every minute. The key must be built
+  // from STABLE facts (state, table@stall-point, outcome) — the message
+  // itself contains txnLag, which grows every cycle while ingestion
+  // continues and would defeat the dedupe.
+  let lastWalNotification: string | null = null;
+
+  function emitWalNotification(
+    state: "alert" | "normal",
+    message: string,
+    key: string,
+  ): void {
+    if (key === lastWalNotification) return;
+    lastWalNotification = key;
+    app.handleMessage("signalk-questdb", {
+      updates: [
+        {
+          values: [
+            {
+              path: WAL_NOTIFICATION_PATH,
+              value: {
+                state,
+                method: ["visual"],
+                message,
+                timestamp: new Date().toISOString(),
+              },
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  // A latched alert must not outlive the monitoring that backs it: after
+  // stop/purge nobody would ever clear it, and a permanent stale alarm
+  // teaches operators to ignore the path. Downgrade honestly (monitoring
+  // stopped ≠ recovered) and reset the dedupe so the next start re-alerts
+  // if the suspension is still there.
+  function clearWalAlertOnTeardown(): void {
+    if (lastWalNotification?.startsWith("alert:")) {
+      emitWalNotification(
+        "normal",
+        "QuestDB WAL monitoring stopped (plugin stopped or data removed); " +
+          "suspension state is no longer tracked.",
+        "normal:teardown",
+      );
+    }
+    lastWalNotification = null;
+  }
+
+  // wal_tables() probe shared by /api/status, the WAL monitor, and the
+  // resume endpoints. errorTag/errorMessage carry QuestDB's reason for a
+  // suspension when it has one; the columns are absent on an older pinned
+  // QuestDB, so probe for them once (the richer query throws if missing),
+  // cache the result in `walTablesHasErrorColumns`, and thereafter run the
+  // query the build actually supports. Detection never regresses; only the
+  // diagnostic columns are dropped on old builds. Throws on query failure —
+  // callers decide whether that means "treat as not suspended" (status) or
+  // "skip this cycle" (monitor).
+  const RICH_WAL_QUERY =
+    "SELECT name, writerTxn, sequencerTxn, errorTag, errorMessage FROM wal_tables() WHERE suspended = true";
+  const BASIC_WAL_QUERY =
+    "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true";
+
+  async function listSuspendedTables(
+    client: QueryClient,
+  ): Promise<SuspendedTable[]> {
+    let walResult: QuestDBResult;
+    if (walTablesHasErrorColumns === null) {
+      try {
+        walResult = await client.exec(RICH_WAL_QUERY);
+        walTablesHasErrorColumns = true;
+      } catch {
+        walResult = await client.exec(BASIC_WAL_QUERY);
+        walTablesHasErrorColumns = false;
+      }
+    } else {
+      walResult = await client.exec(
+        walTablesHasErrorColumns ? RICH_WAL_QUERY : BASIC_WAL_QUERY,
+      );
+    }
+    return client.toObjects(walResult).map((row) => {
+      const writerTxn = Number(row.writerTxn ?? 0);
+      const sequencerTxn = Number(row.sequencerTxn ?? 0);
+      return {
+        name: String(row.name),
+        writerTxn,
+        sequencerTxn,
+        txnLag: Math.max(0, sequencerTxn - writerTxn),
+        errorTag: String(row.errorTag ?? ""),
+        errorMessage: String(row.errorMessage ?? ""),
+      };
+    });
+  }
+
+  async function pendingSegments(
+    client: QueryClient,
+    table: SuspendedTable,
+  ): Promise<PendingSegment[]> {
+    const result = await client.exec(
+      buildPendingSegmentsSQL(table.name, table.writerTxn),
+      15_000,
+    );
+    return client.toObjects(result).map((row) => ({
+      walId: Number(row.walId ?? 0),
+      segmentId: Number(row.segmentId ?? 0),
+      txns: Number(row.txns ?? 0),
+      minTxn: Number(row.minTxn ?? 0),
+      maxTxn: Number(row.maxTxn ?? 0),
+      minTimestamp: String(row.minTimestamp ?? ""),
+      maxTimestamp: String(row.maxTimestamp ?? ""),
+    }));
+  }
+
+  // Engine log lines for the apply-failure scrape; extractApplyError then
+  // runs per suspended table over the one fetch. Best effort: external mode,
+  // an older signalk-container without getLogs, or a fetch failure all
+  // degrade to null (the diagnosis then shows only what wal_tables()
+  // reports).
+  async function fetchEngineLogLines(): Promise<string[] | null> {
+    if (currentConfig?.managedContainer === false) return null;
+    const containers = (globalThis as any).__signalk_containerManager as
+      ContainerManagerApi | undefined;
+    if (!containers?.getLogs) return null;
+    try {
+      return await containers.getLogs(QUESTDB_CONTAINER_NAME, {
+        tail: 3000,
+      });
+    } catch {
+      return null;
+    }
   }
 
   // Runs the actual startup. Always invoked through the lifecycle lock (see
@@ -849,6 +1015,62 @@ module.exports = (app: App) => {
       void healSchemaTables();
     }, SCHEMA_HEAL_INTERVAL_MS);
 
+    // Watch for WAL suspensions. Detection alone is not enough — a suspended
+    // table keeps accepting ILP writes while committing nothing, and the only
+    // built-in recovery QuestDB itself attempts is at engine start. The
+    // monitor closes that gap: loud persistent logging, a Signal K alert
+    // (recording silently stalling for weeks is exactly what notifications
+    // exist for), and one automatic lossless resume per stall point.
+    const client = queryClient;
+    walMonitor = new WalMonitor({
+      // Owned tables only: in external mode the plugin shares a QuestDB with
+      // whatever else the operator runs there, and auto-resuming (or
+      // alerting on) someone else's suspended table is not this plugin's
+      // call to make.
+      listSuspended: async () =>
+        (await listSuspendedTables(client)).filter((t) =>
+          FULL_EXPORT_TABLE_SET.has(t.name),
+        ),
+      resumeTable: (name) =>
+        client
+          .exec(`ALTER TABLE "${name.replace(/"/g, '""')}" RESUME WAL`, 10_000)
+          .then(() => undefined),
+      onSuspended: (tables, anyAutoResumeFailed) => {
+        const summary = tables
+          .map((t) => `${t.name} (${t.txnLag} txns behind)`)
+          .join(", ");
+        app.setPluginError(`QuestDB WAL suspended: ${summary}`);
+        const key =
+          "alert:" +
+          tables
+            .map((t) => `${t.name}@${t.writerTxn}`)
+            .sort()
+            .join(",") +
+          `:${anyAutoResumeFailed}`;
+        emitWalNotification(
+          "alert",
+          anyAutoResumeFailed
+            ? `QuestDB history recording is stalled: ${summary}. Automatic ` +
+                `resume failed — the data at the stall point is likely ` +
+                `unreadable. Open the QuestDB History plugin panel to repair.`
+            : `QuestDB history recording is stalled: ${summary}. Automatic ` +
+                `recovery is being attempted.`,
+          key,
+        );
+      },
+      onResolved: () => {
+        emitWalNotification(
+          "normal",
+          "QuestDB history recording has recovered.",
+          "normal:recovered",
+        );
+        app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
+      },
+      debug: (msg) => app.debug(msg),
+      error: (msg) => app.error(msg),
+    });
+    walMonitor.start();
+
     app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
     // Everything is registered — only now does the plugin count as running.
     // Any earlier return/throw leaves the flag false, so a half-started
@@ -918,6 +1140,11 @@ module.exports = (app: App) => {
         clearInterval(schemaHealTimer);
         schemaHealTimer = null;
       }
+      if (walMonitor) {
+        walMonitor.stop();
+        walMonitor = null;
+      }
+      clearWalAlertOnTeardown();
       schemaMismatch = false;
 
       // Clear the clamp warning so it doesn't survive into the next start
@@ -989,58 +1216,20 @@ module.exports = (app: App) => {
           // still reads "running". Surface it explicitly so the panel can warn
           // instead of looking healthy. `txnLag` = sequencer ahead of writer =
           // the backlog that will never drain until the WAL is resumed.
-          let suspendedTables: {
-            name: string;
-            writerTxn: number;
-            sequencerTxn: number;
-            txnLag: number;
-            errorTag: string;
-            errorMessage: string;
-          }[] = [];
-          // errorTag/errorMessage carry QuestDB's reason for the suspension
-          // (e.g. an out-of-memory or disk error during WAL apply). They are
-          // empty on a healthy table; surfacing them lets the panel — and a
-          // bug report — show WHY ingestion stalled instead of just THAT it
-          // did, without needing to catch the live wal_tables() state by hand
-          // before the data is reset.
-          //
-          // The columns are absent on an older pinned QuestDB. Probe for them
-          // ONCE (the richer query throws if they're missing), cache the
-          // result in `walTablesHasErrorColumns`, and thereafter run the query
-          // the build actually supports — so an old build does not throw and
-          // fall back on every /api/status call. Detection never regresses;
-          // only the diagnostic columns are dropped on old builds.
-          const RICH_WAL_QUERY =
-            "SELECT name, writerTxn, sequencerTxn, errorTag, errorMessage FROM wal_tables() WHERE suspended = true";
-          const BASIC_WAL_QUERY =
-            "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true";
+          // `autoResume` is the monitor's verdict for the current stall point:
+          // "pending" while the automatic lossless resume may still succeed,
+          // "failed" once replay re-hit the same failure — the panel then
+          // offers the guided skip instead of just the resume button.
+          let suspendedTables: (SuspendedTable & {
+            autoResume: string | null;
+          })[] = [];
           try {
-            let walResult: QuestDBResult;
-            if (walTablesHasErrorColumns === null) {
-              try {
-                walResult = await queryClient.exec(RICH_WAL_QUERY);
-                walTablesHasErrorColumns = true;
-              } catch {
-                walResult = await queryClient.exec(BASIC_WAL_QUERY);
-                walTablesHasErrorColumns = false;
-              }
-            } else {
-              walResult = await queryClient.exec(
-                walTablesHasErrorColumns ? RICH_WAL_QUERY : BASIC_WAL_QUERY,
-              );
-            }
-            suspendedTables = queryClient.toObjects(walResult).map((row) => {
-              const writerTxn = Number(row.writerTxn ?? 0);
-              const sequencerTxn = Number(row.sequencerTxn ?? 0);
-              return {
-                name: String(row.name),
-                writerTxn,
-                sequencerTxn,
-                txnLag: Math.max(0, sequencerTxn - writerTxn),
-                errorTag: String(row.errorTag ?? ""),
-                errorMessage: String(row.errorMessage ?? ""),
-              };
-            });
+            suspendedTables = (await listSuspendedTables(queryClient)).map(
+              (t) => ({
+                ...t,
+                autoResume: walMonitor?.outcomeFor(t.name) ?? null,
+              }),
+            );
           } catch {
             // wal_tables() itself is unavailable on non-WAL/older QuestDB, or
             // the tables don't exist yet during startup — treat as "not
@@ -1427,13 +1616,9 @@ module.exports = (app: App) => {
               .json({ error: "QuestDB connection not initialized" });
             return;
           }
-          const walResult = await client.exec(
-            "SELECT name, writerTxn, sequencerTxn FROM wal_tables() WHERE suspended = true",
-            10_000,
+          const suspended = (await listSuspendedTables(client)).filter((row) =>
+            FULL_EXPORT_TABLE_SET.has(row.name),
           );
-          const suspended = client
-            .toObjects(walResult)
-            .filter((row) => FULL_EXPORT_TABLE_SET.has(String(row.name)));
 
           const results: {
             table: string;
@@ -1443,11 +1628,11 @@ module.exports = (app: App) => {
             sequencerTxn: number;
           }[] = [];
           for (const row of suspended) {
-            const table = String(row.name);
+            const table = row.name;
             const base = {
               table,
-              writerTxn: Number(row.writerTxn ?? 0),
-              sequencerTxn: Number(row.sequencerTxn ?? 0),
+              writerTxn: row.writerTxn,
+              sequencerTxn: row.sequencerTxn,
             };
             try {
               // Plain RESUME WAL replays from the next unapplied txn — it
@@ -1477,6 +1662,173 @@ module.exports = (app: App) => {
               results.length === 0
                 ? "No suspended tables found"
                 : `Resumed ${results.filter((r) => r.ok).length} of ${results.length} suspended table(s)`,
+          });
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
+      // Per-suspended-table repair diagnosis: the pending-segment map, the
+      // minimal bounded skip that would get past the stuck segment (with the
+      // exact loss it implies), and the apply job's real failure reason
+      // scraped from the engine log. The panel calls this when a suspension's
+      // automatic resume has failed, to present the skip decision with its
+      // cost quantified instead of a blind "RESUME WAL FROM TXN" incantation.
+      router.get("/api/wal-diagnosis", async (_req, res) => {
+        try {
+          const client = queryClient;
+          if (!client) {
+            res
+              .status(503)
+              .json({ error: "QuestDB connection not initialized" });
+            return;
+          }
+          const suspended = (await listSuspendedTables(client)).filter((row) =>
+            FULL_EXPORT_TABLE_SET.has(row.name),
+          );
+          const logLines =
+            suspended.length > 0 ? await fetchEngineLogLines() : null;
+          const tables = [];
+          for (const table of suspended) {
+            let segments: PendingSegment[] = [];
+            let segmentError: string | null = null;
+            try {
+              segments = await pendingSegments(client, table);
+            } catch (err) {
+              // wal_transactions() may be unavailable on an older QuestDB —
+              // report the rest of the diagnosis without a skip plan.
+              segmentError = err instanceof Error ? err.message : String(err);
+            }
+            tables.push({
+              ...table,
+              autoResume: walMonitor?.outcomeFor(table.name) ?? null,
+              // Commit-time of the first unapplied txn = when apply froze.
+              suspendedSince:
+                segments.length > 0 ? segments[0].minTimestamp : null,
+              pendingSegments: segments.length,
+              skipPlan: computeSkipPlan(segments),
+              segmentError,
+              applyError: logLines
+                ? extractApplyError(logLines, table.name)
+                : null,
+            });
+          }
+          res.json({ tables });
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
+      // Bounded lossy skip past an unreadable WAL segment. This is the ONLY
+      // write path that can lose data, so it is deliberately narrow:
+      //   - the table must be one of ours and currently suspended;
+      //   - a lossless resume is attempted first and re-checked — if it
+      //     sticks, nothing is skipped;
+      //   - the skip target is computed server-side from the live segment
+      //     map (never taken from the client), so it can only ever be the
+      //     minimal next-segment boundary.
+      // The client sends the plan it displayed only so a stale UI can be
+      // rejected instead of skipping more than the operator agreed to.
+      router.post("/api/resume-wal/skip", async (req, res) => {
+        try {
+          const client = queryClient;
+          if (!client) {
+            res
+              .status(503)
+              .json({ error: "QuestDB connection not initialized" });
+            return;
+          }
+          const table = String(req.body?.table ?? "");
+          if (!FULL_EXPORT_TABLE_SET.has(table)) {
+            res.status(400).json({ error: `Unknown table: ${table}` });
+            return;
+          }
+          const quoted = `"${table.replace(/"/g, '""')}"`;
+          const recheck = async () =>
+            (await listSuspendedTables(client)).find((t) => t.name === table);
+
+          const before = await recheck();
+          if (!before) {
+            res.json({
+              skipped: false,
+              healed: true,
+              message: `${table} is not suspended — nothing to skip.`,
+            });
+            return;
+          }
+
+          // Safety ladder step 1: the lossless path. If the suspension cause
+          // was transient after all, this recovers everything and the lossy
+          // step below never runs.
+          await client.exec(`ALTER TABLE ${quoted} RESUME WAL`, 10_000);
+          await new Promise((resolve) =>
+            setTimeout(resolve, SKIP_RECHECK_DELAY_MS),
+          );
+          const afterResume = await recheck();
+          if (!afterResume) {
+            res.json({
+              skipped: false,
+              healed: true,
+              message: `Lossless resume succeeded on ${table} — no data was skipped. The backlog is now replaying.`,
+            });
+            return;
+          }
+          if (afterResume.writerTxn !== before.writerTxn) {
+            res.json({
+              skipped: false,
+              healed: false,
+              progressed: true,
+              message: `The writer advanced on ${table} before re-suspending — the situation changed. Re-run the diagnosis.`,
+            });
+            return;
+          }
+
+          // Step 2: replay re-froze at the same transaction. Compute the
+          // minimal skip fresh and compare against what the operator saw.
+          const plan = computeSkipPlan(
+            await pendingSegments(client, afterResume),
+          );
+          if (!plan) {
+            res.status(500).json({
+              error: `Cannot compute a skip plan for ${table} — no pending transactions found.`,
+            });
+            return;
+          }
+          const confirmed = Number(req.body?.confirmSkipToTxn);
+          if (confirmed !== plan.skipToTxn) {
+            res.status(409).json({
+              error:
+                "The skip target changed since the diagnosis was displayed. Re-run the diagnosis and confirm again.",
+              skipPlan: plan,
+            });
+            return;
+          }
+
+          app.error(
+            `Skipping ${plan.skippedTxns} unreadable WAL txn(s) on ${table} ` +
+              `(walId=${plan.walId} segmentId=${plan.segmentId}, ` +
+              `${plan.skipWindowStart} → ${plan.skipWindowEnd}) — ` +
+              `RESUME WAL FROM TXN ${plan.skipToTxn}, requested via panel`,
+          );
+          await client.exec(
+            `ALTER TABLE ${quoted} RESUME WAL FROM TXN ${plan.skipToTxn}`,
+            10_000,
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, SKIP_RECHECK_DELAY_MS),
+          );
+          const afterSkip = await recheck();
+          res.json({
+            skipped: true,
+            skipPlan: plan,
+            stillSuspended: Boolean(afterSkip),
+            message: afterSkip
+              ? `Skipped ${plan.skippedTxns} txn(s) on ${table}, but the table re-suspended at txn ${afterSkip.writerTxn + 1} — another segment appears unreadable. Re-run the diagnosis to skip it too.`
+              : `Skipped ${plan.skippedTxns} txn(s) on ${table} (${plan.skipWindowStart} → ${plan.skipWindowEnd}). The remaining backlog is replaying.`,
           });
         } catch (err) {
           res.status(500).json({
@@ -1530,6 +1882,11 @@ module.exports = (app: App) => {
               clearInterval(schemaHealTimer);
               schemaHealTimer = null;
             }
+            if (walMonitor) {
+              walMonitor.stop();
+              walMonitor = null;
+            }
+            clearWalAlertOnTeardown();
             if (retentionTimer) {
               clearInterval(retentionTimer);
               retentionTimer = null;

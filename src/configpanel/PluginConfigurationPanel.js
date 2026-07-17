@@ -316,6 +316,8 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [purging, setPurging] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeOutcome, setResumeOutcome] = useState("");
+  const [walDiag, setWalDiag] = useState(null);
+  const [skipping, setSkipping] = useState(false);
 
   const fetchVersions = useCallback(async () => {
     setVersionsLoading(true);
@@ -344,6 +346,78 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     }
     setStatusLoading(false);
   }, []);
+
+  const fetchWalDiagnosis = useCallback(async () => {
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/wal-diagnosis");
+      if (res.ok) {
+        setWalDiag(await res.json());
+      }
+    } catch {
+      // diagnosis is best-effort; the banner still renders from status
+    }
+  }, []);
+
+  const suspendedNow = Boolean(
+    dbStatus &&
+    dbStatus.status === "running" &&
+    (dbStatus.suspendedTables || []).length > 0,
+  );
+
+  useEffect(() => {
+    if (!suspendedNow) {
+      setWalDiag(null);
+      return undefined;
+    }
+    // Keep polling while suspended: a table can join the suspension, the
+    // monitor's auto-resume verdict can arrive, or the skip plan can change
+    // — and the first fetch may simply have failed. On a failed refresh the
+    // last good diagnosis is kept (the skip endpoint re-validates the plan
+    // server-side, so acting on a stale one is rejected, not dangerous).
+    fetchWalDiagnosis();
+    const interval = setInterval(fetchWalDiagnosis, 15000);
+    return () => clearInterval(interval);
+  }, [suspendedNow, fetchWalDiagnosis]);
+
+  const handleSkipWal = async (tableName, plan) => {
+    const backlogWarning = plan.tailSkip
+      ? "\n\nWARNING: this is the newest pending segment — skipping it drops the ENTIRE pending backlog."
+      : "";
+    if (
+      !window.confirm(
+        `Skip the unreadable WAL segment on ${tableName}?\n\n` +
+          `This permanently loses ${formatNumber(plan.skippedTxns)} transaction(s) ` +
+          `recorded between ${plan.skipWindowStart} and ${plan.skipWindowEnd}. ` +
+          `Everything after the skipped segment is replayed without loss.` +
+          backlogWarning,
+      )
+    ) {
+      return;
+    }
+    setSkipping(true);
+    setResumeOutcome("");
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/resume-wal/skip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          table: tableName,
+          confirmSkipToTxn: plan.skipToTxn,
+        }),
+      });
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (res.ok) {
+        setResumeOutcome(data.message);
+      } else {
+        setResumeOutcome(`Skip failed: ${data.error}`);
+      }
+      fetchStatus();
+      fetchWalDiagnosis();
+    } catch (e) {
+      setResumeOutcome(`Skip failed: ${e.message}`);
+    }
+    setSkipping(false);
+  };
 
   const checkForUpdate = async () => {
     setCheckingUpdate(true);
@@ -433,6 +507,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                 failed.map((r) => `${r.table}: ${r.error}`).join(" · "),
         );
         fetchStatus();
+        fetchWalDiagnosis();
       } else {
         setResumeOutcome(`Resume failed: ${data.error}`);
       }
@@ -584,33 +659,105 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                     const reason = String(
                       t.errorMessage || t.errorTag || "reason not reported",
                     ).replace(/[\r\n]+/g, " ");
-                    return `${t.name}: ${formatNumber(t.txnLag)} txns behind — ${reason}`;
+                    const diag = (walDiag?.tables || []).find(
+                      (d) => d.name === t.name,
+                    );
+                    const since = diag?.suspendedSince
+                      ? ` — frozen since ${diag.suspendedSince}`
+                      : "";
+                    return `${t.name}: ${formatNumber(t.txnLag)} txns behind — ${reason}${since}`;
                   })
                   .join("\n")}
               </code>
+              {(walDiag?.tables || [])
+                .filter((d) => d.applyError)
+                .map((d) => (
+                  <div key={d.name} style={{ marginTop: 8, fontSize: 12 }}>
+                    QuestDB&apos;s own log reports the apply failure on{" "}
+                    <code>{d.name}</code> as:
+                    <code style={S.warnBannerCode}>{d.applyError}</code>
+                  </div>
+                ))}
               <div style={{ marginTop: 10 }}>
                 <button
                   style={{
                     ...S.btn,
                     ...S.btnPrimary,
-                    ...(resuming ? S.btnDisabled : {}),
+                    ...(resuming || skipping ? S.btnDisabled : {}),
                   }}
-                  disabled={resuming}
+                  disabled={resuming || skipping}
                   onClick={handleResumeWal}
                 >
                   {resuming ? "Resuming..." : "Resume recording"}
                 </button>
               </div>
+              {suspendedTables
+                .filter((t) => t.autoResume === "failed")
+                .map((t) => {
+                  const diag = (walDiag?.tables || []).find(
+                    (d) => d.name === t.name,
+                  );
+                  const plan = diag?.skipPlan;
+                  if (!plan) return null;
+                  return (
+                    <div key={t.name} style={{ marginTop: 12 }}>
+                      <div style={S.warnBannerTitle}>
+                        {t.name}: automatic resume failed — WAL segment
+                        unreadable
+                      </div>
+                      A lossless resume was attempted and the table re-suspended
+                      at the same transaction: the write-ahead-log segment at
+                      the stall point cannot be read back (typically corrupted
+                      by an unclean shutdown mid-write). Replaying can never get
+                      past it. The only repair is to skip the unreadable
+                      segment, losing{" "}
+                      <b>{formatNumber(plan.skippedTxns)} transaction(s)</b>{" "}
+                      recorded between <b>{plan.skipWindowStart}</b> and{" "}
+                      <b>{plan.skipWindowEnd}</b>
+                      {plan.tailSkip
+                        ? " — and this is the newest pending segment, so skipping it drops the ENTIRE pending backlog"
+                        : ` — everything after the skipped segment (${formatNumber(
+                            Math.max(0, t.txnLag - plan.skippedTxns),
+                          )} txns) is replayed without loss`}
+                      .
+                      <div style={{ marginTop: 8 }}>
+                        <button
+                          style={{
+                            ...S.btn,
+                            ...S.btnDanger,
+                            ...(skipping || resuming ? S.btnDisabled : {}),
+                          }}
+                          disabled={skipping || resuming}
+                          onClick={() => handleSkipWal(t.name, plan)}
+                        >
+                          {skipping
+                            ? "Skipping..."
+                            : "Skip unreadable segment (loses data)"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               <div style={{ marginTop: 8, fontSize: 12 }}>
                 Manual fallback in the QuestDB SQL console (<code>:9000</code>
                 ), one statement at a time — avoid running it from several tabs,
                 the console retries a busy statement forever:
                 <code style={S.warnBannerCode}>
                   {suspendedTables
-                    .map(
-                      (t) =>
-                        `ALTER TABLE "${String(t.name).replace(/"/g, '""')}" RESUME WAL;`,
-                    )
+                    .map((t) => {
+                      const quoted = `"${String(t.name).replace(/"/g, '""')}"`;
+                      const diag = (walDiag?.tables || []).find(
+                        (d) => d.name === t.name,
+                      );
+                      const lines = [`ALTER TABLE ${quoted} RESUME WAL;`];
+                      if (t.autoResume === "failed" && diag?.skipPlan) {
+                        lines.push(
+                          `-- if the resume re-suspends: skip the unreadable segment (loses ${formatNumber(diag.skipPlan.skippedTxns)} txns)`,
+                          `ALTER TABLE ${quoted} RESUME WAL FROM TXN ${diag.skipPlan.skipToTxn};`,
+                        );
+                      }
+                      return lines.join("\n");
+                    })
                     .join("\n")}
                 </code>
               </div>
