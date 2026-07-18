@@ -307,6 +307,12 @@ module.exports = (app: App) => {
   // the chain — or one parked in a long await — would run to completion after
   // teardown and resurrect the resources that were just torn down.
   let lifecycleGeneration = 0;
+  // Bumped by /api/update/apply when it recreates the QuestDB container.
+  // stop/purge bump lifecycleGeneration, but an update deliberately does
+  // not (its own generation check detects stop preemption) — so a request
+  // that must not span a container swap (the WAL skip's final guard) needs
+  // this separate epoch to notice one.
+  let containerEpoch = 0;
   // True only between a FULLY completed start (providers, stream
   // subscription, and timers all registered) and the next stop/purge.
   // queryClient/writer are not usable as a running sentinel: they are
@@ -1533,6 +1539,7 @@ module.exports = (app: App) => {
             // generation one more time.
             assertNotStopped();
             ulimitClamp = null;
+            containerEpoch++;
             await containers.ensureRunning(
               QUESTDB_CONTAINER_NAME,
               updateConfig,
@@ -1773,10 +1780,12 @@ module.exports = (app: App) => {
             return;
           }
           const quoted = `"${table.replace(/"/g, '""')}"`;
-          // Captured at entry: a stop/update/purge bumps this, and the
-          // destructive statement below must never run against whatever
-          // lifecycle replaced the state this request was validated on.
+          // Captured at entry: stop/purge bump the generation, an update
+          // recreate bumps the container epoch — the destructive statement
+          // below must never run against whatever lifecycle replaced the
+          // state this request was validated on.
           const generation = lifecycleGeneration;
+          const epoch = containerEpoch;
           const recheck = async () =>
             (await listSuspendedTables(client)).find((t) => t.name === table);
 
@@ -1826,6 +1835,7 @@ module.exports = (app: App) => {
           const preExec = await recheck();
           if (
             generation !== lifecycleGeneration ||
+            epoch !== containerEpoch ||
             !preExec ||
             preExec.writerTxn !== before.writerTxn
           ) {
@@ -1859,6 +1869,7 @@ module.exports = (app: App) => {
           const finalState = await recheck();
           if (
             generation !== lifecycleGeneration ||
+            epoch !== containerEpoch ||
             !finalState ||
             finalState.writerTxn !== before.writerTxn
           ) {
