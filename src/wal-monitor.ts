@@ -90,6 +90,25 @@ export function buildPendingSegmentsSQL(
   );
 }
 
+// True when the operator-confirmed plan (untrusted request payload) matches
+// the freshly computed one in EVERY field. The skip is destructive, so a
+// confirmation must prove the operator saw exactly what is about to be
+// skipped — not just the same target txn, which can coincide across plans
+// with different loss windows.
+export function skipPlansEqual(plan: SkipPlan, confirmed: unknown): boolean {
+  if (typeof confirmed !== "object" || confirmed === null) return false;
+  const c = confirmed as Record<string, unknown>;
+  return (
+    Number(c.skipToTxn) === plan.skipToTxn &&
+    Number(c.skippedTxns) === plan.skippedTxns &&
+    Number(c.walId) === plan.walId &&
+    Number(c.segmentId) === plan.segmentId &&
+    String(c.skipWindowStart) === plan.skipWindowStart &&
+    String(c.skipWindowEnd) === plan.skipWindowEnd &&
+    c.tailSkip === plan.tailSkip
+  );
+}
+
 export function computeSkipPlan(segments: PendingSegment[]): SkipPlan | null {
   if (segments.length === 0) return null;
   const [stuck, ...rest] = segments;

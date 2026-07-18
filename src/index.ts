@@ -14,6 +14,7 @@ import {
   buildPendingSegmentsSQL,
   computeSkipPlan,
   extractApplyError,
+  skipPlansEqual,
   type PendingSegment,
   type SuspendedTable,
 } from "./wal-monitor";
@@ -647,9 +648,17 @@ module.exports = (app: App) => {
       try {
         walResult = await client.exec(RICH_WAL_QUERY);
         walTablesHasErrorColumns = true;
-      } catch {
+      } catch (err) {
         walResult = await client.exec(BASIC_WAL_QUERY);
-        walTablesHasErrorColumns = false;
+        // Only a definitive rejection (a 4xx — unknown column on an older
+        // QuestDB) proves the columns are missing. A transient failure
+        // (timeout, engine mid-restart) that happens to spare the cheaper
+        // basic query must not permanently disable the diagnostic columns —
+        // leave the flag unprobed so the next call retries the richer query.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/^QuestDB query failed \(4\d\d\)/.test(msg)) {
+          walTablesHasErrorColumns = false;
+        }
       }
     } else {
       walResult = await client.exec(
@@ -1764,6 +1773,10 @@ module.exports = (app: App) => {
             return;
           }
           const quoted = `"${table.replace(/"/g, '""')}"`;
+          // Captured at entry: a stop/update/purge bumps this, and the
+          // destructive statement below must never run against whatever
+          // lifecycle replaced the state this request was validated on.
+          const generation = lifecycleGeneration;
           const recheck = async () =>
             (await listSuspendedTables(client)).find((t) => t.name === table);
 
@@ -1814,11 +1827,28 @@ module.exports = (app: App) => {
             });
             return;
           }
-          const confirmed = Number(req.body?.confirmSkipToTxn);
-          if (confirmed !== plan.skipToTxn) {
+          if (!skipPlansEqual(plan, req.body?.confirmPlan)) {
             res.status(409).json({
               error:
-                "The skip target changed since the diagnosis was displayed. Re-run the diagnosis and confirm again.",
+                "The skip plan changed since the diagnosis was displayed. Re-run the diagnosis and confirm again.",
+              skipPlan: plan,
+            });
+            return;
+          }
+
+          // Final revalidation, immediately before the one destructive
+          // statement: the writer must still be frozen at the txn this plan
+          // was computed for, and no stop/update/purge may have replaced the
+          // lifecycle underneath this request while it slept above.
+          const preExec = await recheck();
+          if (
+            generation !== lifecycleGeneration ||
+            !preExec ||
+            preExec.writerTxn !== before.writerTxn
+          ) {
+            res.status(409).json({
+              error:
+                "The table's state changed while confirming the skip — nothing was skipped. Re-run the diagnosis.",
               skipPlan: plan,
             });
             return;

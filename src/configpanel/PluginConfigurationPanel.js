@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 
 const S = {
   root: {
@@ -317,6 +317,15 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [resuming, setResuming] = useState(false);
   const [resumeOutcome, setResumeOutcome] = useState("");
   const [walDiag, setWalDiag] = useState(null);
+  // True when the most recent diagnosis refresh failed: the displayed data
+  // is kept (better than flapping controls away) but anything destructive
+  // derived from it — the manual FROM TXN statement, the skip button — is
+  // withheld until a refresh confirms the plan is current.
+  const [walDiagStale, setWalDiagStale] = useState(false);
+  // Monotonic request id so a slow diagnosis response that lands after a
+  // newer one (poll cycle vs. post-action refresh) is dropped instead of
+  // overwriting fresher data.
+  const walDiagGen = useRef(0);
   const [skipping, setSkipping] = useState(false);
 
   const fetchVersions = useCallback(async () => {
@@ -348,15 +357,24 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   }, []);
 
   const fetchWalDiagnosis = useCallback(async (signal) => {
+    const gen = ++walDiagGen.current;
     try {
       const res = await fetch("/plugins/signalk-questdb/api/wal-diagnosis", {
         signal,
       });
+      if (gen !== walDiagGen.current) return;
       if (res.ok) {
-        setWalDiag(await res.json());
+        const data = await res.json();
+        if (gen !== walDiagGen.current) return;
+        setWalDiag(data);
+        setWalDiagStale(false);
+      } else {
+        setWalDiagStale(true);
       }
     } catch {
-      // diagnosis is best-effort; the banner still renders from status
+      // diagnosis is best-effort; the banner still renders from status,
+      // but flag the kept data as stale so destructive actions pause.
+      if (gen === walDiagGen.current) setWalDiagStale(true);
     }
   }, []);
 
@@ -369,6 +387,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   useEffect(() => {
     if (!suspendedNow) {
       setWalDiag(null);
+      setWalDiagStale(false);
       return undefined;
     }
     // Keep polling while suspended: a table can join the suspension, the
@@ -419,10 +438,10 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       const res = await fetch("/plugins/signalk-questdb/api/resume-wal/skip", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          table: tableName,
-          confirmSkipToTxn: plan.skipToTxn,
-        }),
+        // The full plan, not just the target txn: the server 409s unless
+        // every field matches its freshly recomputed plan, so the operator
+        // can only ever confirm exactly the loss they were shown.
+        body: JSON.stringify({ table: tableName, confirmPlan: plan }),
       });
       const data = await res.json().catch(() => ({ error: res.statusText }));
       if (res.ok) {
@@ -744,15 +763,24 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                           style={{
                             ...S.btn,
                             ...S.btnDanger,
-                            ...(skipping || resuming ? S.btnDisabled : {}),
+                            ...(skipping || resuming || walDiagStale
+                              ? S.btnDisabled
+                              : {}),
                           }}
-                          disabled={skipping || resuming}
+                          disabled={skipping || resuming || walDiagStale}
                           onClick={() => handleSkipWal(t.name, plan)}
                         >
                           {skipping
                             ? "Skipping..."
                             : "Skip unreadable segment (loses data)"}
                         </button>
+                        {walDiagStale && (
+                          <div style={{ marginTop: 6, fontSize: 12 }}>
+                            The diagnosis could not be refreshed — the numbers
+                            above may be stale. The skip re-enables once a
+                            refresh succeeds.
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -769,7 +797,14 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                         (d) => d.name === t.name,
                       );
                       const lines = [`ALTER TABLE ${quoted} RESUME WAL;`];
-                      if (t.autoResume === "failed" && diag?.skipPlan) {
+                      // The FROM TXN statement bypasses the server-side plan
+                      // re-validation, so only print it while the displayed
+                      // diagnosis is confirmed current.
+                      if (
+                        t.autoResume === "failed" &&
+                        diag?.skipPlan &&
+                        !walDiagStale
+                      ) {
                         lines.push(
                           `-- if the resume re-suspends: skip the unreadable segment (loses ${formatNumber(diag.skipPlan.skippedTxns)} txns)`,
                           `ALTER TABLE ${quoted} RESUME WAL FROM TXN ${diag.skipPlan.skipToTxn};`,

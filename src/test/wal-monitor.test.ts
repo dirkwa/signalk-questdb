@@ -5,7 +5,9 @@ import {
   buildPendingSegmentsSQL,
   computeSkipPlan,
   extractApplyError,
+  skipPlansEqual,
   type PendingSegment,
+  type SkipPlan,
   type SuspendedTable,
   type WalMonitorDeps,
 } from "../wal-monitor";
@@ -89,6 +91,41 @@ describe("computeSkipPlan", () => {
     assert.ok(plan);
     assert.equal(plan.skipToTxn, 4672118);
     assert.equal(plan.tailSkip, true);
+  });
+});
+
+describe("skipPlansEqual", () => {
+  const plan: SkipPlan = {
+    skipToTxn: 4672118,
+    skippedTxns: 6,
+    skipWindowStart: "2026-07-01T04:22:14.701496Z",
+    skipWindowEnd: "2026-07-01T04:22:17.204514Z",
+    walId: 33,
+    segmentId: 20,
+    tailSkip: false,
+  };
+
+  it("accepts an identical confirmation (including a JSON round-trip)", () => {
+    assert.equal(skipPlansEqual(plan, { ...plan }), true);
+    assert.equal(skipPlansEqual(plan, JSON.parse(JSON.stringify(plan))), true);
+  });
+
+  it("rejects non-object confirmations", () => {
+    assert.equal(skipPlansEqual(plan, undefined), false);
+    assert.equal(skipPlansEqual(plan, null), false);
+    assert.equal(skipPlansEqual(plan, 4672118), false);
+  });
+
+  it("rejects when any field diverges — same target txn is not enough", () => {
+    assert.equal(skipPlansEqual(plan, { ...plan, skippedTxns: 12000 }), false);
+    assert.equal(
+      skipPlansEqual(plan, { ...plan, skipWindowEnd: "2026-07-05T00:00:00Z" }),
+      false,
+    );
+    assert.equal(skipPlansEqual(plan, { ...plan, tailSkip: true }), false);
+    assert.equal(skipPlansEqual(plan, { ...plan, walId: 34 }), false);
+    assert.equal(skipPlansEqual(plan, { ...plan, segmentId: 21 }), false);
+    assert.equal(skipPlansEqual(plan, { ...plan, skipToTxn: 4672119 }), false);
   });
 });
 
