@@ -1842,13 +1842,29 @@ module.exports = (app: App) => {
             });
             return;
           }
-          if (
-            generation !== lifecycleGeneration ||
-            !skipPlansEqual(plan, req.body?.confirmPlan)
-          ) {
+          if (!skipPlansEqual(plan, req.body?.confirmPlan)) {
             res.status(409).json({
               error:
                 "The skip plan changed since the diagnosis was displayed. Re-run the diagnosis and confirm again.",
+              skipPlan: plan,
+            });
+            return;
+          }
+
+          // Last state read before the destructive statement — only
+          // synchronous code between this validation and the ALTER, so no
+          // await window remains in which the writer could move or the
+          // lifecycle could be swapped. (The two HTTP calls are still
+          // distinct reads; that residue is irreducible client-side.)
+          const finalState = await recheck();
+          if (
+            generation !== lifecycleGeneration ||
+            !finalState ||
+            finalState.writerTxn !== before.writerTxn
+          ) {
+            res.status(409).json({
+              error:
+                "The table's state changed while confirming the skip — nothing was skipped. Re-run the diagnosis.",
               skipPlan: plan,
             });
             return;
