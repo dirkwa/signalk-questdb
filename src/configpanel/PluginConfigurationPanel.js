@@ -347,9 +347,11 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     setStatusLoading(false);
   }, []);
 
-  const fetchWalDiagnosis = useCallback(async () => {
+  const fetchWalDiagnosis = useCallback(async (signal) => {
     try {
-      const res = await fetch("/plugins/signalk-questdb/api/wal-diagnosis");
+      const res = await fetch("/plugins/signalk-questdb/api/wal-diagnosis", {
+        signal,
+      });
       if (res.ok) {
         setWalDiag(await res.json());
       }
@@ -374,9 +376,26 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     // — and the first fetch may simply have failed. On a failed refresh the
     // last good diagnosis is kept (the skip endpoint re-validates the plan
     // server-side, so acting on a stale one is rejected, not dangerous).
-    fetchWalDiagnosis();
-    const interval = setInterval(fetchWalDiagnosis, 15000);
-    return () => clearInterval(interval);
+    // Self-scheduling rather than setInterval: the endpoint aggregates
+    // several engine queries plus a log fetch, and on a slow host one
+    // response can take longer than the poll period — the next request
+    // must only start after the previous one settled. Cleanup aborts the
+    // in-flight request so a banner unmount doesn't leave it dangling.
+    let cancelled = false;
+    let timer = null;
+    const controller = new AbortController();
+    const poll = async () => {
+      await fetchWalDiagnosis(controller.signal);
+      if (!cancelled) {
+        timer = setTimeout(poll, 15000);
+      }
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer) clearTimeout(timer);
+    };
   }, [suspendedNow, fetchWalDiagnosis]);
 
   const handleSkipWal = async (tableName, plan) => {

@@ -251,6 +251,12 @@ const SCHEMA_HEAL_INTERVAL_MS = 60_000;
 // cleanly separates "re-suspended at the same txn" from "healthily replaying".
 const SKIP_RECHECK_DELAY_MS = 3_000;
 
+// Deadline for the engine-log fetch inside /api/wal-diagnosis. The container
+// API exposes no abort signal, so this bounds how long the diagnosis waits —
+// a runtime that stalls streaming logs must degrade the response (applyError
+// null), not hang it.
+const ENGINE_LOG_TIMEOUT_MS = 10_000;
+
 function buildResourceLimits(config: Config): ContainerResourceLimits {
   return {
     memory: config.questdbMemoryLimit?.trim() || null,
@@ -693,12 +699,22 @@ module.exports = (app: App) => {
     const containers = (globalThis as any).__signalk_containerManager as
       ContainerManagerApi | undefined;
     if (!containers?.getLogs) return null;
+    let timeoutTimer: NodeJS.Timeout | undefined;
     try {
-      return await containers.getLogs(QUESTDB_CONTAINER_NAME, {
-        tail: 3000,
-      });
+      return await Promise.race([
+        // The trailing catch keeps a fetch that fails AFTER the timeout won
+        // the race from surfacing as an unhandled rejection.
+        containers
+          .getLogs(QUESTDB_CONTAINER_NAME, { tail: 3000 })
+          .catch(() => null),
+        new Promise<null>((resolve) => {
+          timeoutTimer = setTimeout(() => resolve(null), ENGINE_LOG_TIMEOUT_MS);
+        }),
+      ]);
     } catch {
       return null;
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
     }
   }
 
