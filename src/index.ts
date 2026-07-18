@@ -1816,30 +1816,13 @@ module.exports = (app: App) => {
             return;
           }
 
-          // Step 2: replay re-froze at the same transaction. Compute the
-          // minimal skip fresh and compare against what the operator saw.
-          const plan = computeSkipPlan(
-            await pendingSegments(client, afterResume),
-          );
-          if (!plan) {
-            res.status(500).json({
-              error: `Cannot compute a skip plan for ${table} — no pending transactions found.`,
-            });
-            return;
-          }
-          if (!skipPlansEqual(plan, req.body?.confirmPlan)) {
-            res.status(409).json({
-              error:
-                "The skip plan changed since the diagnosis was displayed. Re-run the diagnosis and confirm again.",
-              skipPlan: plan,
-            });
-            return;
-          }
-
-          // Final revalidation, immediately before the one destructive
-          // statement: the writer must still be frozen at the txn this plan
-          // was computed for, and no stop/update/purge may have replaced the
-          // lifecycle underneath this request while it slept above.
+          // Step 2: replay re-froze at the same transaction. Everything the
+          // destructive statement depends on is validated from the state
+          // read CLOSEST to execution: re-read the suspension state, require
+          // the writer still frozen at the same txn and the lifecycle
+          // untouched by stop/update/purge, recompute the plan from that
+          // state, and require it to match the operator's confirmation in
+          // every field. Only that final validated plan is executed.
           const preExec = await recheck();
           if (
             generation !== lifecycleGeneration ||
@@ -1849,6 +1832,23 @@ module.exports = (app: App) => {
             res.status(409).json({
               error:
                 "The table's state changed while confirming the skip — nothing was skipped. Re-run the diagnosis.",
+            });
+            return;
+          }
+          const plan = computeSkipPlan(await pendingSegments(client, preExec));
+          if (!plan) {
+            res.status(500).json({
+              error: `Cannot compute a skip plan for ${table} — no pending transactions found.`,
+            });
+            return;
+          }
+          if (
+            generation !== lifecycleGeneration ||
+            !skipPlansEqual(plan, req.body?.confirmPlan)
+          ) {
+            res.status(409).json({
+              error:
+                "The skip plan changed since the diagnosis was displayed. Re-run the diagnosis and confirm again.",
               skipPlan: plan,
             });
             return;
