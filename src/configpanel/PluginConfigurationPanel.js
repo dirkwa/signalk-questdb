@@ -698,8 +698,10 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           database grows, this kernel limit can run out — mmap then fails with
           out-of-memory errors even though RAM is free, which shows up as slow
           or failing history queries, can suspend recording, and can take
-          QuestDB down entirely. Raise it on the host (takes effect immediately,
-          no restart needed):
+          QuestDB down entirely. Run this in a shell on the host machine — not
+          inside the QuestDB container, which can neither change the
+          kernel-global limit nor has sudo (takes effect immediately, no restart
+          needed):
           <code style={S.warnBannerCode}>
             {`echo 'vm.max_map_count=${maxMapCount.recommended}' | sudo tee /etc/sysctl.d/99-questdb.conf && sudo sysctl --system`}
           </code>

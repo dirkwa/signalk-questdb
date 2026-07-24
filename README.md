@@ -279,9 +279,11 @@ suspend a table.
 
 The QuestDB Web Console shows the same warning
 (`vm.max_map_count limit is too low`), the plugin's config panel shows a
-banner, and the server log gets a warning at plugin startup. Fix it on the
-**host** (the sysctl is kernel-global, so this works no matter how Signal K
-itself is deployed):
+banner, and the server log gets a warning at plugin startup. Fix it in a
+shell **on the host machine itself** — not inside the QuestDB container via
+`podman exec`: the limit is kernel-global, a container cannot change it, and
+the QuestDB image has neither `sudo` nor `/etc/sysctl.d`. Being kernel-global
+also means this works no matter how Signal K itself is deployed:
 
 ```bash
 echo 'vm.max_map_count=1048576' | sudo tee /etc/sysctl.d/99-questdb.conf

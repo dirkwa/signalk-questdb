@@ -1116,7 +1116,8 @@ module.exports = (app: App) => {
         app.error(
           `Host vm.max_map_count is ${mapCount.current}; QuestDB recommends ` +
             `${mapCount.recommended}. A grown database can exhaust this and ` +
-            `fail queries or suspend recording. Fix on the host: ` +
+            `fail queries or suspend recording. Fix in a host shell (not ` +
+            `inside the container — the limit is kernel-global): ` +
             `echo 'vm.max_map_count=${mapCount.recommended}' | sudo tee ` +
             `/etc/sysctl.d/99-questdb.conf && sudo sysctl --system`,
         );
