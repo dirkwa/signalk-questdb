@@ -345,11 +345,14 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const fetchStatus = useCallback(async () => {
     try {
       const res = await fetch("/plugins/signalk-questdb/api/status");
-      if (res.ok) {
-        setDbStatus(await res.json());
-      } else {
-        setDbStatus({ status: "not_running" });
-      }
+      // Parse the body on non-2xx too: the unhealthy 503 carries fields the
+      // panel must still surface (hostMaxMapCount — mmap exhaustion is one
+      // of the ways QuestDB becomes unhealthy). Unparseable bodies fall
+      // through to the plain not_running shape.
+      const body = await res.json().catch(() => null);
+      setDbStatus(
+        body && typeof body === "object" ? body : { status: "not_running" },
+      );
     } catch {
       setDbStatus({ status: "not_running" });
     }
@@ -664,6 +667,14 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const walSuspended = suspendedTables.length > 0;
   const schemaMismatch = (isRunning && dbStatus.schemaMismatch) || false;
   const ulimitClamp = (isRunning && dbStatus.ulimitClamp) || null;
+  // Only surfaced when too low — a healthy limit needs no banner. NOT gated
+  // on isRunning: mmap exhaustion is one of the ways QuestDB becomes
+  // unhealthy, so the hint must stay visible while it is down (the status
+  // endpoint reports the field on the unhealthy response too). The endpoint
+  // re-reads /proc on every poll, so this clears by itself once the operator
+  // applies the sysctl (no container restart needed).
+  const maxMapCount =
+    (dbStatus?.hostMaxMapCount?.tooLow && dbStatus.hostMaxMapCount) || null;
 
   // Build version options: latest first, then pre-releases, then stable
   const stableVersions = versions.filter((v) => !v.prerelease).slice(0, 3);
@@ -673,6 +684,29 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     <div style={S.root}>
       {/* QuestDB Status */}
       <div style={S.sectionTitle}>QuestDB Status</div>
+
+      {/* Rendered outside the running/not-running branches: the status
+          endpoint reports hostMaxMapCount even on the unhealthy response,
+          and the remediation hint matters MOST while QuestDB is down. */}
+      {maxMapCount && (
+        <div style={S.infoBanner}>
+          <div style={S.warnBannerTitle}>
+            Host vm.max_map_count is low — {formatNumber(maxMapCount.current)}{" "}
+            (QuestDB recommends {formatNumber(maxMapCount.recommended)})
+          </div>
+          QuestDB memory-maps every partition and WAL segment it touches. As the
+          database grows, this kernel limit can run out — mmap then fails with
+          out-of-memory errors even though RAM is free, which shows up as slow
+          or failing history queries, can suspend recording, and can take
+          QuestDB down entirely. Run this in a shell on the host machine — not
+          inside the QuestDB container, which can neither change the
+          kernel-global limit nor has sudo (takes effect immediately, no restart
+          needed):
+          <code style={S.warnBannerCode}>
+            {`echo 'vm.max_map_count=${maxMapCount.recommended}' | sudo tee /etc/sysctl.d/99-questdb.conf && sudo sysctl --system`}
+          </code>
+        </div>
+      )}
 
       {statusLoading ? (
         <div style={S.empty}>Checking QuestDB...</div>

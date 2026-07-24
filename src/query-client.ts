@@ -55,9 +55,17 @@ export class QueryClient {
     // an ALTER against a busy table is retried server-side once per second
     // with the response held open ("JsonQueryProcessor resource busy, will
     // retry"), so without a deadline the call would wait the full default.
+    //
+    // The deadline is enforced on BOTH sides. The AbortSignal frees us, but
+    // an aborted fetch leaves QuestDB executing the statement until its own
+    // default timeout (60s) — and the managed container runs a single shared
+    // worker (low-power tuning), so one abandoned heavy query convoys every
+    // query behind it. `Statement-Timeout` (milliseconds) makes QuestDB stop
+    // the work itself at the same deadline.
 
     const res = await fetch(url.toString(), {
       signal: AbortSignal.timeout(timeoutMs),
+      headers: { "Statement-Timeout": String(timeoutMs) },
     });
 
     if (!res.ok) {
@@ -75,12 +83,15 @@ export class QueryClient {
     return this.exec(sql);
   }
 
-  async execCsv(sql: string): Promise<string> {
+  async execCsv(sql: string, timeoutMs = 60000): Promise<string> {
     const url = new URL("/exp", this.baseUrl);
     url.searchParams.set("query", sql);
 
+    // Same double-sided deadline as exec(): the abort frees us, the header
+    // stops QuestDB from burning its worker on an export nobody is reading.
     const res = await fetch(url.toString(), {
-      signal: AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { "Statement-Timeout": String(timeoutMs) },
     });
 
     if (!res.ok) {

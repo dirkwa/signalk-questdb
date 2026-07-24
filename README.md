@@ -265,6 +265,35 @@ podman events --since 2h --stream=false --filter container=sk-signalk-questdb \
   --filter event=oom --filter event=died
 ```
 
+### History queries slow or timing out / "out-of-memory" errors with free RAM
+
+QuestDB memory-maps every partition column file and every pending WAL segment
+it touches. The Linux kernel caps how many memory mappings one process may
+hold (`vm.max_map_count`), and the stock value on Debian, Ubuntu ≤ 22.04, and
+RHEL (65530) is far below what QuestDB recommends (1048576). A fresh database
+fits easily; months of daily partitions across the three tables — plus a
+segment backlog if a table's WAL is suspended — can exhaust the limit. When
+that happens `mmap` fails with out-of-memory errors (errno 12) **even though
+plenty of RAM is free**: queries error out or crawl, and the WAL apply job can
+suspend a table.
+
+The QuestDB Web Console shows the same warning
+(`vm.max_map_count limit is too low`), the plugin's config panel shows a
+banner, and the server log gets a warning at plugin startup. Fix it in a
+shell **on the host machine itself** — not inside the QuestDB container via
+`podman exec`: the limit is kernel-global, a container cannot change it, and
+the QuestDB image has neither `sudo` nor `/etc/sysctl.d`. Being kernel-global
+also means this works no matter how Signal K itself is deployed:
+
+```bash
+echo 'vm.max_map_count=1048576' | sudo tee /etc/sysctl.d/99-questdb.conf
+sudo sysctl --system
+```
+
+This takes effect immediately — no container or host restart needed. See
+[QuestDB capacity planning](https://questdb.com/docs/getting-started/capacity-planning/#max-virtual-memory-areas-limit)
+for background.
+
 ## History API Provider
 
 QuestDB automatically registers as the **default** Signal K v2 History API provider. Any app or Grafana plugin that queries `/signalk/v2/api/history/` uses QuestDB.

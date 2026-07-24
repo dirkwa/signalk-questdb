@@ -188,3 +188,136 @@ describe("history-v2 navigation.position aggregate", () => {
     }
   });
 });
+
+describe("history-v2 sample bucket guard", () => {
+  it("rejects a resolution that would fabricate millions of FILL(NULL) rows", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    // 60 days at 1s resolution = 5.18M buckets — over the 1M cap.
+    await assert.rejects(
+      provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-03-01T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          { path: "navigation.position", aggregate: "first", parameter: [] },
+        ],
+      } as any),
+      /sample buckets/,
+    );
+    // The guard must fire before any SQL reaches QuestDB.
+    assert.equal(captured.length, 0);
+  });
+
+  it("allows the same range at a sane resolution", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-03-01T00:00:00Z" },
+      resolution: 2600, // ~2000 buckets, the well-behaved-client budget
+      pathSpecs: [
+        { path: "navigation.position", aggregate: "first", parameter: [] },
+      ],
+    } as any);
+
+    assert.equal(captured.length, 1);
+    assert.ok(captured[0].sql.includes("SAMPLE BY 2600s"));
+  });
+
+  it("clamps fractional resolutions to 1s instead of SAMPLE BY 0s", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-01-01T01:00:00Z" },
+      resolution: 0.5,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+        },
+      ],
+    } as any);
+
+    assert.equal(captured.length, 1);
+    assert.ok(
+      captured[0].sql.includes("SAMPLE BY 1s"),
+      `expected SAMPLE BY 1s, got: ${captured[0].sql}`,
+    );
+  });
+
+  it("caps the fabricated total across multiple sampled paths", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    // 7 days at 1s = ~605K buckets per series: one series passes the 1M cap,
+    // two series must not slip past it (1.21M fabricated rows total).
+    await assert.rejects(
+      provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-01-08T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          { path: "navigation.position", aggregate: "first", parameter: [] },
+          {
+            path: "navigation.speedOverGround",
+            aggregate: "average",
+            parameter: [],
+          },
+        ],
+      } as any),
+      /sample buckets/,
+    );
+    assert.equal(captured.length, 0);
+  });
+
+  it("does not reject client-side aggregates, which never SAMPLE BY", async () => {
+    // 60 days at 1s would be 5.18M buckets — but every client-side aggregate
+    // reads raw rows under a LIMIT, so the cap must not apply to any of them.
+    const cases: [string, string[]][] = [
+      ["sma", ["5"]],
+      ["ema", ["0.2"]],
+      ["middle_index", []],
+    ];
+    for (const [aggregate, parameter] of cases) {
+      const captured: CapturedQuery[] = [];
+      const provider = createHistoryProviderV2(
+        makeMockClient(captured),
+        SELF_CONTEXT,
+      );
+
+      await provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-03-01T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          { path: "navigation.speedOverGround", aggregate, parameter },
+        ],
+      } as any);
+
+      assert.equal(captured.length, 1, `no query captured for '${aggregate}'`);
+      assert.ok(
+        captured[0].sql.includes("LIMIT 50000") &&
+          !captured[0].sql.includes("SAMPLE BY"),
+        `expected raw-row LIMIT query for '${aggregate}', got: ${captured[0].sql}`,
+      );
+    }
+  });
+});

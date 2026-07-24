@@ -127,12 +127,54 @@ function normalizeContext(context: string, selfContext: string): string {
   return context;
 }
 
+// Upper bound on SAMPLE BY buckets a single request may generate. The
+// SAMPLE BY queries use FILL(NULL), which fabricates a row for EVERY bucket
+// in the range whether data exists or not — a caller asking for weeks at 1s
+// resolution would stream millions of rows through QuestDB, Node's JSON
+// parser, and the HTTP response, wedging Pi-class servers for minutes. The
+// well-behaved clients budget ~2000 points per request; a million covers any
+// sane chart while keeping the worst case bounded.
+const MAX_SAMPLE_BUCKETS = 1_000_000;
+
+// Effective SAMPLE BY period: QuestDB rejects `SAMPLE BY 0s`, so fractional
+// resolutions (e.g. 0.5) must clamp up to 1s instead of flooring to zero.
+function effectiveResolution(resolution: number): number {
+  return Math.max(1, Math.floor(resolution));
+}
+
 export function createHistoryProviderV2(
   queryClient: QueryClient,
   selfContext: string,
 ) {
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
     const range = resolveTimeRange(query as any);
+
+    // Only specs that actually run a SAMPLE BY query fabricate buckets:
+    // client-side aggregates (sma/ema/middle_index) read raw rows under a
+    // LIMIT and must not trip the cap. Each qualifying spec issues its own
+    // SAMPLE BY, so the fabricated total scales with their count.
+    const sampledSpecs = query.pathSpecs.filter(
+      (spec) =>
+        spec.path === "navigation.position" ||
+        !needsClientSideAggregation(spec.aggregate),
+    ).length;
+
+    if (sampledSpecs > 0 && query.resolution && query.resolution > 0) {
+      const rangeSec = (Date.parse(range.to) - Date.parse(range.from)) / 1000;
+      const bucketsPerSeries = Math.ceil(
+        rangeSec / effectiveResolution(query.resolution),
+      );
+      const buckets = bucketsPerSeries * sampledSpecs;
+      if (buckets > MAX_SAMPLE_BUCKETS) {
+        throw new Error(
+          `resolution ${query.resolution}s over this range produces ` +
+            `${buckets} sample buckets across ${sampledSpecs} paths ` +
+            `(max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or ` +
+            `a shorter range`,
+        );
+      }
+    }
+
     const requestedContext = query.context ?? "vessels.self";
     const storedContext = normalizeContext(requestedContext, selfContext);
     const safeContext = validateIdentifier(storedContext);
@@ -156,7 +198,7 @@ export function createHistoryProviderV2(
         const posAgg = spec.aggregate === "last" ? "last" : "first";
         let sql: string;
         if (query.resolution && query.resolution > 0) {
-          sql = `SELECT ts, ${posAgg}(lat) as lat, ${posAgg}(lon) as lon FROM ${table} WHERE ${where} SAMPLE BY ${Math.floor(query.resolution)}s FILL(NULL) ORDER BY ts`;
+          sql = `SELECT ts, ${posAgg}(lat) as lat, ${posAgg}(lon) as lon FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`;
         } else {
           sql = `SELECT ts, lat, lon FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
         }
@@ -202,7 +244,7 @@ export function createHistoryProviderV2(
       const aggExpr = aggregateToSql(spec.aggregate);
       let sql: string;
       if (query.resolution && query.resolution > 0) {
-        sql = `SELECT ts, ${aggExpr} as agg_value FROM ${table} WHERE ${where} SAMPLE BY ${Math.floor(query.resolution)}s FILL(NULL) ORDER BY ts`;
+        sql = `SELECT ts, ${aggExpr} as agg_value FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`;
       } else {
         sql = `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
       }
