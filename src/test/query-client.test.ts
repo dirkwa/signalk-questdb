@@ -240,3 +240,51 @@ describe("QueryClient.toObjects", () => {
     assert.deepEqual(client.toObjects(result), []);
   });
 });
+
+describe("QueryClient statement timeout header", () => {
+  // A real (loopback) HTTP server instead of a fetch stub: the point is to
+  // assert what actually goes on the wire, since Statement-Timeout is only
+  // honored when QuestDB receives it as a request header.
+  async function captureHeaders(
+    run: (client: QueryClient) => Promise<unknown>,
+  ): Promise<Record<string, string | string[] | undefined>> {
+    const http = await import("node:http");
+    let headers: Record<string, string | string[] | undefined> = {};
+    const server = http.createServer((req, res) => {
+      headers = req.headers;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({ columns: [], dataset: [], count: 0, timestamp: -1 }),
+      );
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as { port: number }).port;
+    try {
+      await run(new QueryClient("127.0.0.1", port));
+    } finally {
+      server.close();
+    }
+    return headers;
+  }
+
+  it("mirrors the exec() deadline into Statement-Timeout (ms)", async () => {
+    const headers = await captureHeaders((client) =>
+      client.exec("SELECT 1", 12345),
+    );
+    assert.equal(headers["statement-timeout"], "12345");
+  });
+
+  it("sends the default deadline when none is given", async () => {
+    const headers = await captureHeaders((client) => client.exec("SELECT 1"));
+    assert.equal(headers["statement-timeout"], "30000");
+  });
+
+  it("bounds CSV exports the same way", async () => {
+    const headers = await captureHeaders((client) =>
+      client.execCsv("SELECT 1"),
+    );
+    assert.equal(headers["statement-timeout"], "60000");
+  });
+});

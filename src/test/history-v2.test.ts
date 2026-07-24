@@ -188,3 +188,75 @@ describe("history-v2 navigation.position aggregate", () => {
     }
   });
 });
+
+describe("history-v2 sample bucket guard", () => {
+  it("rejects a resolution that would fabricate millions of FILL(NULL) rows", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    // 60 days at 1s resolution = 5.18M buckets — over the 1M cap.
+    await assert.rejects(
+      provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-03-01T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          { path: "navigation.position", aggregate: "first", parameter: [] },
+        ],
+      } as any),
+      /sample buckets/,
+    );
+    // The guard must fire before any SQL reaches QuestDB.
+    assert.equal(captured.length, 0);
+  });
+
+  it("allows the same range at a sane resolution", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-03-01T00:00:00Z" },
+      resolution: 2600, // ~2000 buckets, the well-behaved-client budget
+      pathSpecs: [
+        { path: "navigation.position", aggregate: "first", parameter: [] },
+      ],
+    } as any);
+
+    assert.equal(captured.length, 1);
+    assert.ok(captured[0].sql.includes("SAMPLE BY 2600s"));
+  });
+
+  it("clamps fractional resolutions to 1s instead of SAMPLE BY 0s", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-01-01T01:00:00Z" },
+      resolution: 0.5,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+        },
+      ],
+    } as any);
+
+    assert.equal(captured.length, 1);
+    assert.ok(
+      captured[0].sql.includes("SAMPLE BY 1s"),
+      `expected SAMPLE BY 1s, got: ${captured[0].sql}`,
+    );
+  });
+});

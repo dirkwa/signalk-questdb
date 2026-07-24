@@ -664,6 +664,14 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const walSuspended = suspendedTables.length > 0;
   const schemaMismatch = (isRunning && dbStatus.schemaMismatch) || false;
   const ulimitClamp = (isRunning && dbStatus.ulimitClamp) || null;
+  // Only surfaced when too low — a healthy limit needs no banner. The status
+  // endpoint re-reads /proc on every poll, so this clears by itself once the
+  // operator applies the sysctl (no container restart needed).
+  const maxMapCount =
+    (isRunning &&
+      dbStatus.hostMaxMapCount?.tooLow &&
+      dbStatus.hostMaxMapCount) ||
+    null;
 
   // Build version options: latest first, then pre-releases, then stable
   const stableVersions = versions.filter((v) => !v.prerelease).slice(0, 3);
@@ -858,6 +866,24 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                 Step-by-step instructions
               </a>
               .
+            </div>
+          )}
+          {maxMapCount && (
+            <div style={S.infoBanner}>
+              <div style={S.warnBannerTitle}>
+                Host vm.max_map_count is low —{" "}
+                {formatNumber(maxMapCount.current)} (QuestDB recommends{" "}
+                {formatNumber(maxMapCount.recommended)})
+              </div>
+              QuestDB memory-maps every partition and WAL segment it touches. As
+              the database grows, this kernel limit can run out — mmap then
+              fails with out-of-memory errors even though RAM is free, which
+              shows up as slow or failing history queries and can suspend
+              recording. Raise it on the host (takes effect immediately, no
+              restart needed):
+              <code style={S.warnBannerCode}>
+                {`echo 'vm.max_map_count=${maxMapCount.recommended}' | sudo tee /etc/sysctl.d/99-questdb.conf && sudo sysctl --system`}
+              </code>
             </div>
           )}
           <div style={S.card}>

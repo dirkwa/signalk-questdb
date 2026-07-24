@@ -28,6 +28,7 @@ import {
   lanExposureEndpoints,
   type Endpoint,
 } from "./questdb-endpoint";
+import { readMaxMapCount } from "./host-limits";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -1102,6 +1103,26 @@ module.exports = (app: App) => {
     });
     walMonitor.start();
 
+    // vm.max_map_count is kernel-global (not namespaced), so in managed mode
+    // this local probe reflects the limit the QuestDB container actually runs
+    // under. QuestDB memory-maps every partition column file and WAL segment;
+    // on a grown database the stock 65530 exhausts and mmap fails with
+    // out-of-memory errors — failed queries and suspended WAL apply while
+    // plenty of RAM is free. Warn once here; /api/status re-reads it live so
+    // the panel banner clears as soon as the operator raises the sysctl.
+    if (config.managedContainer) {
+      const mapCount = await readMaxMapCount();
+      if (mapCount?.tooLow) {
+        app.error(
+          `Host vm.max_map_count is ${mapCount.current}; QuestDB recommends ` +
+            `${mapCount.recommended}. A grown database can exhaust this and ` +
+            `fail queries or suspend recording. Fix on the host: ` +
+            `echo 'vm.max_map_count=${mapCount.recommended}' | sudo tee ` +
+            `/etc/sysctl.d/99-questdb.conf && sudo sysctl --system`,
+        );
+      }
+    }
+
     app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
     // Everything is registered — only now does the plugin count as running.
     // Any earlier return/throw leaves the flag false, so a half-started
@@ -1267,6 +1288,15 @@ module.exports = (app: App) => {
             // suspended".
           }
 
+          // Live /proc read (cheap) rather than a cached startup probe, so
+          // the panel warning clears on the next poll once the operator
+          // applies the sysctl — raising it takes effect immediately, no
+          // container restart needed. Managed mode only: an external QuestDB
+          // may run on another machine whose kernel this probe cannot see.
+          const hostMaxMapCount = currentConfig?.managedContainer
+            ? await readMaxMapCount()
+            : null;
+
           res.json({
             status: "running",
             totalRows,
@@ -1275,6 +1305,7 @@ module.exports = (app: App) => {
             suspendedTables,
             schemaMismatch,
             ulimitClamp,
+            hostMaxMapCount,
             endpoint: questdbEndpoints
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
               : null,
