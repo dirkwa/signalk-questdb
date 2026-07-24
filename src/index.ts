@@ -1110,7 +1110,7 @@ module.exports = (app: App) => {
     // out-of-memory errors — failed queries and suspended WAL apply while
     // plenty of RAM is free. Warn once here; /api/status re-reads it live so
     // the panel banner clears as soon as the operator raises the sysctl.
-    if (config.managedContainer) {
+    if (config.managedContainer !== false) {
       const mapCount = await readMaxMapCount();
       if (mapCount?.tooLow) {
         app.error(
@@ -1236,9 +1236,23 @@ module.exports = (app: App) => {
             return;
           }
 
+          // Probe the host limit BEFORE the health gate: mmap exhaustion is
+          // one of the ways QuestDB becomes unhealthy in the first place, so
+          // the remediation hint must survive into the unhealthy response
+          // instead of disappearing exactly when it matters. Live /proc read
+          // (cheap) rather than a cached startup probe, so the panel warning
+          // clears on the next poll once the operator applies the sysctl —
+          // raising it takes effect immediately, no container restart needed.
+          // Managed mode only: an external QuestDB may run on another machine
+          // whose kernel this probe cannot see.
+          const hostMaxMapCount =
+            currentConfig?.managedContainer !== false
+              ? await readMaxMapCount()
+              : null;
+
           const healthy = await queryClient.isHealthy();
           if (!healthy) {
-            res.status(503).json({ status: "unhealthy" });
+            res.status(503).json({ status: "unhealthy", hostMaxMapCount });
             return;
           }
 
@@ -1287,15 +1301,6 @@ module.exports = (app: App) => {
             // the tables don't exist yet during startup — treat as "not
             // suspended".
           }
-
-          // Live /proc read (cheap) rather than a cached startup probe, so
-          // the panel warning clears on the next poll once the operator
-          // applies the sysctl — raising it takes effect immediately, no
-          // container restart needed. Managed mode only: an external QuestDB
-          // may run on another machine whose kernel this probe cannot see.
-          const hostMaxMapCount = currentConfig?.managedContainer
-            ? await readMaxMapCount()
-            : null;
 
           res.json({
             status: "running",

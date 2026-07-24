@@ -259,4 +259,58 @@ describe("history-v2 sample bucket guard", () => {
       `expected SAMPLE BY 1s, got: ${captured[0].sql}`,
     );
   });
+
+  it("caps the fabricated total across multiple sampled paths", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    // 7 days at 1s = ~605K buckets per series: one series passes the 1M cap,
+    // two series must not slip past it (1.21M fabricated rows total).
+    await assert.rejects(
+      provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-01-08T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          { path: "navigation.position", aggregate: "first", parameter: [] },
+          {
+            path: "navigation.speedOverGround",
+            aggregate: "average",
+            parameter: [],
+          },
+        ],
+      } as any),
+      /sample buckets/,
+    );
+    assert.equal(captured.length, 0);
+  });
+
+  it("does not reject client-side aggregates, which never SAMPLE BY", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    // 60 days at 1s would be 5.18M buckets — but sma reads raw rows under a
+    // LIMIT, so the cap must not apply.
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-03-01T00:00:00Z" },
+      resolution: 1,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "sma",
+          parameter: ["5"],
+        },
+      ],
+    } as any);
+
+    assert.equal(captured.length, 1);
+    assert.ok(captured[0].sql.includes("LIMIT 50000"));
+  });
 });

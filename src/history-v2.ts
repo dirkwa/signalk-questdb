@@ -149,16 +149,28 @@ export function createHistoryProviderV2(
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
     const range = resolveTimeRange(query as any);
 
-    if (query.resolution && query.resolution > 0) {
+    // Only specs that actually run a SAMPLE BY query fabricate buckets:
+    // client-side aggregates (sma/ema/middle_index) read raw rows under a
+    // LIMIT and must not trip the cap. Each qualifying spec issues its own
+    // SAMPLE BY, so the fabricated total scales with their count.
+    const sampledSpecs = query.pathSpecs.filter(
+      (spec) =>
+        spec.path === "navigation.position" ||
+        !needsClientSideAggregation(spec.aggregate),
+    ).length;
+
+    if (sampledSpecs > 0 && query.resolution && query.resolution > 0) {
       const rangeSec = (Date.parse(range.to) - Date.parse(range.from)) / 1000;
-      const buckets = Math.ceil(
+      const bucketsPerSeries = Math.ceil(
         rangeSec / effectiveResolution(query.resolution),
       );
+      const buckets = bucketsPerSeries * sampledSpecs;
       if (buckets > MAX_SAMPLE_BUCKETS) {
         throw new Error(
           `resolution ${query.resolution}s over this range produces ` +
-            `${buckets} sample buckets (max ${MAX_SAMPLE_BUCKETS}) — ` +
-            `use a coarser resolution or a shorter range`,
+            `${buckets} sample buckets across ${sampledSpecs} paths ` +
+            `(max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or ` +
+            `a shorter range`,
         );
       }
     }
