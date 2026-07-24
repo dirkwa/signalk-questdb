@@ -287,4 +287,11 @@ describe("QueryClient statement timeout header", () => {
     );
     assert.equal(headers["statement-timeout"], "60000");
   });
+
+  it("mirrors an explicit CSV deadline into Statement-Timeout", async () => {
+    const headers = await captureHeaders((client) =>
+      client.execCsv("SELECT 1", 12345),
+    );
+    assert.equal(headers["statement-timeout"], "12345");
+  });
 });

@@ -289,28 +289,35 @@ describe("history-v2 sample bucket guard", () => {
   });
 
   it("does not reject client-side aggregates, which never SAMPLE BY", async () => {
-    const captured: CapturedQuery[] = [];
-    const provider = createHistoryProviderV2(
-      makeMockClient(captured),
-      SELF_CONTEXT,
-    );
+    // 60 days at 1s would be 5.18M buckets — but every client-side aggregate
+    // reads raw rows under a LIMIT, so the cap must not apply to any of them.
+    const cases: [string, string[]][] = [
+      ["sma", ["5"]],
+      ["ema", ["0.2"]],
+      ["middle_index", []],
+    ];
+    for (const [aggregate, parameter] of cases) {
+      const captured: CapturedQuery[] = [];
+      const provider = createHistoryProviderV2(
+        makeMockClient(captured),
+        SELF_CONTEXT,
+      );
 
-    // 60 days at 1s would be 5.18M buckets — but sma reads raw rows under a
-    // LIMIT, so the cap must not apply.
-    await provider.getValues({
-      from: { toString: () => "2024-01-01T00:00:00Z" },
-      to: { toString: () => "2024-03-01T00:00:00Z" },
-      resolution: 1,
-      pathSpecs: [
-        {
-          path: "navigation.speedOverGround",
-          aggregate: "sma",
-          parameter: ["5"],
-        },
-      ],
-    } as any);
+      await provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-03-01T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          { path: "navigation.speedOverGround", aggregate, parameter },
+        ],
+      } as any);
 
-    assert.equal(captured.length, 1);
-    assert.ok(captured[0].sql.includes("LIMIT 50000"));
+      assert.equal(captured.length, 1, `no query captured for '${aggregate}'`);
+      assert.ok(
+        captured[0].sql.includes("LIMIT 50000") &&
+          !captured[0].sql.includes("SAMPLE BY"),
+        `expected raw-row LIMIT query for '${aggregate}', got: ${captured[0].sql}`,
+      );
+    }
   });
 });
