@@ -15,23 +15,44 @@ interface Delta {
 }
 
 // v1 replays raw deltas rather than aggregating, so all three value tables can
-// be read in one pass and interleaved by timestamp. Values are unified into a
-// single `value` column: numbers stay numbers, signalk_str rows come back as
-// their stored text (booleans as "true"/"false"), and positions are
-// reassembled into the {latitude, longitude} object a delta carries.
+// be read in one pass and interleaved by timestamp. Every branch below emits
+// the same unified shape — ts, path, context, valuetext, kind — which
+// decodeValue turns back into the real delta value; the CASTs exist to keep
+// the union's column types compatible.
 //
-// Position rows have no `path` column — the table is the vessel track — so the
-// path is supplied as a literal. CAST keeps the union's column types
-// compatible across branches; the reader turns them back into real values.
-// The signalk_str branch, with or without the value_kind tag. ensureTables()
-// adds that column at startup, but a read racing an unmigrated table (or an
+// One builder per table, shared by BOTH query shapes (windowed streaming and
+// the LATEST ON snapshot). `tail` carries what the caller appends inside the
+// branch — the snapshot's LATEST ON clause. Keeping every branch here is the
+// point: the snapshot query used to re-implement these by hand and drifted,
+// silently replaying booleans as text on that path only.
+function numBranch(where: string, tail = ""): string {
+  return (
+    `SELECT ts, path, context, CAST(value AS STRING) valuetext, ` +
+    `'number' kind FROM signalk WHERE ${where}${tail}`
+  );
+}
+
+// `withKind: false` degrades to the pre-migration shape. ensureTables() adds
+// value_kind at startup, but a read racing an unmigrated table (or an
 // external QuestDB the plugin does not own) would otherwise fail the WHOLE
 // union with "Invalid column: value_kind" — turning a missing type tag into
-// no history at all. `withKind: false` degrades to the pre-migration
-// behaviour: every string row replays as text.
-function strBranch(where: string, withKind: boolean): string {
-  const kind = withKind ? `CAST(value_kind AS STRING)` : `NULL`;
-  return `SELECT ts, path, context, value_str valuetext, ${kind} kind FROM signalk_str WHERE ${where}`;
+// no history at all. The NULL is cast so the union's column type is stated
+// rather than inferred.
+function strBranch(where: string, withKind: boolean, tail = ""): string {
+  const kind = withKind ? `CAST(value_kind AS STRING)` : `CAST(NULL AS STRING)`;
+  return (
+    `SELECT ts, path, context, value_str valuetext, ${kind} kind ` +
+    `FROM signalk_str WHERE ${where}${tail}`
+  );
+}
+
+// The track table has no path column, so the path is supplied as a literal.
+function posBranch(where: string, tail = ""): string {
+  return (
+    `SELECT ts, 'navigation.position' path, context, ` +
+    `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, ` +
+    `'position' kind FROM signalk_position WHERE ${where}${tail}`
+  );
 }
 
 function unionValueRowsSQL(
@@ -40,14 +61,9 @@ function unionValueRowsSQL(
   withKind = true,
 ): string {
   return (
-    `SELECT ts, path, context, CAST(value AS STRING) valuetext, 'number' kind FROM signalk WHERE ${where}` +
-    ` UNION ALL ` +
-    strBranch(where, withKind) +
-    ` UNION ALL ` +
-    `SELECT ts, 'navigation.position' path, context, ` +
-    `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, 'position' kind ` +
-    `FROM signalk_position WHERE ${where}` +
-    ` ${orderAndLimit}`
+    `${numBranch(where)} UNION ALL ` +
+    `${strBranch(where, withKind)} UNION ALL ` +
+    `${posBranch(where)} ${orderAndLimit}`
   );
 }
 
@@ -299,15 +315,15 @@ export function createHistoryProviderV1(
     // instead of using each table's index, which timed out (>30s) on a
     // multi-hundred-million-row install. Position partitions by context only
     // — the track table has no path column.
+    const at = `ts <= '${ts}'`;
+    const byPath = ` LATEST ON ts PARTITION BY path, context`;
+    const byContext = ` LATEST ON ts PARTITION BY context`;
     const snapshotSQL = (withKind: boolean) =>
-      `(SELECT ts, path, context, CAST(value AS STRING) valuetext, 'number' kind ` +
-      `FROM signalk WHERE ts <= '${ts}' LATEST ON ts PARTITION BY path, context)` +
+      `(${numBranch(at, byPath)})` +
       ` UNION ALL ` +
-      `(${strBranch(`ts <= '${ts}'`, withKind)} LATEST ON ts PARTITION BY path, context)` +
+      `(${strBranch(at, withKind, byPath)})` +
       ` UNION ALL ` +
-      `(SELECT ts, 'navigation.position' path, context, ` +
-      `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, 'position' kind ` +
-      `FROM signalk_position WHERE ts <= '${ts}' LATEST ON ts PARTITION BY context)`;
+      `(${posBranch(at, byContext)})`;
 
     queryClient
       .exec(snapshotSQL(true))
