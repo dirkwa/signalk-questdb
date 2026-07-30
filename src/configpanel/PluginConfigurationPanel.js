@@ -788,8 +788,11 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                         the {formatNumber(t.txnLag)} pending transactions for
                         nothing, so no repair button is offered. Recovering this
                         table means repairing its commit record by hand; please
-                        open an issue with the error below. Recording continues
-                        into the other tables.
+                        open an issue with the error above. Recording continues
+                        into the other tables, and &ldquo;Resume
+                        recording&rdquo; will re-suspend this one within
+                        milliseconds — it is safe to press, but it cannot repair
+                        this damage.
                       </div>
                     );
                   }

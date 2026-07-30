@@ -445,6 +445,23 @@ describe("isPartitionOpenFailure", () => {
     }
   });
 
+  it("does not classify on the table name or error prose", () => {
+    // The captured entry includes QuestDB's `[table=..., error=...]` header.
+    // Matching a bare word anywhere in it would misfire on a user's table
+    // name or on wording inside an unrelated error — and a false positive
+    // withholds a skip that would actually have repaired the table.
+    const tableNamed = [
+      "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=openPartition~3, error=io.questdb.cairo.CairoException: could not open, out of disk space",
+      "]",
+    ];
+    const prose = [
+      "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk~3, error=io.questdb.cairo.CairoException: openPartition budget exceeded",
+      "]",
+    ];
+    assert.equal(isPartitionOpenFailure(extractApplyError(tableNamed)), false);
+    assert.equal(isPartitionOpenFailure(extractApplyError(prose)), false);
+  });
+
   it("treats a missing diagnosis as not-this-class", () => {
     // No engine log (container recreated, log API unavailable): must not
     // withhold the skip on speculation.

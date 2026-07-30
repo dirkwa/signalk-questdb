@@ -179,8 +179,14 @@ export function extractApplyError(
 // Frames that only appear when the writer dies OPENING the table's partition
 // (or reading the commit record that describes it), rather than while reading
 // a pending WAL segment.
-const PARTITION_OPEN_FRAMES =
-  /\b(openPartition|openLastPartition|TableReader\.openPartition|TxReader\.unsafeLoadAll|ColumnVersionReader\.readUnsafe)\b/;
+//
+// Anchored to a stack-trace line (`\tat io.questdb...method(File.java:12)`)
+// rather than matched anywhere in the entry: the captured text also contains
+// QuestDB's `[table=<name>, error=<message>]` header, so a bare word match
+// would classify on a user's table name or on prose inside an error message.
+// A false positive here silently withholds a skip that would have worked.
+const PARTITION_OPEN_FRAME =
+  /^\s*at\s+[\w.$]*\b(?:openPartition|openLastPartition|unsafeLoadAll|readUnsafe)\s*\(/m;
 
 // True when the apply failure happened before any transaction could be
 // applied, i.e. while opening the existing partition data.
@@ -200,7 +206,7 @@ const PARTITION_OPEN_FRAMES =
 //     surgery on QuestDB internals, not something to drive from a button.
 export function isPartitionOpenFailure(applyError: string | null): boolean {
   if (!applyError) return false;
-  return PARTITION_OPEN_FRAMES.test(applyError);
+  return PARTITION_OPEN_FRAME.test(applyError);
 }
 
 export type AutoResumeOutcome = "pending" | "failed";
