@@ -14,6 +14,7 @@ import {
   buildPendingSegmentsSQL,
   computeSkipPlan,
   extractApplyError,
+  isPartitionOpenFailure,
   skipPlansEqual,
   type PendingSegment,
   type SuspendedTable,
@@ -29,6 +30,7 @@ import {
   type Endpoint,
 } from "./questdb-endpoint";
 import { readMaxMapCount } from "./host-limits";
+import { buildContainerEnv } from "./container-env";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -822,29 +824,7 @@ module.exports = (app: App) => {
 
       app.debug("container runtime ready, starting QuestDB");
       try {
-        const containerEnv: Record<string, string> = {
-          QDB_TELEMETRY_ENABLED: "false",
-          QDB_HTTP_ENABLED: "true",
-          QDB_LINE_TCP_ENABLED: "true",
-          // Reduce CPU usage on low-power devices (Pi, Cerbo)
-          QDB_CAIRO_WAL_APPLY_WORKER_COUNT: "1",
-          QDB_SHARED_WORKER_COUNT: "1",
-          QDB_LINE_TCP_WRITER_WORKER_COUNT: "1",
-          QDB_CAIRO_O3_COLUMN_MEMORY_SIZE: "262144",
-          ...(config.compression && config.compression !== "none"
-            ? {
-                QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
-                  config.compression === "zstd" ? "ZSTD" : "LZ4",
-                ...(config.compression === "zstd" && config.compressionLevel
-                  ? {
-                      QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
-                        config.compressionLevel,
-                      ),
-                    }
-                  : {}),
-              }
-            : {}),
-        };
+        const containerEnv = buildContainerEnv(config);
 
         const volumeSource = await resolveQuestdbVolumeSource(containers);
         if (signal.aborted) return;
@@ -1537,26 +1517,7 @@ module.exports = (app: App) => {
               volumes: {
                 "/var/lib/questdb": updateVolumeSource,
               },
-              env: {
-                QDB_TELEMETRY_ENABLED: "false",
-                QDB_HTTP_ENABLED: "true",
-                QDB_LINE_TCP_ENABLED: "true",
-                ...(currentConfig?.compression &&
-                currentConfig.compression !== "none"
-                  ? {
-                      QDB_CAIRO_WAL_SEGMENT_COMPRESSION_CODEC:
-                        currentConfig.compression === "zstd" ? "ZSTD" : "LZ4",
-                      ...(currentConfig.compression === "zstd" &&
-                      currentConfig.compressionLevel
-                        ? {
-                            QDB_CAIRO_WAL_SEGMENT_COMPRESSION_LEVEL: String(
-                              currentConfig.compressionLevel,
-                            ),
-                          }
-                        : {}),
-                    }
-                  : {}),
-              },
+              env: buildContainerEnv(currentConfig ?? {}),
               restart: "unless-stopped",
               resources: currentConfig
                 ? buildResourceLimits(currentConfig)
@@ -1770,6 +1731,14 @@ module.exports = (app: App) => {
               // report the rest of the diagnosis without a skip plan.
               segmentError = err instanceof Error ? err.message : String(err);
             }
+            const applyError = logLines
+              ? extractApplyError(logLines, table.name)
+              : null;
+            // A torn applied partition fails at open, before any transaction
+            // is read, so no RESUME WAL target can get past it. Withhold the
+            // skip plan entirely rather than let the panel offer a repair
+            // that destroys the backlog and still leaves the table suspended.
+            const partitionOpenFailure = isPartitionOpenFailure(applyError);
             tables.push({
               ...table,
               autoResume: walMonitor?.outcomeFor(table.name) ?? null,
@@ -1777,11 +1746,10 @@ module.exports = (app: App) => {
               suspendedSince:
                 segments.length > 0 ? segments[0].minTimestamp : null,
               pendingSegments: segments.length,
-              skipPlan: computeSkipPlan(segments),
+              skipPlan: partitionOpenFailure ? null : computeSkipPlan(segments),
+              partitionOpenFailure,
               segmentError,
-              applyError: logLines
-                ? extractApplyError(logLines, table.name)
-                : null,
+              applyError,
             });
           }
           res.json({ tables });
@@ -1879,6 +1847,24 @@ module.exports = (app: App) => {
             res.status(409).json({
               error:
                 "The table's state changed while confirming the skip — nothing was skipped. Re-run the diagnosis.",
+            });
+            return;
+          }
+          // The skip is pointless AND destructive when the writer is dying at
+          // partition open (torn `_txn` vs column data after a power cut): it
+          // drops the pending backlog and the table stays suspended. Re-scrape
+          // the engine log here, not from the client's stale diagnosis.
+          const preExecLog = await fetchEngineLogLines();
+          if (
+            preExecLog &&
+            isPartitionOpenFailure(extractApplyError(preExecLog, table))
+          ) {
+            res.status(409).json({
+              error:
+                `${table} is failing while opening its partition data, not while reading a WAL segment. ` +
+                "A skip cannot repair this — the writer never reaches the transactions it would skip — " +
+                "and it would drop the pending backlog for nothing. Nothing was skipped. This is a torn " +
+                "commit record (power loss under QuestDB's non-durable default), which needs manual repair.",
             });
             return;
           }

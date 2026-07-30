@@ -5,6 +5,7 @@ import {
   buildPendingSegmentsSQL,
   computeSkipPlan,
   extractApplyError,
+  isPartitionOpenFailure,
   skipPlansEqual,
   type PendingSegment,
   type SkipPlan,
@@ -382,5 +383,48 @@ describe("WalMonitor", () => {
     assert.equal(h.monitor.outcomeFor("signalk"), null);
     // Not fully resolved while one table is still suspended.
     assert.equal(h.resolvedCalls, 0);
+  });
+});
+
+describe("isPartitionOpenFailure", () => {
+  // Field report (issue #81): power loss left the `_txn` commit record
+  // claiming 1,403,951 rows while the column files held 1,402,837. The writer
+  // asserts while OPENING the partition, before it reads any transaction, so
+  // every RESUME WAL variant re-hits it.
+  const partitionOpenStack = [
+    "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk_str~8, seqTxn=57606, error=java.lang.AssertionError",
+    "\tat io.questdb.cairo.VarcharTypeDriver.getDataVectorSize(VarcharTypeDriver.java:175)",
+    "\tat io.questdb.cairo.TableReader.openPartition(TableReader.java:1234)",
+    "]",
+  ];
+
+  // The class we shipped the guided skip for: the failure is in the pending
+  // WAL segment's own files, which a bounded skip really can get past.
+  const segmentStack = [
+    "2026-07-17T22:22:51.000000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk_str~8, seqTxn=4672118, error=java.lang.AssertionError",
+    "\tat io.questdb.cairo.VarcharTypeDriver.getDataVectorSize(VarcharTypeDriver.java:175)",
+    "\tat io.questdb.cairo.wal.TableWriterSegmentFileCache.mmapSegments(TableWriterSegmentFileCache.java:200)",
+    "]",
+  ];
+
+  it("detects a failure while opening the applied partition", () => {
+    assert.equal(
+      isPartitionOpenFailure(extractApplyError(partitionOpenStack)),
+      true,
+    );
+  });
+
+  it("does not flag an unreadable WAL segment, which a skip can repair", () => {
+    assert.equal(
+      isPartitionOpenFailure(extractApplyError(segmentStack)),
+      false,
+    );
+  });
+
+  it("treats a missing diagnosis as not-this-class", () => {
+    // No engine log (container recreated, log API unavailable): must not
+    // withhold the skip on speculation.
+    assert.equal(isPartitionOpenFailure(null), false);
+    assert.equal(isPartitionOpenFailure(""), false);
   });
 });

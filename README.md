@@ -158,6 +158,31 @@ whether Signal K runs on bare metal or is itself containerized:
 In **external mode** (`Managed container` off) the plugin connects to the
 QuestDB you point it at via `QuestDB host` + the HTTP/ILP ports.
 
+## Durability on power loss
+
+The managed container runs QuestDB with `cairo.commit.mode=sync`.
+
+QuestDB's default is `nosync`: nothing on the ingest path is ever fsynced, and
+durability is left to the OS page cache. On a power cut an arbitrary subset of
+recent writes survives — including the case where a commit record reaches disk
+while the row data it describes does not. QuestDB then fails while _opening_
+that table's partition, which suspends the table permanently: neither a
+lossless `RESUME WAL` nor a bounded `RESUME WAL FROM TXN` skip can get past it,
+because the failure happens before any transaction is read. Repair means
+hand-patching the commit record.
+
+With `sync`, partition columns are fsynced before the commit record is written
+and WAL segments are fsynced on commit, so the stored state can never claim
+data that isn't durable. The cost is a few fsyncs per commit interval — writes
+are already batched (see `ilpFlushIntervalMs`), so at boat data rates it is
+negligible against losing a table.
+
+**Running an external QuestDB?** Set this yourself in `server.conf`:
+
+```
+cairo.commit.mode=sync
+```
+
 ## QuestDB Web Console
 
 QuestDB ships a web console (SQL editor + import UI) on its HTTP port. See the

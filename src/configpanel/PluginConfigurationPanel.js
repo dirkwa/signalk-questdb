@@ -769,6 +769,30 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                   const diag = (walDiag?.tables || []).find(
                     (d) => d.name === t.name,
                   );
+                  // Torn applied partition: the writer dies opening the
+                  // partition, so no RESUME WAL target helps. Say so instead
+                  // of offering a skip that loses the backlog for nothing.
+                  if (diag?.partitionOpenFailure) {
+                    return (
+                      <div key={t.name} style={{ marginTop: 12 }}>
+                        <div style={S.warnBannerTitle}>
+                          {t.name}: table data damaged — automatic repair not
+                          possible
+                        </div>
+                        QuestDB fails while opening this table&apos;s stored
+                        data, before it reaches any pending transaction. That
+                        means the commit record on disk describes rows whose
+                        data never made it to storage — the signature of a power
+                        loss during a write. Skipping transactions cannot fix
+                        this (the failure happens before them) and would discard
+                        the {formatNumber(t.txnLag)} pending transactions for
+                        nothing, so no repair button is offered. Recovering this
+                        table means repairing its commit record by hand; please
+                        open an issue with the error below. Recording continues
+                        into the other tables.
+                      </div>
+                    );
+                  }
                   const plan = diag?.skipPlan;
                   if (!plan) return null;
                   return (
