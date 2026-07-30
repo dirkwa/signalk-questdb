@@ -503,6 +503,61 @@ describe("history-v2 string-table fallback", () => {
     assert.equal(result.values[0].method, "first");
   });
 
+  it("replays a tagged boolean as a boolean, matching v1", async () => {
+    // The same path must not read `true` through v1 and `"true"` through v2.
+    const provider = createHistoryProviderV2(
+      mockClient([], (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "true", "boolean"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("electrical.switches.bilgePump.state"),
+    );
+    assert.equal(result.data[0][1], true);
+  });
+
+  it('leaves an untagged "true" as text', async () => {
+    // A path whose value genuinely is the word "true" carries no tag, as do
+    // all rows written before value_kind existed.
+    const provider = createHistoryProviderV2(
+      mockClient([], (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "true", null]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(query("navigation.state"));
+    assert.equal(result.data[0][1], "true");
+  });
+
+  it("degrades to text when value_kind is not migrated yet", async () => {
+    // A read racing ensureTables(), or an external QuestDB, must not lose the
+    // whole response to "Invalid column: value_kind".
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) => {
+        if (sql.includes("value_kind") && !sql.includes("NULL as value_kind")) {
+          throw new Error(
+            "QuestDB query failed (400): Invalid column: value_kind",
+          );
+        }
+        return sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "true", null]]
+          : [];
+      }),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(query("some.path"));
+    assert.equal(result.data[0][1], "true");
+  });
+
   it("aggregates a downsampled string path with last(), not avg()", async () => {
     const captured: CapturedQuery[] = [];
     const provider = createHistoryProviderV2(
