@@ -254,8 +254,10 @@ describe("history-v2 sample bucket guard", () => {
     } as any);
 
     // The mock returns no rows, so the string-table fallback also runs; both
-    // queries must carry the clamped period, never `SAMPLE BY 0s`.
-    assert.ok(captured.length >= 1);
+    // queries must carry the clamped period, never `SAMPLE BY 0s`. Assert the
+    // fallback actually fired, so this cannot pass by silently skipping it.
+    const stringQuery = captured.find(({ sql }) => sql.includes("signalk_str"));
+    assert.ok(stringQuery, "expected a string-table fallback query");
     for (const { sql } of captured) {
       assert.ok(
         sql.includes("SAMPLE BY 1s"),
