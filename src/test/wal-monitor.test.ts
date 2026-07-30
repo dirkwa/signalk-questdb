@@ -5,6 +5,7 @@ import {
   buildPendingSegmentsSQL,
   computeSkipPlan,
   extractApplyError,
+  isPartitionOpenFailure,
   skipPlansEqual,
   type PendingSegment,
   type SkipPlan,
@@ -382,5 +383,100 @@ describe("WalMonitor", () => {
     assert.equal(h.monitor.outcomeFor("signalk"), null);
     // Not fully resolved while one table is still suspended.
     assert.equal(h.resolvedCalls, 0);
+  });
+});
+
+describe("isPartitionOpenFailure", () => {
+  // Field report (issue #81): power loss left the `_txn` commit record
+  // claiming 1,403,951 rows while the column files held 1,402,837. The writer
+  // asserts while OPENING the partition, before it reads any transaction, so
+  // every RESUME WAL variant re-hits it.
+  const partitionOpenStack = [
+    "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk_str~8, seqTxn=57606, error=java.lang.AssertionError",
+    "\tat io.questdb.cairo.VarcharTypeDriver.getDataVectorSize(VarcharTypeDriver.java:175)",
+    "\tat io.questdb.cairo.TableReader.openPartition(TableReader.java:1234)",
+    "]",
+  ];
+
+  // The class we shipped the guided skip for: the failure is in the pending
+  // WAL segment's own files, which a bounded skip really can get past.
+  const segmentStack = [
+    "2026-07-17T22:22:51.000000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk_str~8, seqTxn=4672118, error=java.lang.AssertionError",
+    "\tat io.questdb.cairo.VarcharTypeDriver.getDataVectorSize(VarcharTypeDriver.java:175)",
+    "\tat io.questdb.cairo.wal.TableWriterSegmentFileCache.mmapSegments(TableWriterSegmentFileCache.java:200)",
+    "]",
+  ];
+
+  it("detects a failure while opening the applied partition", () => {
+    assert.equal(
+      isPartitionOpenFailure(extractApplyError(partitionOpenStack)),
+      true,
+    );
+  });
+
+  it("does not flag an unreadable WAL segment, which a skip can repair", () => {
+    assert.equal(
+      isPartitionOpenFailure(extractApplyError(segmentStack)),
+      false,
+    );
+  });
+
+  it("detects every partition-open frame the classifier accepts", () => {
+    // Each alternative in the pattern is a distinct way the writer reports
+    // dying before it reads a transaction; an untested one can silently stop
+    // matching.
+    const frames = [
+      "io.questdb.cairo.TableReader.openPartition(TableReader.java:1234)",
+      "io.questdb.cairo.TableWriter.openLastPartition(TableWriter.java:4242)",
+      "io.questdb.cairo.TxReader.unsafeLoadAll(TxReader.java:311)",
+      "io.questdb.cairo.ColumnVersionReader.readUnsafe(ColumnVersionReader.java:98)",
+    ];
+    for (const frame of frames) {
+      const log = [
+        "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk_str~8, error=java.lang.AssertionError",
+        `\tat ${frame}`,
+        "]",
+      ];
+      assert.equal(
+        isPartitionOpenFailure(extractApplyError(log)),
+        true,
+        `expected ${frame} to classify as a partition-open failure`,
+      );
+    }
+  });
+
+  it("does not classify on the table name or error prose", () => {
+    // The captured entry includes QuestDB's `[table=..., error=...]` header.
+    // Matching a bare word anywhere in it would misfire on a user's table
+    // name or on wording inside an unrelated error — and a false positive
+    // withholds a skip that would actually have repaired the table.
+    const tableNamed = [
+      "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=openPartition~3, error=io.questdb.cairo.CairoException: could not open, out of disk space",
+      "]",
+    ];
+    const prose = [
+      "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk~3, error=io.questdb.cairo.CairoException: openPartition budget exceeded",
+      "]",
+    ];
+    assert.equal(isPartitionOpenFailure(extractApplyError(tableNamed)), false);
+    assert.equal(isPartitionOpenFailure(extractApplyError(prose)), false);
+  });
+
+  it("does not classify a same-named frame from another library", () => {
+    // The method names are not unique to QuestDB; without the namespace
+    // anchor an unrelated dependency's frame would suppress a valid skip.
+    const foreign = [
+      "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk~3, error=java.lang.AssertionError",
+      "\tat com.example.storage.Writer.openPartition(Writer.java:88)",
+      "]",
+    ];
+    assert.equal(isPartitionOpenFailure(extractApplyError(foreign)), false);
+  });
+
+  it("treats a missing diagnosis as not-this-class", () => {
+    // No engine log (container recreated, log API unavailable): must not
+    // withhold the skip on speculation.
+    assert.equal(isPartitionOpenFailure(null), false);
+    assert.equal(isPartitionOpenFailure(""), false);
   });
 });

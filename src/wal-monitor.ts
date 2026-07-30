@@ -176,6 +176,47 @@ export function extractApplyError(
   return collected.join("\n");
 }
 
+// Frames that only appear when the writer dies OPENING the table's partition
+// (or reading the commit record that describes it), rather than while reading
+// a pending WAL segment.
+//
+// Anchored to a stack-trace line inside QuestDB's own package
+// (`\tat io.questdb.cairo.TableReader.openPartition(TableReader.java:12)`).
+// Both halves of that anchor matter, and each closes a real false positive:
+// the captured text also contains QuestDB's `[table=<name>, error=<message>]`
+// header, so an unanchored word matches a user's table name or error prose;
+// and without the namespace, an unrelated library's `openPartition` frame
+// matches too. A false positive silently withholds a skip that would have
+// repaired the table, so this errs toward not classifying.
+//
+// The class name is left open (rather than whitelisting exact pairs) so an
+// upstream refactor that moves these methods still matches; the namespace
+// plus the method set is specific enough that nothing else realistically
+// collides.
+const PARTITION_OPEN_FRAME =
+  /^\s*at\s+io\.questdb\.[\w.$]*\b(?:openPartition|openLastPartition|unsafeLoadAll|readUnsafe)\s*\(/m;
+
+// True when the apply failure happened before any transaction could be
+// applied, i.e. while opening the existing partition data.
+//
+// This distinguishes the two corruption classes, which look identical in
+// wal_tables() but have opposite remedies:
+//
+//   - unreadable WAL SEGMENT — the pending data is bad; skipping past it with
+//     RESUME WAL FROM TXN gets the table running again at a bounded cost.
+//   - torn APPLIED PARTITION (power loss under the default nosync commit
+//     mode: the `_txn` commit record reached disk claiming rows whose column
+//     data did not) — the writer asserts while opening that partition, before
+//     it looks at any transaction. Every RESUME WAL variant re-hits it no
+//     matter which txn it starts from, so offering the lossy skip here
+//     destroys the pending backlog and still leaves the table suspended.
+//     Repair means restoring `_txn` to the durable on-disk prefix, which is
+//     surgery on QuestDB internals, not something to drive from a button.
+export function isPartitionOpenFailure(applyError: string | null): boolean {
+  if (!applyError) return false;
+  return PARTITION_OPEN_FRAME.test(applyError);
+}
+
 export type AutoResumeOutcome = "pending" | "failed";
 
 export interface WalMonitorDeps {
