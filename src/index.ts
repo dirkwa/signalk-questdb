@@ -1004,7 +1004,16 @@ module.exports = (app: App) => {
       } else if (route === "string") {
         writer.writeString(path, ctx, value as string);
       } else if (route === "boolean") {
-        writer.writeString(path, ctx, value ? "true" : "false");
+        // Tagged, so a replayed boolean stays a boolean instead of becoming
+        // the text "true" — indistinguishable from a path whose value really
+        // is that word.
+        writer.writeString(
+          path,
+          ctx,
+          value ? "true" : "false",
+          undefined,
+          "boolean",
+        );
       } else if (route === "position") {
         writer.writePosition(
           ctx,

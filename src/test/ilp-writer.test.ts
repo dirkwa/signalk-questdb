@@ -78,6 +78,47 @@ describe("ILPWriter", () => {
     );
   });
 
+  it("tags booleans with value_kind and leaves text untagged", async () => {
+    // value_kind is what keeps a recorded boolean distinguishable from a
+    // path whose text value is literally "true". Text must stay untagged so
+    // it reads back exactly like rows written before the column existed.
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (chunk) => received.push(chunk.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
+    await writer.connect();
+
+    const ts = new Date("2024-06-15T12:00:00.000Z");
+    writer.writeString("switches.bilge.state", "self", "true", ts, "boolean");
+    writer.writeString("some.text.path", "self", "true", ts);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await writer.disconnect();
+    server.close();
+
+    const all = received.join("");
+    assert.ok(
+      all.includes(
+        'signalk_str,path=switches.bilge.state,context=self,value_kind=boolean value_str="true"',
+      ),
+      `Expected a tagged boolean line in: ${all}`,
+    );
+    assert.ok(
+      all.includes(
+        'signalk_str,path=some.text.path,context=self value_str="true"',
+      ),
+      `Expected an untagged text line in: ${all}`,
+    );
+  });
+
   it("sends position data to signalk_position table", async () => {
     const received: string[] = [];
 

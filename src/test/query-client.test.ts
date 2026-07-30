@@ -295,3 +295,30 @@ describe("QueryClient statement timeout header", () => {
     assert.equal(headers["statement-timeout"], "12345");
   });
 });
+
+describe("QueryClient.ensureTables schema migration", () => {
+  it("creates signalk_str with value_kind and migrates existing tables", async () => {
+    // CREATE TABLE IF NOT EXISTS leaves a pre-existing table untouched, so
+    // installs that predate value_kind need the explicit ALTER. It must run
+    // unconditionally (it is idempotent) or those installs never gain the
+    // column and every replayed boolean silently degrades to text.
+    const { client, sql } = stubClient(() => emptyResult);
+    await client.ensureTables();
+
+    const created = sql.find((q) =>
+      q.includes("CREATE TABLE IF NOT EXISTS signalk_str"),
+    );
+    assert.ok(created, "expected signalk_str to be created");
+    assert.ok(
+      created.includes("value_kind"),
+      `new tables must include value_kind, got: ${created}`,
+    );
+
+    const altered = sql.find((q) => q.includes("ALTER TABLE signalk_str"));
+    assert.ok(altered, "expected the migration ALTER for existing tables");
+    assert.ok(
+      altered.includes("ADD COLUMN IF NOT EXISTS value_kind"),
+      `migration must be idempotent, got: ${altered}`,
+    );
+  });
+});

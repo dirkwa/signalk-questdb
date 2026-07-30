@@ -128,15 +128,26 @@ export class QueryClient {
 
     await this.exec(`
       CREATE TABLE IF NOT EXISTS signalk_str (
-        ts        TIMESTAMP,
-        path      SYMBOL CAPACITY 256 CACHE,
-        context   SYMBOL CAPACITY 128 CACHE,
-        value_str VARCHAR
+        ts         TIMESTAMP,
+        path       SYMBOL CAPACITY 256 CACHE,
+        context    SYMBOL CAPACITY 128 CACHE,
+        value_str  VARCHAR,
+        value_kind SYMBOL CAPACITY 8 CACHE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
         DEDUP UPSERT KEYS(ts, path, context)
     `);
+
+    // Tables created before value_kind existed keep working: CREATE TABLE IF
+    // NOT EXISTS leaves them untouched, so add the column separately. Rows
+    // written before this migration have value_kind = null, which readers
+    // treat as "text" — the original type of those rows is not recoverable,
+    // and guessing from the text would turn a legitimate "true" string into a
+    // boolean. Idempotent, so it can run on every start.
+    await this.exec(
+      `ALTER TABLE signalk_str ADD COLUMN IF NOT EXISTS value_kind SYMBOL CAPACITY 8 CACHE`,
+    );
 
     await this.exec(`
       CREATE TABLE IF NOT EXISTS signalk_position (

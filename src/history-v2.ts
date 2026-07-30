@@ -156,12 +156,27 @@ export function createHistoryProviderV2(
     where: string,
     resolution?: number,
   ): Promise<[string, unknown][]> {
-    const sql =
-      resolution && resolution > 0
-        ? `SELECT ts, last(value_str) as value_str FROM signalk_str WHERE ${where} SAMPLE BY ${effectiveResolution(resolution)}s FILL(NULL) ORDER BY ts`
-        : `SELECT ts, value_str FROM signalk_str WHERE ${where} ORDER BY ts LIMIT 10000`;
-    const result = await queryClient.exec(sql);
-    return result.dataset.map((row) => [row[0] as string, row[1]]);
+    // `value_kind` marks rows that were recorded as booleans, so v2 replays
+    // them as real booleans exactly like v1 — otherwise the same path would
+    // read `true` through one API and `"true"` through the other. Untagged
+    // rows (plain text, and everything written before the column existed)
+    // stay strings; the text is never guessed at.
+    const sql = (withKind: boolean) => {
+      const kind = withKind ? "value_kind" : "NULL";
+      return resolution && resolution > 0
+        ? `SELECT ts, last(value_str) as value_str, last(${kind}) as value_kind FROM signalk_str WHERE ${where} SAMPLE BY ${effectiveResolution(resolution)}s FILL(NULL) ORDER BY ts`
+        : `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${where} ORDER BY ts LIMIT 10000`;
+    };
+    // A read racing ensureTables()'s migration — or an external QuestDB the
+    // plugin does not own — must degrade to text, not fail the request.
+    const result = await queryClient.exec(sql(true)).catch((err) => {
+      if (!/Invalid column:\s*value_kind/i.test(String(err))) throw err;
+      return queryClient.exec(sql(false));
+    });
+    return result.dataset.map((row) => [
+      row[0] as string,
+      row[2] === "boolean" ? row[1] === "true" : row[1],
+    ]);
   }
 
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
