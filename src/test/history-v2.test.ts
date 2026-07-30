@@ -581,19 +581,24 @@ describe("history-v2 string-table fallback", () => {
 });
 
 describe("history-v2 path and context discovery", () => {
-  function captureClient(captured: CapturedQuery[]) {
+  type QueryClientArg = Parameters<typeof createHistoryProviderV2>[0];
+  type RangeArg = Parameters<
+    ReturnType<typeof createHistoryProviderV2>["getPaths"]
+  >[0];
+
+  function captureClient(captured: CapturedQuery[]): QueryClientArg {
     return {
       exec: async (sql: string) => {
         captured.push({ sql });
         return { columns: [], dataset: [], count: 0, timestamp: 0 };
       },
-    } as any;
+    } as unknown as QueryClientArg;
   }
 
-  const range = {
-    from: { toString: () => "2024-01-01T00:00:00Z" },
+  const range: RangeArg = {
+    from: { toString: () => "2024-01-01T00:00:00Z", add: () => undefined },
     to: { toString: () => "2024-01-01T01:00:00Z" },
-  } as any;
+  };
 
   it("advertises navigation.position in getPaths", async () => {
     // The track table has no `path` column, so it was omitted entirely:
