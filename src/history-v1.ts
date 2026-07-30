@@ -14,6 +14,63 @@ interface Delta {
   }[];
 }
 
+// v1 replays raw deltas rather than aggregating, so all three value tables can
+// be read in one pass and interleaved by timestamp. Values are unified into a
+// single `value` column: numbers stay numbers, signalk_str rows come back as
+// their stored text (booleans as "true"/"false"), and positions are
+// reassembled into the {latitude, longitude} object a delta carries.
+//
+// Position rows have no `path` column — the table is the vessel track — so the
+// path is supplied as a literal. CAST keeps the union's column types
+// compatible across branches; the reader turns them back into real values.
+function unionValueRowsSQL(where: string, orderAndLimit: string): string {
+  return (
+    `SELECT ts, path, context, CAST(value AS STRING) valuetext, 'number' kind FROM signalk WHERE ${where}` +
+    ` UNION ALL ` +
+    // value_kind records the ORIGINAL type ('boolean', or null for text and
+    // for rows written before that column existed).
+    `SELECT ts, path, context, value_str valuetext, ` +
+    `CAST(value_kind AS STRING) kind FROM signalk_str WHERE ${where}` +
+    ` UNION ALL ` +
+    `SELECT ts, 'navigation.position' path, context, ` +
+    `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, 'position' kind ` +
+    `FROM signalk_position WHERE ${where}` +
+    ` ${orderAndLimit}`
+  );
+}
+
+// Turn a unified row back into the value a Signal K delta carries. Numbers
+// must not stay strings (consumers do arithmetic on them), positions must be
+// objects again, and a value recorded as a boolean must replay as a boolean.
+//
+// Only rows explicitly tagged 'boolean' are converted: the text is parsed
+// from the stored value, never guessed. A path whose value genuinely is the
+// word "true" carries no tag and stays a string — as do all rows written
+// before the value_kind column existed, whose original type is not
+// recoverable.
+function decodeValue(row: Record<string, unknown>): unknown {
+  const text = row.valuetext;
+  if (text === null || text === undefined) return null;
+  switch (row.kind) {
+    case "number": {
+      const n = Number(text);
+      return Number.isFinite(n) ? n : null;
+    }
+    case "boolean":
+      return String(text) === "true";
+    case "position": {
+      const [lat, lon] = String(text).split(",");
+      const latitude = Number(lat);
+      const longitude = Number(lon);
+      return Number.isFinite(latitude) && Number.isFinite(longitude)
+        ? { latitude, longitude }
+        : null;
+    }
+    default:
+      return text;
+  }
+}
+
 function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
   const byTimestamp = new Map<
     string,
@@ -24,7 +81,11 @@ function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
     const ts = row.ts as string;
     const context = (row.context as string) || "self";
     const path = row.path as string;
-    const value = row.value as unknown;
+    // Unified rows carry `valuetext` + `kind`; decodeValue reconstructs the
+    // real value. Rows that already have a plain `value` (older callers) are
+    // passed through unchanged.
+    const value =
+      "valuetext" in row ? decodeValue(row) : (row.value as unknown);
 
     if (!byTimestamp.has(ts)) {
       byTimestamp.set(ts, new Map());
@@ -59,9 +120,17 @@ export function createHistoryProviderV1(
     callback: (hasResults: boolean) => void,
   ): void {
     const startTime = validateTimestamp(options.startTime.toISOString());
+    // "Any data" must consider every value table: a vessel recording only
+    // string/boolean channels (or only a position track) has history to play
+    // back, and answering false here disables playback entirely.
     queryClient
       .exec(
-        `SELECT count() as cnt FROM signalk WHERE ts >= '${startTime}' LIMIT 1`,
+        // Summed via a UNION ALL subquery: QuestDB rejects adding scalar
+        // subqueries with `+` ("no matching operator").
+        `SELECT sum(c) as cnt FROM (` +
+          `SELECT count() c FROM signalk WHERE ts >= '${startTime}'` +
+          ` UNION ALL SELECT count() c FROM signalk_str WHERE ts >= '${startTime}'` +
+          ` UNION ALL SELECT count() c FROM signalk_position WHERE ts >= '${startTime}')`,
       )
       .then((result) => {
         const count =
@@ -87,6 +156,9 @@ export function createHistoryProviderV1(
     const playbackRate = Math.max(1, options.playbackRate);
 
     const CHUNK_SECONDS = 60;
+    // Rows per read. A window holding more than this is drained across
+    // several reads rather than truncated (see the resume logic below).
+    const CHUNK_ROW_LIMIT = 10000;
     let currentTime = new Date(startTime);
 
     async function streamChunk() {
@@ -98,7 +170,10 @@ export function createHistoryProviderV1(
 
       try {
         const result = await queryClient.exec(
-          `SELECT ts, path, context, value FROM signalk WHERE ts >= '${from}' AND ts < '${to}' ORDER BY ts LIMIT 10000`,
+          unionValueRowsSQL(
+            `ts >= '${from}' AND ts < '${to}'`,
+            `ORDER BY ts LIMIT ${CHUNK_ROW_LIMIT}`,
+          ),
         );
 
         if (result.dataset.length === 0) {
@@ -121,6 +196,35 @@ export function createHistoryProviderV1(
             ...delta,
             context: resolvedContext,
           });
+        }
+
+        // A busy interval can hold more rows than one read returns — querying
+        // three tables instead of one makes that far likelier (a live install
+        // already reaches ~6k rows per 60s window). Advancing to chunkEnd
+        // after a truncated read would skip the remainder silently, so drain
+        // the window before moving on.
+        //
+        // Resume AT the last sent row's timestamp, not past it: QuestDB
+        // stamps at microsecond precision but JS Date truncates to
+        // milliseconds, and a single instrument update commonly stamps
+        // several paths within the same millisecond. Stepping past it would
+        // drop the siblings that did not fit in this page. Re-reading that
+        // millisecond can re-send rows already delivered, which is harmless
+        // on replay — losing them is not.
+        //
+        // Only when the whole page shared currentTime's millisecond (so
+        // resuming at it would repeat the identical read forever) does the
+        // cursor step forward by 1ms, trading that millisecond's tail for
+        // guaranteed progress.
+        if (result.dataset.length >= CHUNK_ROW_LIMIT) {
+          const lastTs = new Date(rows[rows.length - 1].ts as string).getTime();
+          const resumeAt =
+            lastTs > currentTime.getTime() ? lastTs : currentTime.getTime() + 1;
+          currentTime = new Date(Math.min(resumeAt, chunkEnd.getTime()));
+          if (!stopped) {
+            setTimeout(streamChunk, 0);
+          }
+          return;
         }
 
         currentTime = chunkEnd;
@@ -156,9 +260,23 @@ export function createHistoryProviderV1(
   ): void {
     const ts = validateTimestamp(date.toISOString());
 
+    // LATEST ON is applied PER TABLE and the results unioned, not the other
+    // way round: running it over a materialized union makes QuestDB scan
+    // instead of using each table's index, which timed out (>30s) on a
+    // multi-hundred-million-row install. Position partitions by context only
+    // — the track table has no path column.
     queryClient
       .exec(
-        `SELECT path, value, ts, context FROM signalk WHERE ts <= '${ts}' LATEST ON ts PARTITION BY path`,
+        `(SELECT ts, path, context, CAST(value AS STRING) valuetext, 'number' kind ` +
+          `FROM signalk WHERE ts <= '${ts}' LATEST ON ts PARTITION BY path, context)` +
+          ` UNION ALL ` +
+          `(SELECT ts, path, context, value_str valuetext, ` +
+          `CAST(value_kind AS STRING) kind ` +
+          `FROM signalk_str WHERE ts <= '${ts}' LATEST ON ts PARTITION BY path, context)` +
+          ` UNION ALL ` +
+          `(SELECT ts, 'navigation.position' path, context, ` +
+          `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, 'position' kind ` +
+          `FROM signalk_position WHERE ts <= '${ts}' LATEST ON ts PARTITION BY context)`,
       )
       .then((result) => {
         const rows = queryClient.toObjects(result);

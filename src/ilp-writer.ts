@@ -280,15 +280,22 @@ export class ILPWriter {
     );
   }
 
+  // `kind` records what the value ORIGINALLY was, so a boolean recorded as
+  // "true" stays distinguishable from a path whose text value is the word
+  // "true". It is a tag (SYMBOL) because it has two values and is filtered
+  // on, never aggregated. Omitted for plain text, leaving value_kind null,
+  // which is exactly how rows written before the column existed read back.
   writeString(
     path: string,
     context: string,
     value: string,
     timestamp?: Date,
+    kind?: "boolean",
   ): void {
     const ts = this.nextNanos(timestamp);
+    const kindTag = kind ? `,value_kind=${escapeTag(kind)}` : "";
     this.enqueue(
-      `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)} value_str="${escapeFieldString(value)}" ${ts}\n`,
+      `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)}${kindTag} value_str="${escapeFieldString(value)}" ${ts}\n`,
     );
   }
 
