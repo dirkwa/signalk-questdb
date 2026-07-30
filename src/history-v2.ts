@@ -146,6 +146,24 @@ export function createHistoryProviderV2(
   queryClient: QueryClient,
   selfContext: string,
 ) {
+  // Read a path's rows from signalk_str. Numeric aggregates do not apply to
+  // text, so a downsampled request takes one representative value per bucket
+  // (last = the state in force at the bucket's end, which is what a state
+  // channel means) instead of averaging. Values are returned verbatim:
+  // booleans were stored as "true"/"false", so a consumer can tell them apart
+  // from real numbers, and Grafana value mappings work directly.
+  async function readStringRows(
+    where: string,
+    resolution?: number,
+  ): Promise<[string, unknown][]> {
+    const sql =
+      resolution && resolution > 0
+        ? `SELECT ts, last(value_str) as value_str FROM signalk_str WHERE ${where} SAMPLE BY ${effectiveResolution(resolution)}s FILL(NULL) ORDER BY ts`
+        : `SELECT ts, value_str FROM signalk_str WHERE ${where} ORDER BY ts LIMIT 10000`;
+    const result = await queryClient.exec(sql);
+    return result.dataset.map((row) => [row[0] as string, row[1]]);
+  }
+
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
     const range = resolveTimeRange(query as any);
 
@@ -254,6 +272,22 @@ export function createHistoryProviderV2(
         row[0] as string,
         row[1],
       ]);
+
+      // Non-numeric paths (strings, and booleans stored as "true"/"false")
+      // live in signalk_str, which this query never touches — they used to
+      // come back empty even though getPaths lists them. Fall back to the
+      // string table when the numeric one held nothing for this path.
+      // Emptiness is judged on VALUES, not row count: a SAMPLE BY with
+      // FILL(NULL) fabricates a row per bucket, so an all-null result is
+      // still "no numeric data here".
+      if (!rows.some(([, value]) => value !== null)) {
+        columnData.set(
+          spec.path,
+          await readStringRows(where, query.resolution),
+        );
+        continue;
+      }
+
       columnData.set(spec.path, rows);
     }
 

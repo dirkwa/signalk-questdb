@@ -1003,6 +1003,8 @@ module.exports = (app: App) => {
         writer.write(path, ctx, value as number);
       } else if (route === "string") {
         writer.writeString(path, ctx, value as string);
+      } else if (route === "boolean") {
+        writer.writeString(path, ctx, value ? "true" : "false");
       } else if (route === "position") {
         writer.writePosition(
           ctx,
