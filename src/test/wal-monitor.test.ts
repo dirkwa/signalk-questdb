@@ -421,6 +421,30 @@ describe("isPartitionOpenFailure", () => {
     );
   });
 
+  it("detects every partition-open frame the classifier accepts", () => {
+    // Each alternative in the pattern is a distinct way the writer reports
+    // dying before it reads a transaction; an untested one can silently stop
+    // matching.
+    const frames = [
+      "io.questdb.cairo.TableReader.openPartition(TableReader.java:1234)",
+      "io.questdb.cairo.TableWriter.openLastPartition(TableWriter.java:4242)",
+      "io.questdb.cairo.TxReader.unsafeLoadAll(TxReader.java:311)",
+      "io.questdb.cairo.ColumnVersionReader.readUnsafe(ColumnVersionReader.java:98)",
+    ];
+    for (const frame of frames) {
+      const log = [
+        "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk_str~8, error=java.lang.AssertionError",
+        `\tat ${frame}`,
+        "]",
+      ];
+      assert.equal(
+        isPartitionOpenFailure(extractApplyError(log)),
+        true,
+        `expected ${frame} to classify as a partition-open failure`,
+      );
+    }
+  });
+
   it("treats a missing diagnosis as not-this-class", () => {
     // No engine log (container recreated, log API unavailable): must not
     // withhold the skip on speculation.
