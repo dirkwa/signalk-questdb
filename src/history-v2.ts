@@ -281,6 +281,14 @@ export function createHistoryProviderV2(
       // FILL(NULL) fabricates a row per bucket, so an all-null result is
       // still "no numeric data here".
       if (!rows.some(([, value]) => value !== null)) {
+        // Report the aggregate that was actually applied. Downsampled string
+        // rows always use last() — averaging text is meaningless — so leaving
+        // the caller's requested method in the response would label the
+        // series with an aggregation that never ran.
+        if (query.resolution && query.resolution > 0) {
+          const reported = valuesList[valuesList.length - 1];
+          if (reported.path === spec.path) reported.method = "last";
+        }
         columnData.set(
           spec.path,
           await readStringRows(where, query.resolution),

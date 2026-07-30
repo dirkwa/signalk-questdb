@@ -346,14 +346,16 @@ describe("history-v2 string-table fallback", () => {
     } as any;
   }
 
-  const query = (path: string, extra: Record<string, unknown> = {}) =>
-    ({
+  const query = (path: string, extra: Record<string, unknown> = {}): any => {
+    const { aggregate = "first", ...rest } = extra;
+    return {
       from: { toString: () => "2024-01-01T00:00:00Z" },
       to: { toString: () => "2024-01-01T01:00:00Z" },
       context: "self",
-      pathSpecs: [{ path, aggregate: "first", parameter: [] }],
-      ...extra,
-    }) as any;
+      pathSpecs: [{ path, aggregate, parameter: [] }],
+      ...rest,
+    };
+  };
 
   it("serves a boolean path from signalk_str", async () => {
     const captured: CapturedQuery[] = [];
@@ -413,6 +415,42 @@ describe("history-v2 string-table fallback", () => {
     );
 
     assert.deepEqual(result.data, [["2024-01-01T00:00:00.000000Z", "false"]]);
+  });
+
+  it("reports last() as the method actually applied when downsampling", async () => {
+    // The response's `method` labels the series for consumers like Grafana;
+    // echoing the requested "average" would name an aggregate that never ran.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "on"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("navigation.state", { resolution: 600, aggregate: "average" }),
+    );
+
+    assert.equal(result.values[0].method, "last");
+  });
+
+  it("keeps the requested method for raw (non-downsampled) string reads", async () => {
+    // Without a resolution no aggregate is applied at all, so nothing is
+    // being misreported and the caller's choice stands.
+    const provider = createHistoryProviderV2(
+      mockClient([], (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "on"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(query("navigation.state"));
+    assert.equal(result.values[0].method, "first");
   });
 
   it("aggregates a downsampled string path with last(), not avg()", async () => {
