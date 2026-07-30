@@ -551,15 +551,15 @@ module.exports = (app: App) => {
   let pathFilterMatcher: PathMatcher | null = null;
   let rateMatcher: RateMatcher | null = null;
 
-  function shouldRecord(
-    path: string,
-    filter: { mode: string; paths: string[] },
-  ): boolean {
+  // Takes only the mode: the patterns themselves live in pathFilterMatcher,
+  // compiled from this same config at start. Accepting a `paths` array here
+  // would imply it is consulted when it is not.
+  function shouldRecord(path: string, mode: string): boolean {
     const matcher = pathFilterMatcher;
     if (!matcher || matcher.isEmpty) return true;
 
     const matches = matcher.matches(path);
-    return filter.mode === "exclude" ? !matches : matches;
+    return mode === "exclude" ? !matches : matches;
   }
 
   function isThrottled(path: string, defaultRate: number): boolean {
@@ -974,7 +974,7 @@ module.exports = (app: App) => {
       if (isSelf && !config.recordSelf) return;
       if (!isSelf && !config.recordOthers) return;
 
-      if (!shouldRecord(path, config.pathFilter)) return;
+      if (!shouldRecord(path, config.pathFilter.mode)) return;
       if (isThrottled(path, config.defaultSamplingRate ?? 2000)) return;
 
       // Rows are stamped with the server receive time, deliberately NOT the
