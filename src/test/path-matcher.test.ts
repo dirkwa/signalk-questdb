@@ -64,21 +64,45 @@ describe("PathMatcher", () => {
     }
   });
 
-  it("returns the same answer on repeat calls (memoized)", () => {
-    const m = new PathMatcher(["navigation.*"]);
-    for (let i = 0; i < 3; i++) {
-      assert.equal(m.matches("navigation.position"), true);
-      assert.equal(m.matches("electrical.x"), false);
+  // Counting the glob evaluations makes the memoization observable: result
+  // stability alone would also pass with no cache at all, and caching is the
+  // whole point of the change.
+  function countingMatcher(pattern: string) {
+    const m = new PathMatcher([pattern]);
+    let evaluations = 0;
+    const globs = (
+      m as unknown as { globs: { match: (p: string) => boolean }[] }
+    ).globs;
+    for (const g of globs) {
+      const real = g.match.bind(g);
+      g.match = (p: string) => {
+        evaluations++;
+        return real(p);
+      };
     }
+    return { matcher: m, count: () => evaluations };
+  }
+
+  it("evaluates a path once and reuses the result", () => {
+    const { matcher, count } = countingMatcher("navigation.*");
+    for (let i = 0; i < 5; i++) {
+      assert.equal(matcher.matches("navigation.position"), true);
+    }
+    assert.equal(count(), 1, "expected the glob to be evaluated only once");
   });
 
-  it("stays correct after the memo cache is flushed", () => {
-    // The cache clears wholesale at its ceiling; results must not change.
-    const m = new PathMatcher(["navigation.*"]);
-    assert.equal(m.matches("navigation.position"), true);
-    for (let i = 0; i < 5100; i++) m.matches(`filler.path.${i}`);
-    assert.equal(m.matches("navigation.position"), true);
-    assert.equal(m.matches("filler.path.1"), false);
+  it("re-evaluates after the cache ceiling flushes, still correctly", () => {
+    const { matcher, count } = countingMatcher("navigation.*");
+    assert.equal(matcher.matches("navigation.position"), true);
+    const afterFirst = count();
+    // Cross the ceiling so the cache clears.
+    for (let i = 0; i < 5100; i++) matcher.matches(`filler.path.${i}`);
+    assert.equal(matcher.matches("navigation.position"), true);
+    assert.ok(
+      count() > afterFirst,
+      "expected a re-evaluation once the cache was flushed",
+    );
+    assert.equal(matcher.matches("filler.path.1"), false);
   });
 });
 
@@ -153,5 +177,36 @@ describe("RateMatcher throttle semantics", () => {
       effectiveRate({ "navigation.*": 0 }, "navigation.position", 2000),
       2000,
     );
+  });
+});
+
+describe("RateMatcher memoization", () => {
+  it("evaluates a path once and reuses the resolved rate", () => {
+    const r = new RateMatcher({ "environment.wind.*": 200 });
+    let evaluations = 0;
+    const globs = (
+      r as unknown as {
+        globs: { matcher: { match: (p: string) => boolean } }[];
+      }
+    ).globs;
+    for (const g of globs) {
+      const real = g.matcher.match.bind(g.matcher);
+      g.matcher.match = (p: string) => {
+        evaluations++;
+        return real(p);
+      };
+    }
+
+    for (let i = 0; i < 5; i++) {
+      assert.equal(r.rateFor("environment.wind.angle"), 200);
+    }
+    assert.equal(evaluations, 1, "expected one glob evaluation");
+  });
+
+  it("memoizes a non-match too, so misses are not re-evaluated", () => {
+    const r = new RateMatcher({ "environment.wind.*": 200 });
+    for (let i = 0; i < 3; i++) {
+      assert.equal(r.rateFor("navigation.position"), null);
+    }
   });
 });
