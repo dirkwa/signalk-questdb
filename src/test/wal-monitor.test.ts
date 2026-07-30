@@ -462,6 +462,17 @@ describe("isPartitionOpenFailure", () => {
     assert.equal(isPartitionOpenFailure(extractApplyError(prose)), false);
   });
 
+  it("does not classify a same-named frame from another library", () => {
+    // The method names are not unique to QuestDB; without the namespace
+    // anchor an unrelated dependency's frame would suppress a valid skip.
+    const foreign = [
+      "2026-07-21T07:35:50.072000Z C i.q.c.w.ApplyWal2TableJob job failed, table suspended [table=signalk~3, error=java.lang.AssertionError",
+      "\tat com.example.storage.Writer.openPartition(Writer.java:88)",
+      "]",
+    ];
+    assert.equal(isPartitionOpenFailure(extractApplyError(foreign)), false);
+  });
+
   it("treats a missing diagnosis as not-this-class", () => {
     // No engine log (container recreated, log API unavailable): must not
     // withhold the skip on speculation.

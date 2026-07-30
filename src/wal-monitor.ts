@@ -180,13 +180,21 @@ export function extractApplyError(
 // (or reading the commit record that describes it), rather than while reading
 // a pending WAL segment.
 //
-// Anchored to a stack-trace line (`\tat io.questdb...method(File.java:12)`)
-// rather than matched anywhere in the entry: the captured text also contains
-// QuestDB's `[table=<name>, error=<message>]` header, so a bare word match
-// would classify on a user's table name or on prose inside an error message.
-// A false positive here silently withholds a skip that would have worked.
+// Anchored to a stack-trace line inside QuestDB's own package
+// (`\tat io.questdb.cairo.TableReader.openPartition(TableReader.java:12)`).
+// Both halves of that anchor matter, and each closes a real false positive:
+// the captured text also contains QuestDB's `[table=<name>, error=<message>]`
+// header, so an unanchored word matches a user's table name or error prose;
+// and without the namespace, an unrelated library's `openPartition` frame
+// matches too. A false positive silently withholds a skip that would have
+// repaired the table, so this errs toward not classifying.
+//
+// The class name is left open (rather than whitelisting exact pairs) so an
+// upstream refactor that moves these methods still matches; the namespace
+// plus the method set is specific enough that nothing else realistically
+// collides.
 const PARTITION_OPEN_FRAME =
-  /^\s*at\s+[\w.$]*\b(?:openPartition|openLastPartition|unsafeLoadAll|readUnsafe)\s*\(/m;
+  /^\s*at\s+io\.questdb\.[\w.$]*\b(?:openPartition|openLastPartition|unsafeLoadAll|readUnsafe)\s*\(/m;
 
 // True when the apply failure happened before any transaction could be
 // applied, i.e. while opening the existing partition data.
