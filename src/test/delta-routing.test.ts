@@ -10,6 +10,19 @@ describe("routeDeltaValue", () => {
     );
   });
 
+  it("routes booleans to the string table", () => {
+    // Switch/relay, pump and valve states, autopilot flags: these used to
+    // fall through to null and be dropped without a trace (issue #79).
+    assert.equal(
+      routeDeltaValue("watermaker.brineomatic.high_pressure_pump_on", true),
+      "boolean",
+    );
+    assert.equal(
+      routeDeltaValue("electrical.switches.bilgePump.state", false),
+      "boolean",
+    );
+  });
+
   it("routes strings to the string table", () => {
     assert.strictEqual(
       routeDeltaValue("navigation.state", "anchored"),

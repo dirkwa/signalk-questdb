@@ -146,6 +146,24 @@ export function createHistoryProviderV2(
   queryClient: QueryClient,
   selfContext: string,
 ) {
+  // Read a path's rows from signalk_str. Numeric aggregates do not apply to
+  // text, so a downsampled request takes one representative value per bucket
+  // (last = the state in force at the bucket's end, which is what a state
+  // channel means) instead of averaging. Values are returned verbatim:
+  // booleans were stored as "true"/"false", so a consumer can tell them apart
+  // from real numbers, and Grafana value mappings work directly.
+  async function readStringRows(
+    where: string,
+    resolution?: number,
+  ): Promise<[string, unknown][]> {
+    const sql =
+      resolution && resolution > 0
+        ? `SELECT ts, last(value_str) as value_str FROM signalk_str WHERE ${where} SAMPLE BY ${effectiveResolution(resolution)}s FILL(NULL) ORDER BY ts`
+        : `SELECT ts, value_str FROM signalk_str WHERE ${where} ORDER BY ts LIMIT 10000`;
+    const result = await queryClient.exec(sql);
+    return result.dataset.map((row) => [row[0] as string, row[1]]);
+  }
+
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
     const range = resolveTimeRange(query as any);
 
@@ -153,9 +171,22 @@ export function createHistoryProviderV2(
     // client-side aggregates (sma/ema/middle_index) read raw rows under a
     // LIMIT and must not trip the cap. Each qualifying spec issues its own
     // SAMPLE BY, so the fabricated total scales with their count.
+    //
+    // A non-numeric path costs TWO such queries: the numeric one comes back
+    // empty and the string-table fallback repeats it against signalk_str.
+    // Which paths those are is only known after querying, so the budget
+    // assumes the worst case — every sampled spec falling back — rather than
+    // letting a request built entirely of boolean/string paths quietly run at
+    // twice the ceiling this cap exists to enforce on Pi-class hosts.
     const sampledSpecs = query.pathSpecs.filter(
       (spec) =>
         spec.path === "navigation.position" ||
+        !needsClientSideAggregation(spec.aggregate),
+    ).length;
+    // navigation.position is served by its own table and never falls back.
+    const fallbackCapableSpecs = query.pathSpecs.filter(
+      (spec) =>
+        spec.path !== "navigation.position" &&
         !needsClientSideAggregation(spec.aggregate),
     ).length;
 
@@ -164,10 +195,11 @@ export function createHistoryProviderV2(
       const bucketsPerSeries = Math.ceil(
         rangeSec / effectiveResolution(query.resolution),
       );
-      const buckets = bucketsPerSeries * sampledSpecs;
+      const worstCaseQueries = sampledSpecs + fallbackCapableSpecs;
+      const buckets = bucketsPerSeries * worstCaseQueries;
       if (buckets > MAX_SAMPLE_BUCKETS) {
         throw new Error(
-          `resolution ${query.resolution}s over this range produces ` +
+          `resolution ${query.resolution}s over this range produces up to ` +
             `${buckets} sample buckets across ${sampledSpecs} paths ` +
             `(max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or ` +
             `a shorter range`,
@@ -254,6 +286,30 @@ export function createHistoryProviderV2(
         row[0] as string,
         row[1],
       ]);
+
+      // Non-numeric paths (strings, and booleans stored as "true"/"false")
+      // live in signalk_str, which this query never touches — they used to
+      // come back empty even though getPaths lists them. Fall back to the
+      // string table when the numeric one held nothing for this path.
+      // Emptiness is judged on VALUES, not row count: a SAMPLE BY with
+      // FILL(NULL) fabricates a row per bucket, so an all-null result is
+      // still "no numeric data here".
+      if (!rows.some(([, value]) => value !== null)) {
+        // Report the aggregate that was actually applied. Downsampled string
+        // rows always use last() — averaging text is meaningless — so leaving
+        // the caller's requested method in the response would label the
+        // series with an aggregation that never ran.
+        if (query.resolution && query.resolution > 0) {
+          const reported = valuesList[valuesList.length - 1];
+          if (reported.path === spec.path) reported.method = "last";
+        }
+        columnData.set(
+          spec.path,
+          await readStringRows(where, query.resolution),
+        );
+        continue;
+      }
+
       columnData.set(spec.path, rows);
     }
 

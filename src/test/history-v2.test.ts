@@ -253,11 +253,17 @@ describe("history-v2 sample bucket guard", () => {
       ],
     } as any);
 
-    assert.equal(captured.length, 1);
-    assert.ok(
-      captured[0].sql.includes("SAMPLE BY 1s"),
-      `expected SAMPLE BY 1s, got: ${captured[0].sql}`,
-    );
+    // The mock returns no rows, so the string-table fallback also runs; both
+    // queries must carry the clamped period, never `SAMPLE BY 0s`. Assert the
+    // fallback actually fired, so this cannot pass by silently skipping it.
+    const stringQuery = captured.find(({ sql }) => sql.includes("signalk_str"));
+    assert.ok(stringQuery, "expected a string-table fallback query");
+    for (const { sql } of captured) {
+      assert.ok(
+        sql.includes("SAMPLE BY 1s"),
+        `expected SAMPLE BY 1s, got: ${sql}`,
+      );
+    }
   });
 
   it("caps the fabricated total across multiple sampled paths", async () => {
@@ -286,6 +292,56 @@ describe("history-v2 sample bucket guard", () => {
       /sample buckets/,
     );
     assert.equal(captured.length, 0);
+  });
+
+  it("budgets the string-table fallback's second SAMPLE BY", async () => {
+    // A non-numeric path costs two SAMPLE BY queries (numeric miss, then the
+    // signalk_str fallback). Counting only the first would let a request of
+    // boolean/string paths run at ~2x the cap this guard exists to enforce.
+    // 7 days at 1s = ~605k buckets: one query fits under 1M, two do not.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await assert.rejects(
+      provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-01-08T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          {
+            path: "electrical.switches.bilgePump.state",
+            aggregate: "first",
+            parameter: [],
+          },
+        ],
+      } as any),
+      /sample buckets/,
+    );
+    assert.equal(captured.length, 0, "must reject before querying QuestDB");
+  });
+
+  it("does not double-count navigation.position, which never falls back", async () => {
+    // Position is served by its own table, so it costs exactly one query —
+    // budgeting it as two would reject requests that are actually fine.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-01-08T00:00:00Z" },
+      resolution: 1,
+      pathSpecs: [
+        { path: "navigation.position", aggregate: "first", parameter: [] },
+      ],
+    } as any);
+
+    assert.ok(captured.length >= 1, "expected the position query to run");
   });
 
   it("does not reject client-side aggregates, which never SAMPLE BY", async () => {
@@ -319,5 +375,152 @@ describe("history-v2 sample bucket guard", () => {
         `expected raw-row LIMIT query for '${aggregate}', got: ${captured[0].sql}`,
       );
     }
+  });
+});
+
+describe("history-v2 string-table fallback", () => {
+  // Values live in `signalk` (numeric) or `signalk_str` (strings, and
+  // booleans stored as "true"/"false" since #79). getValues only ever queried
+  // the numeric table, so every non-numeric path was listed by getPaths but
+  // returned no data at all.
+  function mockClient(
+    captured: CapturedQuery[],
+    responder: (sql: string) => unknown[][],
+  ) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        const dataset = responder(sql);
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+    } as any;
+  }
+
+  const query = (path: string, extra: Record<string, unknown> = {}): any => {
+    const { aggregate = "first", ...rest } = extra;
+    return {
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-01-01T01:00:00Z" },
+      context: "self",
+      pathSpecs: [{ path, aggregate, parameter: [] }],
+      ...rest,
+    };
+  };
+
+  it("serves a boolean path from signalk_str", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:01.000000Z", "true"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("watermaker.brineomatic.high_pressure_pump_on"),
+    );
+
+    assert.deepEqual(result.data, [["2024-01-01T00:00:01.000000Z", "true"]]);
+    assert.ok(captured.some((c) => c.sql.includes("signalk_str")));
+  });
+
+  it("does not query the string table when numeric data exists", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, () => [["2024-01-01T00:00:01.000000Z", 4.2]]),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("environment.depth.belowKeel"),
+    );
+
+    assert.deepEqual(result.data, [["2024-01-01T00:00:01.000000Z", 4.2]]);
+    assert.ok(
+      !captured.some((c) => c.sql.includes("signalk_str")),
+      "numeric paths must not pay for a second query",
+    );
+  });
+
+  it("falls back when SAMPLE BY fabricated only FILL(NULL) rows", async () => {
+    // A downsampled numeric query returns a row per bucket even with no data,
+    // so emptiness has to be judged on values, not row count.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "false"]]
+          : [
+              ["2024-01-01T00:00:00.000000Z", null],
+              ["2024-01-01T00:10:00.000000Z", null],
+            ],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("electrical.switches.bilgePump.state", { resolution: 600 }),
+    );
+
+    assert.deepEqual(result.data, [["2024-01-01T00:00:00.000000Z", "false"]]);
+  });
+
+  it("reports last() as the method actually applied when downsampling", async () => {
+    // The response's `method` labels the series for consumers like Grafana;
+    // echoing the requested "average" would name an aggregate that never ran.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "on"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("navigation.state", { resolution: 600, aggregate: "average" }),
+    );
+
+    assert.equal(result.values[0].method, "last");
+  });
+
+  it("keeps the requested method for raw (non-downsampled) string reads", async () => {
+    // Without a resolution no aggregate is applied at all, so nothing is
+    // being misreported and the caller's choice stands.
+    const provider = createHistoryProviderV2(
+      mockClient([], (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "on"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(query("navigation.state"));
+    assert.equal(result.values[0].method, "first");
+  });
+
+  it("aggregates a downsampled string path with last(), not avg()", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "on"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues(query("navigation.state", { resolution: 600 }));
+
+    const strSql = captured.find((c) => c.sql.includes("signalk_str"))!.sql;
+    assert.ok(
+      strSql.includes("last(value_str)"),
+      `expected last(value_str), got: ${strSql}`,
+    );
+    assert.ok(!strSql.includes("avg("));
   });
 });
