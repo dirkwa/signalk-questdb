@@ -42,7 +42,7 @@
   "dependencies": {
     "@js-temporal/polyfill": "^0.5.0",
     "@sinclair/typebox": "^0.34.0",
-    "minimatch": "^10.0.0"
+    "minimatch": "^10.2.3"
   },
   "devDependencies": {
     "@babel/core": "^8.0.1",

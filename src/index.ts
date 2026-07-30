@@ -1,5 +1,4 @@
 import { IRouter } from "express";
-import { minimatch } from "minimatch";
 import { ILPWriter } from "./ilp-writer";
 import { QueryClient, isReadOnlySQL } from "./query-client";
 import type { QuestDBResult } from "./query-client";
@@ -31,6 +30,7 @@ import {
 } from "./questdb-endpoint";
 import { readMaxMapCount } from "./host-limits";
 import { buildContainerEnv } from "./container-env";
+import { PathMatcher, RateMatcher } from "./path-matcher";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -545,38 +545,32 @@ module.exports = (app: App) => {
     };
   }
 
-  function shouldRecord(
-    path: string,
-    filter: { mode: string; paths: string[] },
-  ): boolean {
-    if (!filter.paths || filter.paths.length === 0) return true;
+  // Compiled once per config (see runStart), never per delta — recompiling
+  // these globs on every incoming value pinned a real vessel's event loop at
+  // 100% CPU with an 89-pattern filter list.
+  let pathFilterMatcher: PathMatcher | null = null;
+  let rateMatcher: RateMatcher | null = null;
 
-    const matches = filter.paths.some((pattern) => minimatch(path, pattern));
-    return filter.mode === "exclude" ? !matches : matches;
+  // Takes only the mode: the patterns themselves live in pathFilterMatcher,
+  // compiled from this same config at start. Accepting a `paths` array here
+  // would imply it is consulted when it is not.
+  function shouldRecord(path: string, mode: string): boolean {
+    const matcher = pathFilterMatcher;
+    if (!matcher || matcher.isEmpty) return true;
+
+    const matches = matcher.matches(path);
+    return mode === "exclude" ? !matches : matches;
   }
 
-  function isThrottled(
-    path: string,
-    rates: Record<string, number>,
-    defaultRate: number,
-  ): boolean {
+  function isThrottled(path: string, defaultRate: number): boolean {
     const now = Date.now();
 
-    // Check per-path overrides first
-    for (const [pattern, minMs] of Object.entries(rates)) {
-      if (minMs <= 0) continue;
-      if (!minimatch(path, pattern)) continue;
-
+    // Per-path override wins when one matches; otherwise the default rate.
+    const overrideRate = rateMatcher?.rateFor(path) ?? null;
+    const minMs = overrideRate ?? defaultRate;
+    if (minMs > 0) {
       const lastWrite = throttleMap.get(path) ?? 0;
       if (now - lastWrite < minMs) return true;
-      throttleMap.set(path, now);
-      return false;
-    }
-
-    // Apply default rate
-    if (defaultRate > 0) {
-      const lastWrite = throttleMap.get(path) ?? 0;
-      if (now - lastWrite < defaultRate) return true;
       throttleMap.set(path, now);
     }
 
@@ -768,6 +762,12 @@ module.exports = (app: App) => {
     // at the boundary.
     config = normalizeConfig(config);
     currentConfig = config;
+    // Compile the filter/throttle globs here, alongside the config they come
+    // from, so the per-delta path only does lookups. Rebuilt on every start,
+    // which is also how a config change takes effect (the server stops and
+    // restarts the plugin).
+    pathFilterMatcher = new PathMatcher(config.pathFilter?.paths ?? []);
+    rateMatcher = new RateMatcher(config.samplingRates ?? {});
     // A start may connect to a different QuestDB than the previous run —
     // notably external mode repointed at a new host/build — so drop any cached
     // wal_tables() capability flag and let /api/status re-probe. The
@@ -974,15 +974,8 @@ module.exports = (app: App) => {
       if (isSelf && !config.recordSelf) return;
       if (!isSelf && !config.recordOthers) return;
 
-      if (!shouldRecord(path, config.pathFilter)) return;
-      if (
-        isThrottled(
-          path,
-          config.samplingRates,
-          config.defaultSamplingRate ?? 2000,
-        )
-      )
-        return;
+      if (!shouldRecord(path, config.pathFilter.mode)) return;
+      if (isThrottled(path, config.defaultSamplingRate ?? 2000)) return;
 
       // Rows are stamped with the server receive time, deliberately NOT the
       // delta's own timestamp: a boat is a set of independent clocks (GPS
@@ -1201,6 +1194,10 @@ module.exports = (app: App) => {
       }
 
       throttleMap.clear();
+      // Drop the compiled globs with the config they belong to, so a restart
+      // with different patterns cannot match against the previous run's.
+      pathFilterMatcher = null;
+      rateMatcher = null;
       queryClient = null;
       questdbEndpoints = null;
 
