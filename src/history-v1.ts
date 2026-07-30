@@ -23,19 +23,38 @@ interface Delta {
 // Position rows have no `path` column — the table is the vessel track — so the
 // path is supplied as a literal. CAST keeps the union's column types
 // compatible across branches; the reader turns them back into real values.
-function unionValueRowsSQL(where: string, orderAndLimit: string): string {
+// The signalk_str branch, with or without the value_kind tag. ensureTables()
+// adds that column at startup, but a read racing an unmigrated table (or an
+// external QuestDB the plugin does not own) would otherwise fail the WHOLE
+// union with "Invalid column: value_kind" — turning a missing type tag into
+// no history at all. `withKind: false` degrades to the pre-migration
+// behaviour: every string row replays as text.
+function strBranch(where: string, withKind: boolean): string {
+  const kind = withKind ? `CAST(value_kind AS STRING)` : `NULL`;
+  return `SELECT ts, path, context, value_str valuetext, ${kind} kind FROM signalk_str WHERE ${where}`;
+}
+
+function unionValueRowsSQL(
+  where: string,
+  orderAndLimit: string,
+  withKind = true,
+): string {
   return (
     `SELECT ts, path, context, CAST(value AS STRING) valuetext, 'number' kind FROM signalk WHERE ${where}` +
     ` UNION ALL ` +
-    // value_kind records the ORIGINAL type ('boolean', or null for text and
-    // for rows written before that column existed).
-    `SELECT ts, path, context, value_str valuetext, ` +
-    `CAST(value_kind AS STRING) kind FROM signalk_str WHERE ${where}` +
+    strBranch(where, withKind) +
     ` UNION ALL ` +
     `SELECT ts, 'navigation.position' path, context, ` +
     `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, 'position' kind ` +
     `FROM signalk_position WHERE ${where}` +
     ` ${orderAndLimit}`
+  );
+}
+
+// True for the error QuestDB returns when value_kind has not been added yet.
+function isMissingKindColumn(err: unknown): boolean {
+  return /Invalid column:\s*value_kind/i.test(
+    err instanceof Error ? err.message : String(err),
   );
 }
 
@@ -169,12 +188,14 @@ export function createHistoryProviderV1(
       const to = validateTimestamp(chunkEnd.toISOString());
 
       try {
-        const result = await queryClient.exec(
-          unionValueRowsSQL(
-            `ts >= '${from}' AND ts < '${to}'`,
-            `ORDER BY ts LIMIT ${CHUNK_ROW_LIMIT}`,
-          ),
-        );
+        const window = `ts >= '${from}' AND ts < '${to}'`;
+        const order = `ORDER BY ts LIMIT ${CHUNK_ROW_LIMIT}`;
+        const result = await queryClient
+          .exec(unionValueRowsSQL(window, order))
+          .catch((err) => {
+            if (!isMissingKindColumn(err)) throw err;
+            return queryClient.exec(unionValueRowsSQL(window, order, false));
+          });
 
         if (result.dataset.length === 0) {
           currentTime = chunkEnd;
@@ -216,7 +237,11 @@ export function createHistoryProviderV1(
         // resuming at it would repeat the identical read forever) does the
         // cursor step forward by 1ms, trading that millisecond's tail for
         // guaranteed progress.
-        if (result.dataset.length >= CHUNK_ROW_LIMIT) {
+        // Guard on `rows`, not `dataset`: toObjects() returns [] when the
+        // response carries no column metadata, and indexing the last row of
+        // an empty array would throw into the catch below — turning a
+        // metadata hiccup into a permanent 1s retry loop on this window.
+        if (rows.length >= CHUNK_ROW_LIMIT) {
           const lastTs = new Date(rows[rows.length - 1].ts as string).getTime();
           const resumeAt =
             lastTs > currentTime.getTime() ? lastTs : currentTime.getTime() + 1;
@@ -253,8 +278,19 @@ export function createHistoryProviderV1(
     };
   }
 
+  // Snapshot of every path at `date`, for the v1 snapshot API.
+  //
+  // `path` is deliberately unused and must NOT become a filter. Despite the
+  // name (and the `string` in the server's provider interface), the server
+  // passes the REQUEST URL SEGMENTS — e.g. ["vessels", "<selfId>",
+  // "navigation"], or [] for the root snapshot — then feeds every returned
+  // delta to buildFullFromDeltas() and walks into the assembled tree with
+  // those segments (signalk-server src/interfaces/rest.js). Filtering the
+  // query by it would both mismatch the type and starve the snapshot the
+  // caller is building.
   function getHistory(
     date: Date,
+
     path: string,
     callback: (deltas: Delta[]) => void,
   ): void {
@@ -265,19 +301,22 @@ export function createHistoryProviderV1(
     // instead of using each table's index, which timed out (>30s) on a
     // multi-hundred-million-row install. Position partitions by context only
     // — the track table has no path column.
+    const snapshotSQL = (withKind: boolean) =>
+      `(SELECT ts, path, context, CAST(value AS STRING) valuetext, 'number' kind ` +
+      `FROM signalk WHERE ts <= '${ts}' LATEST ON ts PARTITION BY path, context)` +
+      ` UNION ALL ` +
+      `(${strBranch(`ts <= '${ts}'`, withKind)} LATEST ON ts PARTITION BY path, context)` +
+      ` UNION ALL ` +
+      `(SELECT ts, 'navigation.position' path, context, ` +
+      `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, 'position' kind ` +
+      `FROM signalk_position WHERE ts <= '${ts}' LATEST ON ts PARTITION BY context)`;
+
     queryClient
-      .exec(
-        `(SELECT ts, path, context, CAST(value AS STRING) valuetext, 'number' kind ` +
-          `FROM signalk WHERE ts <= '${ts}' LATEST ON ts PARTITION BY path, context)` +
-          ` UNION ALL ` +
-          `(SELECT ts, path, context, value_str valuetext, ` +
-          `CAST(value_kind AS STRING) kind ` +
-          `FROM signalk_str WHERE ts <= '${ts}' LATEST ON ts PARTITION BY path, context)` +
-          ` UNION ALL ` +
-          `(SELECT ts, 'navigation.position' path, context, ` +
-          `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, 'position' kind ` +
-          `FROM signalk_position WHERE ts <= '${ts}' LATEST ON ts PARTITION BY context)`,
-      )
+      .exec(snapshotSQL(true))
+      .catch((err) => {
+        if (!isMissingKindColumn(err)) throw err;
+        return queryClient.exec(snapshotSQL(false));
+      })
       .then((result) => {
         const rows = queryClient.toObjects(result);
         const deltas = groupRowsIntoDeltas(rows);

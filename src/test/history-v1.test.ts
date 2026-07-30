@@ -6,6 +6,11 @@ interface Captured {
   sql: string;
 }
 
+// The shape the provider actually depends on. Narrowing to this (instead of
+// `as any`) means a change to exec/toObjects fails at compile time here
+// rather than at runtime.
+type HistoryClient = Parameters<typeof createHistoryProviderV1>[0];
+
 // Rows as QuestDB returns them for the unified value query: the reader keys
 // off `kind` to turn `valuetext` back into a real delta value.
 function mockClient(captured: Captured[], dataset: unknown[][]) {
@@ -22,7 +27,7 @@ function mockClient(captured: Captured[], dataset: unknown[][]) {
         valuetext: row[3],
         kind: row[4],
       })),
-  } as any;
+  } as unknown as HistoryClient;
 }
 
 const SELF = "vessels.urn:mrn:imo:mmsi:123456789";
@@ -189,6 +194,89 @@ describe("history-v1 value decoding", () => {
   });
 });
 
+describe("history-v1 unmigrated value_kind column", () => {
+  // ensureTables() adds value_kind at startup, but a read racing that (or an
+  // external QuestDB the plugin does not own) must not lose ALL history to
+  // "Invalid column: value_kind" — verified against a live pre-migration
+  // database, which returned 0 paths before this fallback.
+  function failingKindClient(captured: Captured[]) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        if (sql.includes("value_kind")) {
+          throw new Error(
+            "QuestDB query failed (400): Invalid column: value_kind",
+          );
+        }
+        return {
+          columns: [],
+          dataset: [
+            [
+              "2024-01-01T00:00:00.000000Z",
+              "navigation.state",
+              "self",
+              "on",
+              null,
+            ],
+          ],
+          count: 1,
+          timestamp: 0,
+        };
+      },
+      toObjects: (result: { dataset: unknown[][] }) =>
+        result.dataset.map((row) => ({
+          ts: row[0],
+          path: row[1],
+          context: row[2],
+          valuetext: row[3],
+          kind: row[4],
+        })),
+    } as unknown as HistoryClient;
+  }
+
+  it("retries getHistory without the tag and still returns history", async () => {
+    const captured: Captured[] = [];
+    const provider = createHistoryProviderV1(
+      failingKindClient(captured),
+      SELF,
+      noop,
+    );
+
+    const values = await new Promise<{ path: string; value: unknown }[]>(
+      (resolve) =>
+        provider.getHistory(new Date("2024-01-01T01:00:00Z"), "", (deltas) =>
+          resolve(deltas.flatMap((d) => d.updates.flatMap((u) => u.values))),
+        ),
+    );
+
+    assert.equal(values.length, 1);
+    assert.equal(values[0].value, "on");
+    assert.equal(captured.length, 2, "expected a tagged attempt then a retry");
+    assert.ok(!captured[1].sql.includes("value_kind"));
+  });
+
+  it("does not swallow unrelated query failures", async () => {
+    // Only the missing-column case degrades; anything else must surface.
+    const client = {
+      exec: async () => {
+        throw new Error("QuestDB query failed (500): something else");
+      },
+      toObjects: () => [],
+    } as unknown as HistoryClient;
+    const errors: string[] = [];
+    const provider = createHistoryProviderV1(client, SELF, (m) =>
+      errors.push(m),
+    );
+
+    const deltas = await new Promise<unknown[]>((resolve) =>
+      provider.getHistory(new Date("2024-01-01T01:00:00Z"), "", resolve),
+    );
+
+    assert.deepEqual(deltas, []);
+    assert.ok(errors.some((e) => e.includes("something else")));
+  });
+});
+
 describe("history-v1 getHistory query shape", () => {
   it("applies LATEST ON per table instead of over a union", async () => {
     // LATEST ON over a materialized union makes QuestDB scan rather than use
@@ -250,8 +338,8 @@ describe("history-v1 streamHistory chunking", () => {
           valuetext: row[3],
           kind: row[4],
         })),
-    } as any;
-    const written: any[] = [];
+    } as unknown as HistoryClient;
+    const written: unknown[] = [];
     const provider = createHistoryProviderV1(client, SELF, noop);
     const stop = provider.streamHistory(
       { write: (d: unknown) => written.push(d), on: () => {} },
@@ -262,6 +350,24 @@ describe("history-v1 streamHistory chunking", () => {
   }
 
   const row = (ts: string, path: string) => [ts, path, "self", "1", "number"];
+
+  // Poll rather than sleep a fixed interval: on a loaded runner a fixed wait
+  // can miss the follow-up read and fail as a TypeError on undefined instead
+  // of a readable assertion.
+  async function waitForQueries(
+    queries: string[],
+    n: number,
+    timeoutMs = 2000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    while (queries.length < n && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.ok(
+      queries.length >= n,
+      `expected at least ${n} reads, got ${queries.length}`,
+    );
+  }
 
   it("resumes after the last sent row instead of skipping the remainder", async () => {
     // First read returns a full page (10000 rows) ending mid-window; the
@@ -275,10 +381,8 @@ describe("history-v1 streamHistory chunking", () => {
       ),
     );
     const { queries, stop } = streamOnce([full, []]);
-    await new Promise((r) => setTimeout(r, 60));
+    await waitForQueries(queries, 2);
     stop();
-
-    assert.ok(queries.length >= 2, "expected a follow-up read");
     assert.ok(
       queries[1].includes("2024-01-01T00:00:30.000"),
       `second read should resume AT the last row, got: ${queries[1]}`,
@@ -297,7 +401,7 @@ describe("history-v1 streamHistory chunking", () => {
     // parks on the tie rather than stepping over it.
     tied[0] = row("2024-01-01T00:00:05.000000Z", "earlier");
     const { queries, stop } = streamOnce([tied, []]);
-    await new Promise((r) => setTimeout(r, 60));
+    await waitForQueries(queries, 2);
     stop();
 
     assert.ok(
@@ -313,7 +417,7 @@ describe("history-v1 streamHistory chunking", () => {
       row("2024-01-01T00:00:00.000000Z", `p${i}`),
     );
     const { queries, stop } = streamOnce([sameMs, []]);
-    await new Promise((r) => setTimeout(r, 60));
+    await waitForQueries(queries, 2);
     stop();
 
     assert.ok(
@@ -329,10 +433,8 @@ describe("history-v1 streamHistory chunking", () => {
       [[row("2024-01-01T00:00:05.000000Z", "p")], []],
       6000,
     );
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForQueries(queries, 2);
     stop();
-
-    assert.ok(queries.length >= 2, "expected a follow-up read");
     assert.ok(
       queries[1].includes("2024-01-01T00:01:00.000"),
       `expected the next 60s window, got: ${queries[1]}`,
