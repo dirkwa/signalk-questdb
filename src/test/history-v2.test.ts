@@ -579,3 +579,55 @@ describe("history-v2 string-table fallback", () => {
     assert.ok(!strSql.includes("avg("));
   });
 });
+
+describe("history-v2 path and context discovery", () => {
+  function captureClient(captured: CapturedQuery[]) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        return { columns: [], dataset: [], count: 0, timestamp: 0 };
+      },
+    } as any;
+  }
+
+  const range = {
+    from: { toString: () => "2024-01-01T00:00:00Z" },
+    to: { toString: () => "2024-01-01T01:00:00Z" },
+  } as any;
+
+  it("advertises navigation.position in getPaths", async () => {
+    // The track table has no `path` column, so it was omitted entirely:
+    // getValues served the position series while getPaths never listed it,
+    // leaving clients unable to discover the one series they most want.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      captureClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getPaths(range);
+
+    assert.ok(
+      captured[0].sql.includes("signalk_position"),
+      `getPaths must consult the track table, got: ${captured[0].sql}`,
+    );
+    assert.ok(captured[0].sql.includes("'navigation.position'"));
+  });
+
+  it("includes the track table in getContexts", async () => {
+    // A vessel can be position-only (an AIS target whose other paths are
+    // filtered out), and would otherwise be invisible.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      captureClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getContexts(range);
+
+    assert.ok(
+      captured[0].sql.includes("signalk_position"),
+      `getContexts must consult the track table, got: ${captured[0].sql}`,
+    );
+  });
+});

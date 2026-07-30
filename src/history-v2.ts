@@ -367,10 +367,17 @@ export function createHistoryProviderV2(
     const range = resolveTimeRange(query as any);
     const where = buildRangeWhere(range);
 
+    // signalk_position has no `path` column — the whole table IS
+    // navigation.position — so it contributes that name as a literal. Without
+    // this branch getValues happily serves the track while getPaths never
+    // advertised it, so a client enumerating paths could not discover the one
+    // series it most likely wants.
     const result = await queryClient.exec(
       `SELECT DISTINCT path FROM signalk WHERE ${where}
        UNION
        SELECT DISTINCT path FROM signalk_str WHERE ${where}
+       UNION
+       SELECT DISTINCT 'navigation.position' path FROM signalk_position WHERE ${where}
        ORDER BY path`,
     );
 
@@ -381,10 +388,15 @@ export function createHistoryProviderV2(
     const range = resolveTimeRange(query as any);
     const where = buildRangeWhere(range);
 
+    // Include the track table: a vessel can be position-only (an AIS target
+    // whose other paths are filtered out, or a receiver sending nothing but
+    // fixes), and omitting it hides that context entirely.
     const result = await queryClient.exec(
       `SELECT DISTINCT context FROM signalk WHERE ${where}
        UNION
        SELECT DISTINCT context FROM signalk_str WHERE ${where}
+       UNION
+       SELECT DISTINCT context FROM signalk_position WHERE ${where}
        ORDER BY context`,
     );
 
