@@ -171,9 +171,22 @@ export function createHistoryProviderV2(
     // client-side aggregates (sma/ema/middle_index) read raw rows under a
     // LIMIT and must not trip the cap. Each qualifying spec issues its own
     // SAMPLE BY, so the fabricated total scales with their count.
+    //
+    // A non-numeric path costs TWO such queries: the numeric one comes back
+    // empty and the string-table fallback repeats it against signalk_str.
+    // Which paths those are is only known after querying, so the budget
+    // assumes the worst case — every sampled spec falling back — rather than
+    // letting a request built entirely of boolean/string paths quietly run at
+    // twice the ceiling this cap exists to enforce on Pi-class hosts.
     const sampledSpecs = query.pathSpecs.filter(
       (spec) =>
         spec.path === "navigation.position" ||
+        !needsClientSideAggregation(spec.aggregate),
+    ).length;
+    // navigation.position is served by its own table and never falls back.
+    const fallbackCapableSpecs = query.pathSpecs.filter(
+      (spec) =>
+        spec.path !== "navigation.position" &&
         !needsClientSideAggregation(spec.aggregate),
     ).length;
 
@@ -182,10 +195,11 @@ export function createHistoryProviderV2(
       const bucketsPerSeries = Math.ceil(
         rangeSec / effectiveResolution(query.resolution),
       );
-      const buckets = bucketsPerSeries * sampledSpecs;
+      const worstCaseQueries = sampledSpecs + fallbackCapableSpecs;
+      const buckets = bucketsPerSeries * worstCaseQueries;
       if (buckets > MAX_SAMPLE_BUCKETS) {
         throw new Error(
-          `resolution ${query.resolution}s over this range produces ` +
+          `resolution ${query.resolution}s over this range produces up to ` +
             `${buckets} sample buckets across ${sampledSpecs} paths ` +
             `(max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or ` +
             `a shorter range`,

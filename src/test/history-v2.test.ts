@@ -294,6 +294,56 @@ describe("history-v2 sample bucket guard", () => {
     assert.equal(captured.length, 0);
   });
 
+  it("budgets the string-table fallback's second SAMPLE BY", async () => {
+    // A non-numeric path costs two SAMPLE BY queries (numeric miss, then the
+    // signalk_str fallback). Counting only the first would let a request of
+    // boolean/string paths run at ~2x the cap this guard exists to enforce.
+    // 7 days at 1s = ~605k buckets: one query fits under 1M, two do not.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await assert.rejects(
+      provider.getValues({
+        from: { toString: () => "2024-01-01T00:00:00Z" },
+        to: { toString: () => "2024-01-08T00:00:00Z" },
+        resolution: 1,
+        pathSpecs: [
+          {
+            path: "electrical.switches.bilgePump.state",
+            aggregate: "first",
+            parameter: [],
+          },
+        ],
+      } as any),
+      /sample buckets/,
+    );
+    assert.equal(captured.length, 0, "must reject before querying QuestDB");
+  });
+
+  it("does not double-count navigation.position, which never falls back", async () => {
+    // Position is served by its own table, so it costs exactly one query —
+    // budgeting it as two would reject requests that are actually fine.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-01-08T00:00:00Z" },
+      resolution: 1,
+      pathSpecs: [
+        { path: "navigation.position", aggregate: "first", parameter: [] },
+      ],
+    } as any);
+
+    assert.ok(captured.length >= 1, "expected the position query to run");
+  });
+
   it("does not reject client-side aggregates, which never SAMPLE BY", async () => {
     // 60 days at 1s would be 5.18M buckets — but every client-side aggregate
     // reads raw rows under a LIMIT, so the cap must not apply to any of them.
