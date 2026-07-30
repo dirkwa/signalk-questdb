@@ -100,11 +100,9 @@ function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
     const ts = row.ts as string;
     const context = (row.context as string) || "self";
     const path = row.path as string;
-    // Unified rows carry `valuetext` + `kind`; decodeValue reconstructs the
-    // real value. Rows that already have a plain `value` (older callers) are
-    // passed through unchanged.
-    const value =
-      "valuetext" in row ? decodeValue(row) : (row.value as unknown);
+    // Both call sites query the unified shape, so every row carries
+    // `valuetext` + `kind` for decodeValue to reconstruct.
+    const value = decodeValue(row);
 
     if (!byTimestamp.has(ts)) {
       byTimestamp.set(ts, new Map());
