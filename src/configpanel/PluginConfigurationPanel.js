@@ -909,7 +909,12 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               rootless Podman that means a systemd <code>user@.service</code>{" "}
               <code>LimitNOFILE</code> drop-in (editing{" "}
               <code>/etc/security/limits.conf</code> alone is usually not
-              enough) — then restart the QuestDB container.{" "}
+              enough) — then restart the Signal K server so the plugin can
+              re-create the QuestDB container with the raised limit
+              (signalk-container 1.25.3+; on older versions remove the container
+              once with <code>podman rm -f sk-signalk-questdb</code> instead).
+              This warning clears itself once the container is running with the
+              full value.{" "}
               <a
                 href="https://github.com/dirkwa/signalk-container#raising-the-open-files-limit-nofile"
                 target="_blank"

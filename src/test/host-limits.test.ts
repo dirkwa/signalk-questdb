@@ -4,6 +4,7 @@ import { mkdtemp, writeFile, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  nofileClampSatisfied,
   parseMaxMapCount,
   evaluateMaxMapCount,
   readMaxMapCount,
@@ -76,5 +77,36 @@ describe("readMaxMapCount", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("nofileClampSatisfied", () => {
+  it("is satisfied when soft and hard both meet the request", () => {
+    assert.equal(
+      nofileClampSatisfied(1048576, { soft: 1048576, hard: 1048576 }),
+      true,
+    );
+    assert.equal(
+      nofileClampSatisfied(1048576, { soft: 2097152, hard: 2097152 }),
+      true,
+    );
+  });
+
+  it("is not satisfied while the container still runs on the clamped limit", () => {
+    assert.equal(
+      nofileClampSatisfied(1048576, { soft: 524288, hard: 524288 }),
+      false,
+    );
+  });
+
+  it("requires the SOFT limit too — that is what bounds fd allocation", () => {
+    assert.equal(
+      nofileClampSatisfied(1048576, { soft: 1024, hard: 1048576 }),
+      false,
+    );
+  });
+
+  it("treats an unknown live limit as not satisfied (advisory stays)", () => {
+    assert.equal(nofileClampSatisfied(1048576, null), false);
   });
 });

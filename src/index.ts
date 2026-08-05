@@ -28,7 +28,7 @@ import {
   lanExposureEndpoints,
   type Endpoint,
 } from "./questdb-endpoint";
-import { readMaxMapCount } from "./host-limits";
+import { nofileClampSatisfied, readMaxMapCount } from "./host-limits";
 import { buildContainerEnv } from "./container-env";
 import { PathMatcher, RateMatcher } from "./path-matcher";
 
@@ -128,6 +128,16 @@ interface ContainerManagerApi {
     hostPath: string,
     options?: { ownerPluginId?: string },
   ) => Promise<void>;
+  /**
+   * Read the nofile limits the managed container is ACTUALLY running with
+   * (live /proc probe, falling back to the create-time inspect echo); null
+   * means unknown. Used to verify a recorded ulimit clamp against reality
+   * and clear the stale advisory. Optional: requires signalk-container >=
+   * 1.25.3; on older versions the advisory clears on the next plugin start.
+   */
+  getContainerNofile?: (
+    name: string,
+  ) => Promise<{ soft: number; hard: number } | null>;
   ensureNetwork: (name: string) => Promise<void>;
   /**
    * Attach an existing managed container to a user-defined network so other
@@ -242,6 +252,10 @@ const QUESTDB_HEALTHCHECK = {
 // so we pin it on the container. signalk-container clamps it down to what the
 // host can actually grant (a rootless container cannot exceed the calling
 // user's hard limit), so this is safe even where the host limit is lower.
+// Caveat: rootless podman < 5.5.0 drops this request over the compat API
+// (containers/podman#25881) and the container inherits the podman service's
+// limits instead — still safe, and the /api/status live probe reports what
+// the container actually got either way.
 const QUESTDB_ULIMITS = { nofile: 1048576 };
 
 // How often to re-check that the owned tables still have the correct `ts`
@@ -260,6 +274,12 @@ const SKIP_RECHECK_DELAY_MS = 3_000;
 // a runtime that stalls streaming logs must degrade the response (applyError
 // null), not hang it.
 const ENGINE_LOG_TIMEOUT_MS = 10_000;
+
+// Deadline for the live nofile probe inside /api/status. Same rationale as
+// ENGINE_LOG_TIMEOUT_MS, but tighter: the panel polls status every few
+// seconds, so a stalled probe must never back requests up behind it — on
+// timeout the clamp advisory is simply kept for this poll.
+const NOFILE_PROBE_TIMEOUT_MS = 3_000;
 
 function buildResourceLimits(config: Config): ContainerResourceLimits {
   return {
@@ -1289,6 +1309,58 @@ module.exports = (app: App) => {
             // wal_tables() itself is unavailable on non-WAL/older QuestDB, or
             // the tables don't exist yet during startup — treat as "not
             // suspended".
+          }
+
+          // The clamp advisory is a snapshot from the moment the container
+          // was created; the container may since have been recreated with the
+          // full limit (signalk-container's regrant on a raised host ceiling,
+          // an update, an out-of-band operator fix). While the advisory
+          // stands, verify it against the live limit on each poll and clear
+          // it once satisfied — the same self-healing the hostMaxMapCount
+          // probe above has. Requires signalk-container >= 1.25.3; without
+          // the probe the advisory clears on the next plugin start.
+          if (ulimitClamp && currentConfig?.managedContainer !== false) {
+            const containers = (globalThis as any)
+              .__signalk_containerManager as ContainerManagerApi | undefined;
+            if (containers?.getContainerNofile) {
+              // Capture what the probe is verifying: if an update recreates
+              // the container while the probe is in flight (containerEpoch
+              // bump) or the recreate records a NEW clamp, a stale probe
+              // result must not clear it. Bounded like fetchEngineLogLines —
+              // the container API mirror exposes no abort signal, so a
+              // stalled runtime must degrade the response (advisory kept),
+              // not hang the panel's status poll.
+              const observedClamp = ulimitClamp;
+              const observedEpoch = containerEpoch;
+              let probeTimer: NodeJS.Timeout | undefined;
+              try {
+                const live = await Promise.race([
+                  // The trailing catch keeps a probe that fails AFTER the
+                  // timeout won the race from surfacing as an unhandled
+                  // rejection.
+                  containers
+                    .getContainerNofile(QUESTDB_CONTAINER_NAME)
+                    .catch(() => null),
+                  new Promise<null>((resolve) => {
+                    probeTimer = setTimeout(
+                      () => resolve(null),
+                      NOFILE_PROBE_TIMEOUT_MS,
+                    );
+                  }),
+                ]);
+                if (
+                  nofileClampSatisfied(observedClamp.requested, live) &&
+                  ulimitClamp === observedClamp &&
+                  containerEpoch === observedEpoch
+                ) {
+                  ulimitClamp = null;
+                }
+              } catch {
+                // Probe failure — keep the advisory rather than guess.
+              } finally {
+                if (probeTimer) clearTimeout(probeTimer);
+              }
+            }
           }
 
           res.json({
