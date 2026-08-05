@@ -133,7 +133,7 @@ interface ContainerManagerApi {
    * (live /proc probe, falling back to the create-time inspect echo); null
    * means unknown. Used to verify a recorded ulimit clamp against reality
    * and clear the stale advisory. Optional: requires signalk-container >=
-   * 1.26.0; on older versions the advisory clears on the next plugin start.
+   * 1.25.3; on older versions the advisory clears on the next plugin start.
    */
   getContainerNofile?: (
     name: string,
@@ -1317,7 +1317,7 @@ module.exports = (app: App) => {
           // an update, an out-of-band operator fix). While the advisory
           // stands, verify it against the live limit on each poll and clear
           // it once satisfied — the same self-healing the hostMaxMapCount
-          // probe above has. Requires signalk-container >= 1.26.0; without
+          // probe above has. Requires signalk-container >= 1.25.3; without
           // the probe the advisory clears on the next plugin start.
           if (ulimitClamp && currentConfig?.managedContainer !== false) {
             const containers = (globalThis as any)
