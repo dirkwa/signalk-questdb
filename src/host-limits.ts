@@ -48,6 +48,25 @@ export function evaluateMaxMapCount(current: number): MaxMapCountStatus {
   };
 }
 
+/** The nofile limits a container actually runs with, as reported live. */
+export interface NofileLimits {
+  soft: number;
+  hard: number;
+}
+
+// A recorded ulimit-clamp advisory is a snapshot from the moment the
+// container was created; the container may since have been recreated with
+// the full limit (by signalk-container's regrant, or out-of-band by the
+// operator). The advisory is stale — and must be cleared — once the live
+// limits satisfy the request. Soft AND hard must both satisfy it: the soft
+// limit is what actually bounds the process's fd allocation.
+export function nofileClampSatisfied(
+  requested: number,
+  live: NofileLimits | null,
+): boolean {
+  return live !== null && live.soft >= requested && live.hard >= requested;
+}
+
 // Null on non-Linux, unreadable proc, or unparseable content — callers treat
 // null as "unknown, say nothing" rather than warning on speculation.
 export async function readMaxMapCount(
