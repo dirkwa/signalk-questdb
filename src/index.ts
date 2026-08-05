@@ -252,6 +252,10 @@ const QUESTDB_HEALTHCHECK = {
 // so we pin it on the container. signalk-container clamps it down to what the
 // host can actually grant (a rootless container cannot exceed the calling
 // user's hard limit), so this is safe even where the host limit is lower.
+// Caveat: rootless podman < 5.5.0 drops this request over the compat API
+// (containers/podman#25881) and the container inherits the podman service's
+// limits instead — still safe, and the /api/status live probe reports what
+// the container actually got either way.
 const QUESTDB_ULIMITS = { nofile: 1048576 };
 
 // How often to re-check that the owned tables still have the correct `ts`
