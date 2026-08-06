@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { minimatch } from "minimatch";
-import { PathMatcher, RateMatcher } from "../path-matcher";
+import { PathMatcher, RateMatcher, Throttle } from "../path-matcher";
 
 describe("PathMatcher", () => {
   it("matches literal patterns exactly", () => {
@@ -208,5 +208,85 @@ describe("RateMatcher memoization", () => {
     for (let i = 0; i < 3; i++) {
       assert.equal(r.rateFor("navigation.position"), null);
     }
+  });
+});
+
+describe("Throttle", () => {
+  const T0 = 1_000_000;
+
+  it("throttles per path AND context, never across vessels", () => {
+    // The issue #93 regression: two AIS targets updating the same path
+    // inside one sampling window must BOTH record.
+    const t = new Throttle();
+    assert.equal(
+      t.shouldDrop("navigation.position", "vessels.a", 2000, T0),
+      false,
+    );
+    assert.equal(
+      t.shouldDrop("navigation.position", "vessels.b", 2000, T0 + 10),
+      false,
+    );
+    assert.equal(
+      t.shouldDrop("navigation.position", "self", 2000, T0 + 20),
+      false,
+    );
+  });
+
+  it("drops a same-pair update inside the window and passes it after", () => {
+    const t = new Throttle();
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0), false);
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0 + 1999), true);
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0 + 2000), false);
+  });
+
+  it("a dropped update does not extend the window", () => {
+    const t = new Throttle();
+    t.shouldDrop("a.b", "self", 2000, T0);
+    t.shouldDrop("a.b", "self", 2000, T0 + 1500);
+    // Window still measures from T0, not from the dropped attempt.
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0 + 2100), false);
+  });
+
+  it("treats a non-positive rate as no throttling", () => {
+    const t = new Throttle();
+    assert.equal(t.shouldDrop("a.b", "self", 0, T0), false);
+    assert.equal(t.shouldDrop("a.b", "self", 0, T0 + 1), false);
+    assert.equal(t.shouldDrop("a.b", "self", -5, T0 + 2), false);
+  });
+
+  it("clear() forgets all pairs", () => {
+    const t = new Throttle();
+    t.shouldDrop("a.b", "self", 2000, T0);
+    t.clear();
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0 + 1), false);
+  });
+
+  it("evicts pairs older than every sampling window at the cap", () => {
+    // Months of transient AIS contexts must not grow the map forever: a
+    // pair whose last write predates every window can never throttle
+    // again, so crossing the cap sweeps them out.
+    const t = new Throttle(3);
+    t.shouldDrop("p", "vessels.a", 2000, T0);
+    t.shouldDrop("p", "vessels.b", 2000, T0);
+    t.shouldDrop("p", "vessels.c", 2000, T0);
+    assert.equal(t.size, 3);
+    t.shouldDrop("p", "vessels.d", 2000, T0 + 2500);
+    assert.equal(t.size, 1, "stale pairs swept, only the new pair kept");
+  });
+
+  it("falls back to a full clear when every pair is still active", () => {
+    // Pressure valve: if the cap is reached by genuinely concurrent pairs,
+    // bounded memory wins over throttling continuity.
+    const t = new Throttle(3);
+    t.shouldDrop("p", "vessels.a", 2000, T0);
+    t.shouldDrop("p", "vessels.b", 2000, T0);
+    t.shouldDrop("p", "vessels.c", 2000, T0);
+    t.shouldDrop("p", "vessels.d", 2000, T0 + 100);
+    assert.equal(t.size, 1, "active pairs cleared to admit the new one");
+    assert.equal(
+      t.shouldDrop("p", "vessels.b", 2000, T0 + 200),
+      false,
+      "a cleared pair records again immediately",
+    );
   });
 });
