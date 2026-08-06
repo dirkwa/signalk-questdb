@@ -1,4 +1,47 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
+// Type-only, always: this file is bundled for the browser, so a value import
+// reaching out of src/configpanel/ would pull the server module's runtime
+// dependencies (typebox, fs/promises) into the panel bundle.
+import type { Config } from "../config/schema";
+import type {
+  ApiError,
+  DbStatus,
+  MigrationDetectResponse,
+  MigrationSource,
+  QuestdbVersion,
+  ResumeWalResponse,
+  SkipWalResponse,
+  UpdateApplyResponse,
+  UpdateInfo,
+  WalDiagnosis,
+} from "../api-contract";
+import type { SkipPlan } from "../wal-monitor";
+
+type FilterMode = Config["pathFilter"]["mode"];
+type Compression = Config["compression"];
+
+/** `catch` binds `unknown` under strict mode; mirrors the idiom in index.ts. */
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Both fields are optional on every response — a body that failed to parse,
+ * or an error shape from a proxy rather than the plugin, carries neither.
+ * Interpolating them raw renders the literal string "undefined" at the user.
+ */
+function apiText(value: string | undefined, fallback: string): string {
+  return value ?? fallback;
+}
+
+const COMPRESSIONS = ["none", "lz4", "zstd"] as const;
+
+/** A <select> value is `string` to the type system; narrow it back. */
+function toCompression(value: string): Compression {
+  return (COMPRESSIONS as readonly string[]).includes(value)
+    ? (value as Compression)
+    : "lz4";
+}
 
 const S = {
   root: {
@@ -202,9 +245,19 @@ const S = {
   },
   statValue: { fontSize: 22, fontWeight: 700, color: "#333" },
   statLabel: { fontSize: 11, color: "#888", marginTop: 2 },
-};
+  // `satisfies` rather than a type annotation: it checks every value against
+  // CSSProperties while keeping each key's literal type, so `textAlign:
+  // "center"` stays assignable where a widened `string` would not. An
+  // annotation would also make every key name valid and lose typo checking.
+} satisfies Record<string, React.CSSProperties>;
 
-function CollapsibleSection({ title, children }) {
+function CollapsibleSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <div>
@@ -245,15 +298,29 @@ function CollapsibleSection({ title, children }) {
   );
 }
 
-function formatNumber(n) {
+function formatNumber(n: number | null | undefined): string {
   if (n === null || n === undefined) return "—";
   if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
   if (n >= 1000) return (n / 1000).toFixed(1) + "K";
   return String(n);
 }
 
-export default function PluginConfigurationPanel({ configuration, save }) {
-  const cfg = configuration || {};
+interface PluginConfigurationPanelProps {
+  configuration?: Config;
+  // Partial<Config>, not Config: the panel spreads the stored configuration
+  // and overwrites only the keys it manages, so what it hands back is
+  // whatever was stored plus this panel's fields — a config predating a
+  // schema addition still misses that key. That is the contract
+  // normalizeConfig() in config/schema.ts is written to accept; claiming
+  // Config here would assert a completeness neither side believes in.
+  save: (config: Partial<Config>) => void;
+}
+
+export default function PluginConfigurationPanel({
+  configuration,
+  save,
+}: PluginConfigurationPanelProps) {
+  const cfg: Partial<Config> = configuration || {};
 
   const [questdbHost, setQuestdbHost] = useState(
     cfg.questdbHost || "127.0.0.1",
@@ -286,7 +353,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   // Hydrate defensively: a hand-edited or corrupted config could carry a bad
   // mode or a non-array `paths`, and an unguarded `.join()` would crash the
   // whole panel render.
-  const [filterMode, setFilterMode] = useState(
+  const [filterMode, setFilterMode] = useState<FilterMode>(
     cfg.pathFilter?.mode === "include" ? "include" : "exclude",
   );
   // One glob per line in the textarea; round-tripped to/from the schema's
@@ -296,7 +363,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       "\n",
     ),
   );
-  const [compression, setCompression] = useState(cfg.compression || "lz4");
+  const [compression, setCompression] = useState<Compression>(
+    cfg.compression || "lz4",
+  );
   const [compressionLevel, setCompressionLevel] = useState(
     cfg.compressionLevel || 3,
   );
@@ -307,22 +376,24 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     cfg.exposeToContainers || false,
   );
 
-  const [versions, setVersions] = useState([]);
+  const [versions, setVersions] = useState<QuestdbVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
-  const [dbStatus, setDbStatus] = useState(null);
+  const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
-  const [migrationSources, setMigrationSources] = useState(null);
+  const [migrationSources, setMigrationSources] = useState<
+    MigrationSource[] | null
+  >(null);
   const [migrationDetecting, setMigrationDetecting] = useState(false);
   const [migrationUrl, setMigrationUrl] = useState("");
   const [actionStatus, setActionStatus] = useState("");
   const [statusError, setStatusError] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [purging, setPurging] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeOutcome, setResumeOutcome] = useState("");
-  const [walDiag, setWalDiag] = useState(null);
+  const [walDiag, setWalDiag] = useState<WalDiagnosis | null>(null);
   // True when the most recent diagnosis refresh failed: the displayed data
   // is kept (better than flapping controls away) but anything destructive
   // derived from it — the manual FROM TXN statement, the skip button — is
@@ -339,7 +410,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     try {
       const res = await fetch("/plugins/signalk-questdb/api/versions");
       if (res.ok) {
-        const data = await res.json();
+        const data = (await res.json()) as QuestdbVersion[];
         setVersions(data);
       }
     } catch {
@@ -355,7 +426,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       // panel must still surface (hostMaxMapCount — mmap exhaustion is one
       // of the ways QuestDB becomes unhealthy). Unparseable bodies fall
       // through to the plain not_running shape.
-      const body = await res.json().catch(() => null);
+      const body = (await res.json().catch(() => null)) as DbStatus | null;
       setDbStatus(
         body && typeof body === "object" ? body : { status: "not_running" },
       );
@@ -365,7 +436,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     setStatusLoading(false);
   }, []);
 
-  const fetchWalDiagnosis = useCallback(async (signal) => {
+  const fetchWalDiagnosis = useCallback(async (signal?: AbortSignal) => {
     const gen = ++walDiagGen.current;
     try {
       const res = await fetch("/plugins/signalk-questdb/api/wal-diagnosis", {
@@ -373,7 +444,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       });
       if (gen !== walDiagGen.current) return;
       if (res.ok) {
-        const data = await res.json();
+        const data = (await res.json()) as WalDiagnosis;
         if (gen !== walDiagGen.current) return;
         setWalDiag(data);
         setWalDiagStale(false);
@@ -410,7 +481,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     // must only start after the previous one settled. Cleanup aborts the
     // in-flight request so a banner unmount doesn't leave it dangling.
     let cancelled = false;
-    let timer = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const controller = new AbortController();
     const poll = async () => {
       await fetchWalDiagnosis(controller.signal);
@@ -426,7 +497,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     };
   }, [suspendedNow, fetchWalDiagnosis]);
 
-  const handleSkipWal = async (tableName, plan) => {
+  const handleSkipWal = async (tableName: string, plan: SkipPlan) => {
     const backlogWarning = plan.tailSkip
       ? "\n\nWARNING: this is the newest pending segment — skipping it drops the ENTIRE pending backlog."
       : "";
@@ -452,16 +523,20 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         // can only ever confirm exactly the loss they were shown.
         body: JSON.stringify({ table: tableName, confirmPlan: plan }),
       });
-      const data = await res.json().catch(() => ({ error: res.statusText }));
+      const data = (await res
+        .json()
+        .catch(() => ({ error: res.statusText }))) as SkipWalResponse;
       if (res.ok) {
-        setResumeOutcome(data.message);
+        setResumeOutcome(data.message ?? "");
       } else {
-        setResumeOutcome(`Skip failed: ${data.error}`);
+        setResumeOutcome(
+          `Skip failed: ${apiText(data.error, "unknown error")}`,
+        );
       }
       fetchStatus();
       fetchWalDiagnosis();
     } catch (e) {
-      setResumeOutcome(`Skip failed: ${e.message}`);
+      setResumeOutcome(`Skip failed: ${errorMessage(e)}`);
     }
     setSkipping(false);
   };
@@ -471,7 +546,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     try {
       const res = await fetch("/plugins/signalk-questdb/api/update/check");
       if (res.ok) {
-        setUpdateInfo(await res.json());
+        setUpdateInfo((await res.json()) as UpdateInfo);
       }
     } catch {
       // silently fail
@@ -488,20 +563,24 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         method: "POST",
       });
       if (res.ok) {
-        const data = await res.json();
-        setActionStatus(data.message);
+        const data = (await res.json()) as UpdateApplyResponse;
+        setActionStatus(data.message ?? "");
         setUpdateInfo(null);
         if (data.newVersion) {
           setQuestdbVersion(data.newVersion);
         }
         fetchStatus();
       } else {
-        const data = await res.json().catch(() => ({ error: res.statusText }));
-        setActionStatus(`Update failed: ${data.error}`);
+        const data = (await res
+          .json()
+          .catch(() => ({ error: res.statusText }))) as UpdateApplyResponse;
+        setActionStatus(
+          `Update failed: ${apiText(data.error, "unknown error")}`,
+        );
         setStatusError(true);
       }
     } catch (e) {
-      setActionStatus(`Update failed: ${e.message}`);
+      setActionStatus(`Update failed: ${errorMessage(e)}`);
       setStatusError(true);
     }
     setUpdating(false);
@@ -522,16 +601,20 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       const res = await fetch("/plugins/signalk-questdb/api/purge-data", {
         method: "POST",
       });
-      const data = await res.json().catch(() => ({ error: res.statusText }));
+      const data = (await res
+        .json()
+        .catch(() => ({ error: res.statusText }))) as ApiError;
       if (res.ok) {
-        setActionStatus(data.message);
+        setActionStatus(data.message ?? "");
         fetchStatus();
       } else {
-        setActionStatus(`Remove failed: ${data.error}`);
+        setActionStatus(
+          `Remove failed: ${apiText(data.error, "unknown error")}`,
+        );
         setStatusError(true);
       }
     } catch (e) {
-      setActionStatus(`Remove failed: ${e.message}`);
+      setActionStatus(`Remove failed: ${errorMessage(e)}`);
       setStatusError(true);
     }
     setPurging(false);
@@ -544,22 +627,26 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       const res = await fetch("/plugins/signalk-questdb/api/resume-wal", {
         method: "POST",
       });
-      const data = await res.json().catch(() => ({ error: res.statusText }));
+      const data = (await res
+        .json()
+        .catch(() => ({ error: res.statusText }))) as ResumeWalResponse;
       if (res.ok) {
         const failed = (data.results || []).filter((r) => !r.ok);
         setResumeOutcome(
           failed.length === 0
-            ? `${data.message}. Recording resumes as the backlog drains — the banner clears once tables catch up.`
-            : `${data.message}. ` +
+            ? `${apiText(data.message, "Resume requested")}. Recording resumes as the backlog drains — the banner clears once tables catch up.`
+            : `${apiText(data.message, "Resume requested")}. ` +
                 failed.map((r) => `${r.table}: ${r.error}`).join(" · "),
         );
         fetchStatus();
         fetchWalDiagnosis();
       } else {
-        setResumeOutcome(`Resume failed: ${data.error}`);
+        setResumeOutcome(
+          `Resume failed: ${apiText(data.error, "unknown error")}`,
+        );
       }
     } catch (e) {
-      setResumeOutcome(`Resume failed: ${e.message}`);
+      setResumeOutcome(`Resume failed: ${errorMessage(e)}`);
     }
     setResuming(false);
   };
@@ -575,7 +662,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         `/plugins/signalk-questdb/api/migration/detect${params}`,
       );
       if (res.ok) {
-        const data = await res.json();
+        const data = (await res.json()) as MigrationDetectResponse;
         setMigrationSources(data.sources);
         if (data.sources.length === 0) {
           setActionStatus(
@@ -587,7 +674,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         }
       }
     } catch (e) {
-      setActionStatus("Detection failed: " + e.message);
+      setActionStatus("Detection failed: " + errorMessage(e));
       setStatusError(true);
     }
     setMigrationDetecting(false);
@@ -620,7 +707,10 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       setStatusError(true);
       return;
     }
-    save({
+    // `satisfies` rather than a bare argument: it rejects a key that is not
+    // in the schema, so a rename or typo here becomes a compile error
+    // instead of a value silently written under a key nothing reads.
+    const next = {
       // Spread the stored configuration first so keys this panel does not
       // manage (questdbMemoryLimit, questdbCpuLimit, hand-edited extras)
       // survive a save — replacing the config wholesale silently stripped
@@ -649,7 +739,8 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           .filter(Boolean),
       },
       samplingRates: cfg.samplingRates || {},
-    });
+    } satisfies Partial<Config>;
+    save(next);
     setActionStatus("Saved! Plugin will restart with new configuration.");
     setStatusError(false);
   };
@@ -667,8 +758,12 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       const url = `/plugins/signalk-questdb/api/export?from=${encodeURIComponent(exportFrom)}&to=${encodeURIComponent(exportTo)}&format=${exportFormat}`;
       const res = await fetch(url);
       if (!res.ok) {
-        const data = await res.json().catch(() => ({ error: res.statusText }));
-        setActionStatus(`Export failed: ${data.error}`);
+        const data = (await res
+          .json()
+          .catch(() => ({ error: res.statusText }))) as ApiError;
+        setActionStatus(
+          `Export failed: ${apiText(data.error, "unknown error")}`,
+        );
         setStatusError(true);
         setExporting(false);
         return;
@@ -682,7 +777,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       URL.revokeObjectURL(a.href);
       setActionStatus(`Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB`);
     } catch (e) {
-      setActionStatus(`Export failed: ${e.message}`);
+      setActionStatus(`Export failed: ${errorMessage(e)}`);
       setStatusError(true);
     }
     setExporting(false);
@@ -1289,7 +1384,13 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           <select
             style={S.select}
             value={filterMode}
-            onChange={(e) => setFilterMode(e.target.value)}
+            // Narrow rather than cast, matching how the state is hydrated:
+            // a <select> value is only ever `string` to the type system.
+            onChange={(e) =>
+              setFilterMode(
+                e.target.value === "include" ? "include" : "exclude",
+              )
+            }
           >
             <option value="exclude">Exclude matching paths</option>
             <option value="include">Include only matching paths</option>
@@ -1320,7 +1421,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           <select
             style={S.select}
             value={compression}
-            onChange={(e) => setCompression(e.target.value)}
+            onChange={(e) => setCompression(toCompression(e.target.value))}
           >
             <option value="none">None</option>
             <option value="lz4">LZ4 (fast)</option>

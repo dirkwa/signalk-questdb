@@ -29,6 +29,17 @@ import {
   type Endpoint,
 } from "./questdb-endpoint";
 import { nofileClampSatisfied, readMaxMapCount } from "./host-limits";
+import type {
+  DbStatus,
+  MigrationDetectResponse,
+  QuestdbVersion,
+  ResumeWalResponse,
+  SkipWalResponse,
+  UpdateApplyResponse,
+  UpdateInfo,
+  WalDiagnosis,
+  WalDiagnosisTable,
+} from "./api-contract";
 import { buildContainerEnv } from "./container-env";
 import { PathMatcher, RateMatcher, Throttle } from "./path-matcher";
 
@@ -1307,7 +1318,7 @@ module.exports = (app: App) => {
       router.get("/api/status", async (_req, res) => {
         try {
           if (!queryClient) {
-            res.status(503).json({ status: "not_running" });
+            res.status(503).json({ status: "not_running" } satisfies DbStatus);
             return;
           }
 
@@ -1327,7 +1338,10 @@ module.exports = (app: App) => {
 
           const healthy = await queryClient.isHealthy();
           if (!healthy) {
-            res.status(503).json({ status: "unhealthy", hostMaxMapCount });
+            res.status(503).json({
+              status: "unhealthy",
+              hostMaxMapCount,
+            } satisfies DbStatus);
             return;
           }
 
@@ -1441,7 +1455,7 @@ module.exports = (app: App) => {
             endpoint: questdbEndpoints
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
               : null,
-          });
+          } satisfies DbStatus);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",
@@ -1517,7 +1531,7 @@ module.exports = (app: App) => {
             .map((r) => ({
               tag: r.tag_name,
               prerelease: r.prerelease,
-            }));
+            })) satisfies QuestdbVersion[];
           res.json(versions);
         } catch (err) {
           res.status(500).json({
@@ -1577,7 +1591,11 @@ module.exports = (app: App) => {
             latestVersion !== "unknown" &&
             semverGreater(currentVersion, latestVersion);
 
-          res.json({ currentVersion, latestVersion, updateAvailable });
+          res.json({
+            currentVersion,
+            latestVersion,
+            updateAvailable,
+          } satisfies UpdateInfo);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",
@@ -1759,7 +1777,7 @@ module.exports = (app: App) => {
             status: "updated",
             newVersion: newTag,
             message: `Updated to QuestDB ${newTag}. Container running.`,
-          });
+          } satisfies UpdateApplyResponse);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",
@@ -1838,7 +1856,7 @@ module.exports = (app: App) => {
               results.length === 0
                 ? "No suspended tables found"
                 : `Resumed ${results.filter((r) => r.ok).length} of ${results.length} suspended table(s)`,
-          });
+          } satisfies ResumeWalResponse);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : String(err),
@@ -1866,7 +1884,10 @@ module.exports = (app: App) => {
           );
           const logLines =
             suspended.length > 0 ? await fetchEngineLogLines() : null;
-          const tables = [];
+          // Annotated so every push is checked against the element shape;
+          // `satisfies WalDiagnosis` on the response alone would only check
+          // the wrapper.
+          const tables: WalDiagnosisTable[] = [];
           for (const table of suspended) {
             let segments: PendingSegment[] = [];
             let segmentError: string | null = null;
@@ -1898,7 +1919,7 @@ module.exports = (app: App) => {
               applyError,
             });
           }
-          res.json({ tables });
+          res.json({ tables } satisfies WalDiagnosis);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : String(err),
@@ -1946,7 +1967,7 @@ module.exports = (app: App) => {
               skipped: false,
               healed: true,
               message: `${table} is not suspended — nothing to skip.`,
-            });
+            } satisfies SkipWalResponse);
             return;
           }
 
@@ -1963,7 +1984,7 @@ module.exports = (app: App) => {
               skipped: false,
               healed: true,
               message: `Lossless resume succeeded on ${table} — no data was skipped. The backlog is now replaying.`,
-            });
+            } satisfies SkipWalResponse);
             return;
           }
           if (afterResume.writerTxn !== before.writerTxn) {
@@ -1972,7 +1993,7 @@ module.exports = (app: App) => {
               healed: false,
               progressed: true,
               message: `The writer advanced on ${table} before re-suspending — the situation changed. Re-run the diagnosis.`,
-            });
+            } satisfies SkipWalResponse);
             return;
           }
 
@@ -2071,7 +2092,7 @@ module.exports = (app: App) => {
             message: afterSkip
               ? `Skipped ${plan.skippedTxns} txn(s) on ${table}, but the table re-suspended at txn ${afterSkip.writerTxn + 1} — another segment appears unreadable. Re-run the diagnosis to skip it too.`
               : `Skipped ${plan.skippedTxns} txn(s) on ${table} (${plan.skipWindowStart} → ${plan.skipWindowEnd}). The remaining backlog is replaying.`,
-          });
+          } satisfies SkipWalResponse);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : String(err),
@@ -2297,7 +2318,7 @@ module.exports = (app: App) => {
           // not running
         }
 
-        res.json({ sources });
+        res.json({ sources } satisfies MigrationDetectResponse);
       });
 
       router.get("/api/export", async (req, res) => {
