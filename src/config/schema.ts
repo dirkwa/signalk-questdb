@@ -90,7 +90,7 @@ export const ConfigSchema = Type.Object({
     title: "Record own vessel",
   }),
   recordOthers: Type.Boolean({
-    default: false,
+    default: true,
     title: "Record AIS targets",
   }),
 
@@ -149,5 +149,10 @@ export function normalizeConfig(config: Config): Config {
       paths: config.pathFilter?.paths ?? [],
     },
     samplingRates: config.samplingRates ?? {},
+    // Missing recording toggles get the schema defaults (both ON). The
+    // runtime guards read these directly, so without this a hand-edited or
+    // pre-panel config silently disabled the recording the schema promises.
+    recordSelf: config.recordSelf !== false,
+    recordOthers: config.recordOthers !== false,
   };
 }
