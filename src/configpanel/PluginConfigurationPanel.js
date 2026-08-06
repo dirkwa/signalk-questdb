@@ -276,6 +276,12 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [defaultSamplingRate, setDefaultSamplingRate] = useState(
     cfg.defaultSamplingRate ?? 2000,
   );
+  // Kept as the raw input string: coercing per keystroke turns a cleared
+  // field into 0 and partial input into NaN mid-edit. doSave parses and
+  // validates once.
+  const [ilpFlushIntervalMs, setIlpFlushIntervalMs] = useState(
+    String(cfg.ilpFlushIntervalMs ?? 5000),
+  );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
   // Hydrate defensively: a hand-edited or corrupted config could carry a bad
   // mode or a non-array `paths`, and an unguarded `.join()` would crash the
@@ -600,6 +606,20 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [exporting, setExporting] = useState(false);
 
   const doSave = () => {
+    // The min/max attributes only hint, and the state holds the raw input
+    // string — parse and gate here so a bad interval can never reach the
+    // flush timer.
+    const batchIntervalMs = Number(ilpFlushIntervalMs);
+    if (
+      ilpFlushIntervalMs === "" ||
+      !Number.isFinite(batchIntervalMs) ||
+      batchIntervalMs < 500 ||
+      batchIntervalMs > 300000
+    ) {
+      setActionStatus("Write batch interval must be 500–300000 ms.");
+      setStatusError(true);
+      return;
+    }
     save({
       questdbHost,
       questdbIlpPort,
@@ -608,6 +628,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       questdbVersion,
       managedContainer,
       defaultSamplingRate,
+      ilpFlushIntervalMs: batchIntervalMs,
       recordSelf,
       recordOthers,
       retentionDays,
@@ -1206,6 +1227,23 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         />
         <span style={S.hint}>
           1000 = max 1 write/sec per path (0 = every update)
+        </span>
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Write batch interval (ms)</span>
+        <input
+          style={S.inputSmall}
+          type="number"
+          min={500}
+          max={300000}
+          aria-label="Write batch interval in milliseconds"
+          value={ilpFlushIntervalMs}
+          onChange={(e) => setIlpFlushIntervalMs(e.target.value)}
+        />
+        <span style={S.hint}>
+          one QuestDB transaction per table per interval; longer = bigger
+          batches, but up to this many ms lost on a hard crash (default 5000)
         </span>
       </div>
 

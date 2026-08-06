@@ -206,6 +206,30 @@ then browse to `http://localhost:9000`, or enable **"Bind to 0.0.0.0"** in the
 plugin config and use `http://<signalk-host-ip>:9000` (this exposes QuestDB to
 your network — see the warning under Grafana Integration).
 
+### The "Small transactions — consider batching" alert
+
+The console's Monitoring view flags any table whose 90th-percentile WAL
+transaction stays under QuestDB's recommended batch size (100 rows).
+`signalk_position` triggers this **structurally**: the plugin commits its
+write buffer every "Write batch interval", each commit is one WAL transaction
+per table, and the position table holds exactly one path — so its share of
+every commit is just the handful of GPS fixes since the last one. The other
+tables spread hundreds of paths across each transaction and are rarely
+flagged.
+
+At vessel data rates this alert is cosmetic. The numbers that actually matter
+are on the same page: **Write Amplification** near 1x, **Pending Rows** 0, and
+**Transaction Lag** 0 mean the WAL apply is perfectly healthy — QuestDB merges
+many small transactions per apply cycle anyway.
+
+If you want bigger transactions regardless, raise **"Write batch interval"**
+in the plugin config. Clearing the alert for the position table needs roughly
+100 fixes per commit — a batch window in the minutes, not seconds (the exact
+numbers depend on your sampling rate; the config panel states the current
+bounds). The trade-off is honest: up to one batch interval of buffered data is
+lost on a hard crash (a clean Signal K shutdown flushes first), and live-ish
+history queries see new data that much later.
+
 ## Performance (Pi / Low-Power Devices)
 
 The plugin is optimized for Raspberry Pi and similar low-power devices:
