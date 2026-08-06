@@ -5,8 +5,8 @@ import {
   validateTimestamp,
   isReadOnlySQL,
   QueryClient,
-} from "../query-client";
-import type { QuestDBResult } from "../query-client";
+} from "../query-client.js";
+import type { QuestDBResult } from "../query-client.js";
 
 // Build a QueryClient whose exec() is stubbed: every call records the SQL and
 // returns the next canned result (a single-column `column` dataset for the

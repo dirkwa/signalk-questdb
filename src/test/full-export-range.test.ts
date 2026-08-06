@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildFullExportWhere } from "../full-export-range";
+import { buildFullExportWhere } from "../full-export-range.js";
 
 describe("buildFullExportWhere", () => {
   it("returns empty WHERE when both params are unset (full-table behavior)", () => {

@@ -1,7 +1,15 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "commonjs",
+
+    // The package is "type": "module", so the emitted dist/ must be real ESM.
+    // nodenext resolution is what makes tsc enforce Node's actual ESM rules —
+    // notably that relative imports carry the emitted `.js` extension. Under
+    // "bundler" resolution tsc accepts extensionless specifiers and emits them
+    // verbatim, which Node then rejects at load with ERR_MODULE_NOT_FOUND.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,

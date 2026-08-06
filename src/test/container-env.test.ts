@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildContainerEnv, QUESTDB_COMMIT_MODE } from "../container-env";
-import type { Config } from "../config/schema";
+import { buildContainerEnv, QUESTDB_COMMIT_MODE } from "../container-env.js";
+import type { Config } from "../config/schema.js";
 
 const baseConfig = { compression: "none" } as Partial<Config>;
 

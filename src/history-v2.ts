@@ -2,8 +2,8 @@ import {
   QueryClient,
   validateIdentifier,
   validateTimestamp,
-} from "./query-client";
-import { resolveTimeRange, ResolvedRange } from "./time-range";
+} from "./query-client.js";
+import { resolveTimeRange, ResolvedRange } from "./time-range.js";
 
 interface PathSpec {
   path: string;

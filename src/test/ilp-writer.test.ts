@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as net from "net";
-import { ILPWriter, DEFAULT_FLUSH_INTERVAL_MS } from "../ilp-writer";
+import { ILPWriter, DEFAULT_FLUSH_INTERVAL_MS } from "../ilp-writer.js";
 
 describe("ILPWriter", () => {
   it("sends correctly formatted ILP lines over TCP", async () => {

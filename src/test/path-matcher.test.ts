@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { minimatch } from "minimatch";
-import { PathMatcher, RateMatcher, Throttle } from "../path-matcher";
+import { PathMatcher, RateMatcher, Throttle } from "../path-matcher.js";
 
 describe("PathMatcher", () => {
   it("matches literal patterns exactly", () => {

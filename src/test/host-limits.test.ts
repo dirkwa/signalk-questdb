@@ -9,7 +9,7 @@ import {
   evaluateMaxMapCount,
   readMaxMapCount,
   RECOMMENDED_MAX_MAP_COUNT,
-} from "../host-limits";
+} from "../host-limits.js";
 
 describe("parseMaxMapCount", () => {
   it("parses the proc file format (number + trailing newline)", () => {

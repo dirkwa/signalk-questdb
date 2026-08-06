@@ -11,7 +11,7 @@ import {
   type SkipPlan,
   type SuspendedTable,
   type WalMonitorDeps,
-} from "../wal-monitor";
+} from "../wal-monitor.js";
 
 function segment(overrides: Partial<PendingSegment> = {}): PendingSegment {
   return {
