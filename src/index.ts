@@ -7,7 +7,7 @@ import { extractVesselName, routeDeltaValue } from "./delta-routing.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
 import { startRetention } from "./retention.js";
-import { restoreFromHistory } from "./restore.js";
+import { RESTORE_SOURCE, restoreFromHistory } from "./restore.js";
 import { buildFullExportWhere } from "./full-export-range.js";
 import {
   WalMonitor,
@@ -1026,6 +1026,14 @@ export default (app: App) => {
       if (!writer) return;
       const { path, value, context } = delta;
 
+      // Values this plugin replayed at startup come straight back around
+      // through the streambundle. Recording them would re-stamp historical
+      // fixes with the current receive time — inventing present-tense
+      // positions for vessels that may be long gone — and marking their
+      // context live would defeat the guard that stops a restore from
+      // overwriting a vessel that actually transmitted.
+      if (delta.$source === RESTORE_SOURCE) return;
+
       // Note the context BEFORE any early return or filter: identity-only
       // deltas return below, and path filters and throttles decide what gets
       // STORED — but any delta at all proves the vessel is transmitting now,
@@ -1240,7 +1248,7 @@ export default (app: App) => {
     // The recorder is already subscribed, so live deltas keep arriving while
     // the (slow, whole-table) restore query runs. Those are newer by
     // definition: replaying a stored fix over a vessel that just transmitted
-    // would move it BACKWARDS on the chart. liveSince records what the
+    // would move it BACKWARDS on the chart. liveContexts records what the
     // recorder saw and the restore skips those contexts entirely.
     if (config.restoreOnStart) {
       const restoreGeneration = lifecycleGeneration;

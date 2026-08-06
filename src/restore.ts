@@ -18,6 +18,14 @@ import type { QueryClient } from "./query-client.js";
  * as a fresh contact.
  */
 
+/**
+ * Marks a delta as replayed history rather than a live observation. The
+ * recorder filters on this: without it, restored values loop back through the
+ * streambundle and get re-recorded with the current receive time, inventing
+ * present-tense positions for vessels that may be long gone.
+ */
+export const RESTORE_SOURCE = "signalk-questdb.restore";
+
 export interface RestoreDeps {
   queryClient: Pick<QueryClient, "exec" | "toObjects">;
   handleMessage: (delta: unknown) => void;
@@ -240,11 +248,20 @@ export async function restoreFromHistory(
       continue;
     }
 
-    const deltaValues = [...entry.byPath].map(([path, row]) =>
-      row.isName
-        ? { path: "", value: { name: row.value as string } }
-        : { path, value: row.value },
-    );
+    // One update per distinct recorded time. These paths were sampled at
+    // different moments — an AIS name repeats every ~6 minutes while position
+    // arrives every few seconds — so putting them all under the newest
+    // timestamp would present a stale value as being as fresh as the fix.
+    const byTimestamp = new Map<string, { path: string; value: unknown }[]>();
+    for (const [path, row] of entry.byPath) {
+      const group = byTimestamp.get(row.ts) ?? [];
+      group.push(
+        row.isName
+          ? { path: "", value: { name: row.value as string } }
+          : { path, value: row.value },
+      );
+      byTimestamp.set(row.ts, group);
+    }
 
     // Stored "self" is a placeholder for whatever this server's self context
     // is; every other context is already a real Signal K context string.
@@ -252,19 +269,17 @@ export async function restoreFromHistory(
 
     handleMessage({
       context,
-      updates: [
-        {
-          // Mark the source so a consumer (or a human reading the delta
-          // stream) can tell a replayed value from a live one.
-          $source: "signalk-questdb.restore",
-          timestamp: entry.latestTs,
-          values: deltaValues,
-        },
-      ],
+      updates: [...byTimestamp].map(([timestamp, values]) => ({
+        // Marks the value as replayed history — for consumers, and for the
+        // recorder, which filters these out so they are not re-recorded.
+        $source: RESTORE_SOURCE,
+        timestamp,
+        values,
+      })),
     });
 
     contexts++;
-    values += deltaValues.length;
+    values += entry.byPath.size;
   }
 
   debug(

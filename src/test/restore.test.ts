@@ -76,6 +76,14 @@ function run(
 const position = (ctx: string, ageMs: number, lat = "-36.8", lon = "174.7") =>
   [ago(ageMs), "navigation.position", ctx, `${lat},${lon}`, "position"] as Row;
 
+// Values are split across one update per distinct recorded timestamp, so
+// assertions about "what was restored for this vessel" span all of them.
+const allValues = (delta: RestoredDelta): RestoredValue[] =>
+  delta.updates.flatMap((u) => u.values);
+
+const valueAt = (delta: RestoredDelta, path: string) =>
+  allValues(delta).find((v) => v.path === path);
+
 describe("restore: what reaches the data model", () => {
   it("replays an AIS target under its own context, not self", async () => {
     const { promise, deltas } = run([position(AIS, 60_000)]);
@@ -119,6 +127,57 @@ describe("restore: what reaches the data model", () => {
     await promise;
 
     assert.equal(deltas[0].updates[0].$source, "signalk-questdb.restore");
+  });
+});
+
+describe("restore: per-timestamp grouping", () => {
+  it("keeps each path under its own recorded time", async () => {
+    // An AIS name repeats every ~6 minutes while position arrives every few
+    // seconds. Putting both under the newest timestamp would present the
+    // stale name as being as fresh as the fix.
+    const rows: Row[] = [
+      position(AIS, 30_000),
+      [ago(6 * 60_000), "name", AIS, "Black Pearl", "identity"],
+    ];
+    const { promise, deltas } = run(rows);
+    await promise;
+
+    assert.equal(deltas[0].updates.length, 2);
+
+    const posUpdate = deltas[0].updates.find((u) =>
+      u.values.some((v) => v.path === "navigation.position"),
+    );
+    const nameUpdate = deltas[0].updates.find((u) =>
+      u.values.some((v) => v.path === ""),
+    );
+
+    assert.ok(posUpdate && nameUpdate);
+    assert.equal(posUpdate.timestamp, ago(30_000));
+    assert.equal(nameUpdate.timestamp, ago(6 * 60_000));
+  });
+
+  it("emits a single update when everything shares a timestamp", async () => {
+    const ts = ago(60_000);
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      [ts, "navigation.speedOverGround", AIS, "5.4", "number"],
+    ];
+    const { promise, deltas } = run(rows);
+    await promise;
+
+    assert.equal(deltas[0].updates.length, 1);
+    assert.equal(deltas[0].updates[0].timestamp, ts);
+  });
+
+  it("counts every restored value across updates", async () => {
+    const rows: Row[] = [
+      position(AIS, 30_000),
+      [ago(6 * 60_000), "name", AIS, "Black Pearl", "identity"],
+    ];
+    const { promise } = run(rows);
+    const result = await promise;
+
+    assert.equal(result.values, 2);
   });
 });
 
@@ -190,9 +249,7 @@ describe("restore: positionless contexts", () => {
     assert.equal(deltas.length, 1);
     // Names were received as empty-path object deltas and must replay in
     // that shape — the only one Freeboard reads names from.
-    const nameValue = deltas[0].updates[0].values.find(
-      (v: RestoredValue) => v.path === "",
-    );
+    const nameValue = valueAt(deltas[0], "");
     assert.deepEqual(nameValue, { path: "", value: { name: "Black Pearl" } });
   });
 
@@ -205,9 +262,7 @@ describe("restore: positionless contexts", () => {
     const { promise, deltas } = run(rows);
     await promise;
 
-    const entry = deltas[0].updates[0].values.find(
-      (v: RestoredValue) => v.path === "name",
-    );
+    const entry = valueAt(deltas[0], "name");
     assert.deepEqual(entry, { path: "name", value: "not-identity" });
   });
 });
@@ -281,9 +336,7 @@ describe("restore: duplicate rows across tables", () => {
     const { promise, deltas } = run(rows);
     await promise;
 
-    const state = deltas[0].updates[0].values.find(
-      (v: RestoredValue) => v.path === "navigation.state",
-    );
+    const state = valueAt(deltas[0], "navigation.state");
     assert.deepEqual(state, { path: "navigation.state", value: "sailing" });
   });
 
@@ -296,8 +349,8 @@ describe("restore: duplicate rows across tables", () => {
     const { promise, deltas } = run(rows);
     await promise;
 
-    const states = deltas[0].updates[0].values.filter(
-      (v: RestoredValue) => v.path === "navigation.state",
+    const states = allValues(deltas[0]).filter(
+      (v) => v.path === "navigation.state",
     );
     assert.equal(states.length, 1);
   });
@@ -313,9 +366,7 @@ describe("restore: value decoding", () => {
     const { promise, deltas } = run(rows);
     await promise;
 
-    const sog = deltas[0].updates[0].values.find(
-      (v: RestoredValue) => v.path === "navigation.speedOverGround",
-    );
+    const sog = valueAt(deltas[0], "navigation.speedOverGround");
     assert.ok(sog, "expected speedOverGround to be restored");
     assert.equal(sog.value, 5.4);
     assert.equal(typeof sog.value, "number");
