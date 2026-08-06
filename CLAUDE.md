@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- `npm run build` — TypeScript compile (`tsc`) + panel typecheck + webpack bundle of the React config panel into `public/`
-- `npm run build:config` — Webpack only (rebuild the config panel without recompiling TS)
-- `npm run typecheck:panel` — typecheck the config panel (`tsc -p src/configpanel --noEmit`); webpack only strips its types, so this is the only thing that checks them
+- `npm run build` — TypeScript compile (`tsc`) + panel typecheck + Vite bundle of the React config panel into `public/`
+- `npm run build:config` — Vite only (rebuild the config panel without recompiling TS)
+- `npm run typecheck:panel` — typecheck the config panel (`tsc -p src/configpanel --noEmit`); Vite only strips its types, so this is the only thing that checks them
 - `npm run watch` — `tsc --watch` for the plugin source
 - `npm test` — runs the Node built-in test runner against compiled output (`node --test 'dist/test/**/*.test.js'`). Tests must be built first; use `npm run build:all` to build then test.
 - `npm run format` — prettier write + eslint --fix
@@ -22,7 +22,9 @@ This is a Signal K **server plugin** that ingests vessel data into a managed **Q
 ### Two surfaces
 
 1. **Plugin runtime** (`src/index.ts` and siblings) — compiled by `tsc` to `dist/`, loaded by Signal K server as `main` (`dist/index.js`). The package is **ESM** (`"type": "module"`): `src/index.ts` ends in `export default`, and Signal K's `importOrRequire()` unwraps it. Node ≥ 20.19 can `require()` an ESM module, so this works on both supported Node versions.
-2. **React config panel** (`src/configpanel/`) — TypeScript + JSX, bundled by webpack via **Module Federation** into `public/remoteEntry.js`, exposed to the Signal K Admin UI as `./PluginConfigurationPanel`. React 19 is shared as a singleton with the host UI. It has its own `tsconfig.json` (browser libs, classic JSX, `noEmit`) so DOM types never reach the Node compile.
+2. **React config panel** (`src/configpanel/`) — TypeScript + JSX, bundled by **Vite** (`vite.config.ts`) via **Module Federation** into `public/remoteEntry.js`, exposed to the Signal K Admin UI as `./PluginConfigurationPanel`. React 19 is shared as a singleton with the host UI. It has its own `tsconfig.json` (browser libs, classic JSX, `noEmit`) so DOM types never reach the Node compile.
+
+   Because the package is `"type": "module"`, the server injects the panel's script tag with `type="module"`, and the Admin UI then loads it as an **ESM remote**: `await import(remoteEntry.js)` expecting exported `get`/`init` (see the admin UI's `views/Webapps/dynamicutilities.ts`). Vite's federation output provides exactly that.
 
 Both build outputs are shipped in the npm package; `prepublishOnly` rebuilds them.
 
@@ -59,9 +61,10 @@ Their wire shapes live in `src/api-contract.ts` and are shared by both surfaces:
 
 - TypeScript strict mode everywhere, panel included; do not loosen either `tsconfig.json`. In particular never add `jsx` or a DOM `lib` to the root one — server code referencing `document` would then typecheck clean.
 - **Relative imports in the runtime need the `.js` extension** (`./query-client.js`, even though the source is `.ts`). That is Node's ESM rule, enforced by `moduleResolution: "nodenext"`. Omitting it fails the build, which is the point — switching to `"bundler"` resolution would silently emit unresolvable specifiers instead.
-- **Tooling configs are `.cjs`** (`webpack.config.cjs`, `eslint.config.cjs`) because they use `require`, which `"type": "module"` forbids in `.js`. If you rename them again, update `.npmignore` — it excludes them by exact filename, and a stale entry silently publishes them.
+- **`eslint.config.cjs` is `.cjs`** because it uses `require`, which `"type": "module"` forbids in `.js`. `.npmignore` excludes config files by exact filename — rename one and a stale entry silently publishes it.
+- **The three ignore files serve opposite purposes for build output.** `public/assets/` is gitignored and prettier-ignored, but must NEVER be added to `.npmignore`: `remoteEntry.js` imports those chunks by name, so excluding them publishes a panel that 404s on load. Only genuinely local artifacts (`.mf/`) belong in all three.
 - Prettier + eslint flat config (`eslint.config.cjs`); run `npm run format` before committing.
 - The config panel uses React 19 with Module Federation — keep the federation `shared` block in sync with `package.json`'s React version.
-- **Classic JSX is load-bearing.** Babel's `runtime: "classic"` (webpack.config.cjs) and `"jsx": "react"` (panel tsconfig) must agree. The automatic runtime imports `react/jsx-runtime`, which is not in the federation `shared` scope, so webpack would bundle a second React into the remote and the Admin UI's panel loader breaks — at runtime, with no build error.
-- **Imports leaving `src/configpanel/` must be `import type`.** Babel strips types per-file without type information, so a value import pulls the module's runtime dependencies into the browser bundle (typebox via `config/schema`, `fs/promises` via `host-limits`). After changing panel imports, confirm with `grep -l "typebox\|fs/promises" public/*.js` — it must print nothing.
+- **Classic JSX is load-bearing.** `jsxRuntime: "classic"` (vite.config.ts) and `"jsx": "react"` (panel tsconfig) must agree. The automatic runtime imports `react/jsx-runtime`, which is not in the federation `shared` scope, so the remote would carry its own copy of React's jsx runtime — a second React instance whose dispatcher is not the host's, so `useState` reads null and the panel fails to mount. At runtime, with no build error.
+- **Imports leaving `src/configpanel/` must be `import type`.** A value import pulls the module's runtime dependencies into the browser bundle (typebox via `config/schema`, `fs/promises` via `host-limits`). After changing panel imports, confirm with `grep -rl "typebox\|fs/promises" public/` — it must print nothing.
 - `signalk.appIcon` and `signalk.displayName` in `package.json` control how the plugin appears in the Admin UI.

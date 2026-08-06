@@ -3,6 +3,9 @@ dist/
 public/*.js
 public/*.js.map
 public/*.txt
+public/assets/
+public/@mf-types/
+.mf/
 *.tsbuildinfo
 .DS_Store
 *.log
