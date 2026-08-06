@@ -58,7 +58,7 @@ Their wire shapes live in `src/api-contract.ts` and are shared by both surfaces:
 ## Conventions
 
 - TypeScript strict mode everywhere, panel included; do not loosen either `tsconfig.json`. In particular never add `jsx` or a DOM `lib` to the root one — server code referencing `document` would then typecheck clean.
-- Prettier + eslint flat config (`eslint.config.js`); run `npm run format` before committing. `format` runs `eslint --fix` last, which can undo prettier on a file it also touches — if `ci-lint` then fails on formatting, re-run `npx prettier --write` on that file.
+- Prettier + eslint flat config (`eslint.config.js`); run `npm run format` before committing.
 - The config panel uses React 19 with Module Federation — keep the federation `shared` block in sync with `package.json`'s React version.
 - **Classic JSX is load-bearing.** Babel's `runtime: "classic"` (webpack.config.js) and `"jsx": "react"` (panel tsconfig) must agree. The automatic runtime imports `react/jsx-runtime`, which is not in the federation `shared` scope, so webpack would bundle a second React into the remote and the Admin UI's panel loader breaks — at runtime, with no build error.
 - **Imports leaving `src/configpanel/` must be `import type`.** Babel strips types per-file without type information, so a value import pulls the module's runtime dependencies into the browser bundle (typebox via `config/schema`, `fs/promises` via `host-limits`). After changing panel imports, confirm with `grep -l "typebox\|fs/promises" public/*.js` — it must print nothing.
