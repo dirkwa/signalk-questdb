@@ -172,6 +172,39 @@ describe("history-v1 value decoding", () => {
     });
   });
 
+  it("replays a stored vessel-name row in the empty-path shape", async () => {
+    // Names are stored under the synthetic path "name" (kind "identity")
+    // but were received as empty-path object deltas — the only shape
+    // consumers (Freeboard) read names from, so replay must reconstruct it.
+    const values = await replay([
+      [
+        "2024-01-01T00:00:00.000000Z",
+        "name",
+        "vessels.urn:mrn:imo:mmsi:244813000",
+        "Sea Breeze",
+        "identity",
+      ],
+    ]);
+    assert.deepEqual(values[""], { name: "Sea Breeze" });
+  });
+
+  it('leaves a DATA path literally named "name" alone', async () => {
+    // Only rows tagged kind "identity" are synthetic vessel names; a source
+    // emitting a real path called "name" must round-trip as the plain
+    // string it is, not become a vessel identity update.
+    const values = await replay([
+      [
+        "2024-01-01T00:00:00.000000Z",
+        "name",
+        "self",
+        "not an identity",
+        "string",
+      ],
+    ]);
+    assert.equal(values["name"], "not an identity");
+    assert.equal(values[""], undefined);
+  });
+
   it("degrades a malformed value to null rather than emitting NaN", async () => {
     const values = await replay([
       [
@@ -322,10 +355,16 @@ describe("history-v1 streamHistory chunking", () => {
   // skipped: advancing past a truncated read silently loses the remainder,
   // and querying three tables makes truncation far likelier.
   function streamOnce(datasets: unknown[][][], playbackRate = 1) {
+    // `queries` holds WINDOW reads only: the one-shot last-known-names
+    // lookup (LATEST ON) would otherwise shift the indexes every assertion
+    // below relies on, and the sequential datasets feed window reads.
     const queries: string[] = [];
     let call = 0;
     const client = {
       exec: async (sql: string) => {
+        if (sql.includes("LATEST ON")) {
+          return { columns: [], dataset: [], count: 0, timestamp: 0 };
+        }
         queries.push(sql);
         const dataset = datasets[Math.min(call++, datasets.length - 1)];
         return { columns: [], dataset, count: dataset.length, timestamp: 0 };
@@ -439,5 +478,169 @@ describe("history-v1 streamHistory chunking", () => {
       queries[1].includes("2024-01-01T00:01:00.000"),
       `expected the next 60s window, got: ${queries[1]}`,
     );
+  });
+});
+
+describe("history-v1 playback vessel-name injection", () => {
+  // A playback window almost never contains a name row (names are written
+  // on change only, typically when the vessel was first seen), so playback
+  // fetches the last-known name per context once and injects it ahead of a
+  // context's first delta — otherwise restored targets stay anonymous.
+  const VESSEL = "vessels.urn:mrn:imo:mmsi:244813000";
+
+  interface WrittenDelta {
+    context: string;
+    updates: { values: { path: string; value: unknown }[] }[];
+  }
+
+  function streamWithNames(
+    windowDatasets: unknown[][][],
+    names: unknown[][] | Error,
+  ) {
+    let call = 0;
+    const nameQueries: string[] = [];
+    const client = {
+      exec: async (sql: string) => {
+        if (sql.includes("LATEST ON")) {
+          nameQueries.push(sql);
+          if (names instanceof Error) throw names;
+          return {
+            __names: true,
+            columns: [],
+            dataset: names,
+            count: names.length,
+            timestamp: 0,
+          };
+        }
+        const dataset =
+          windowDatasets[Math.min(call++, windowDatasets.length - 1)];
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+      toObjects: (result: { dataset: unknown[][] } & { __names?: boolean }) =>
+        result.__names
+          ? result.dataset.map((row) => ({
+              context: row[0],
+              value_str: row[1],
+            }))
+          : result.dataset.map((row) => ({
+              ts: row[0],
+              path: row[1],
+              context: row[2],
+              valuetext: row[3],
+              kind: row[4],
+            })),
+    } as unknown as HistoryClient;
+    const written: WrittenDelta[] = [];
+    const provider = createHistoryProviderV1(client, SELF, noop);
+    const stop = provider.streamHistory(
+      { write: (d: unknown) => written.push(d as WrittenDelta), on: () => {} },
+      { startTime: new Date("2024-01-01T00:00:00Z"), playbackRate: 1 },
+      () => {},
+    );
+    return { written, stop, nameQueries };
+  }
+
+  async function waitForWritten(
+    written: WrittenDelta[],
+    n: number,
+    timeoutMs = 2000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    while (written.length < n && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.ok(
+      written.length >= n,
+      `expected at least ${n} written deltas, got ${written.length}`,
+    );
+  }
+
+  const dataRow = (ts: string, context: string) => [
+    ts,
+    "navigation.speedOverGround",
+    context,
+    "4.2",
+    "number",
+  ];
+
+  it("injects the last-known name once, ahead of the first delta", async () => {
+    const { written, stop, nameQueries } = streamWithNames(
+      [
+        [
+          dataRow("2024-01-01T00:00:01.000000Z", VESSEL),
+          dataRow("2024-01-01T00:00:02.000000Z", VESSEL),
+        ],
+        [],
+      ],
+      [[VESSEL, "Sea Breeze"]],
+    );
+    try {
+      await waitForWritten(written, 3);
+
+      assert.deepEqual(written[0].updates[0].values, [
+        { path: "", value: { name: "Sea Breeze" } },
+      ]);
+      assert.equal(written[0].context, VESSEL);
+      const nameDeltas = written.filter((d) =>
+        d.updates.some((u) => u.values.some((v) => v.path === "")),
+      );
+      assert.equal(
+        nameDeltas.length,
+        1,
+        "one name delta per context, not per row",
+      );
+      // The lookup is bound to the playback start (a later rename must not
+      // leak into a historical replay) and to identity-tagged rows (a data
+      // path literally named "name" is not a vessel name).
+      assert.equal(nameQueries.length, 1);
+      assert.ok(
+        nameQueries[0].includes("ts <= '2024-01-01T00:00:00"),
+        `expected a start-time bound, got: ${nameQueries[0]}`,
+      );
+      assert.ok(
+        nameQueries[0].includes("value_kind = 'identity'"),
+        `expected the identity filter, got: ${nameQueries[0]}`,
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  it("resolves the self context on the injected delta", async () => {
+    const { written, stop } = streamWithNames(
+      [[dataRow("2024-01-01T00:00:01.000000Z", "self")], []],
+      [["self", "Vessel Aurora"]],
+    );
+    try {
+      await waitForWritten(written, 2);
+
+      assert.equal(written[0].context, SELF);
+      assert.deepEqual(written[0].updates[0].values[0], {
+        path: "",
+        value: { name: "Vessel Aurora" },
+      });
+    } finally {
+      stop();
+    }
+  });
+
+  it("streams unlabeled when the names lookup fails", async () => {
+    const { written, stop } = streamWithNames(
+      [[dataRow("2024-01-01T00:00:01.000000Z", VESSEL)], []],
+      new Error("QuestDB query failed (500): boom"),
+    );
+    try {
+      await waitForWritten(written, 1);
+
+      assert.equal(written[0].context, VESSEL);
+      assert.ok(
+        written.every((d) =>
+          d.updates.every((u) => u.values.every((v) => v.path !== "")),
+        ),
+        "no name delta may be fabricated on lookup failure",
+      );
+    } finally {
+      stop();
+    }
   });
 });

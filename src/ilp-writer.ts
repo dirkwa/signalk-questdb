@@ -290,7 +290,7 @@ export class ILPWriter {
     context: string,
     value: string,
     timestamp?: Date,
-    kind?: "boolean",
+    kind?: "boolean" | "identity",
   ): void {
     const ts = this.nextNanos(timestamp);
     const kindTag = kind ? `,value_kind=${escapeTag(kind)}` : "";
