@@ -78,6 +78,7 @@ export interface UpdateInfo extends ApiError {
  * recreated with, so the panel can sync its version field to reality.
  */
 export interface UpdateApplyResponse extends ApiError {
+  status?: string;
   newVersion?: string;
 }
 
@@ -114,10 +115,22 @@ export interface ResumeWalResponse extends ApiError {
 }
 
 /**
- * POST /api/resume-wal/skip — the lossy repair. Carries only a human-readable
- * outcome; the skip target itself is computed server-side.
+ * POST /api/resume-wal/skip — the lossy repair. The handler walks a safety
+ * ladder (lossless resume first, destructive skip only if that re-froze), and
+ * these flags say which rung it stopped on. The skip target itself is always
+ * computed server-side; `skipPlan` echoes back what was actually executed.
  */
-export type SkipWalResponse = ApiError;
+export interface SkipWalResponse extends ApiError {
+  /** True only when the destructive RESUME WAL FROM TXN ran. */
+  skipped?: boolean;
+  /** True when the table was not suspended, or a lossless resume cleared it. */
+  healed?: boolean;
+  /** True when the writer advanced before re-suspending — state changed. */
+  progressed?: boolean;
+  /** True when the table re-suspended at a later segment after the skip. */
+  stillSuspended?: boolean;
+  skipPlan?: SkipPlan;
+}
 
 export interface MigrationSource {
   type: string;

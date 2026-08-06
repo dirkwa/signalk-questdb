@@ -34,8 +34,11 @@ import type {
   MigrationDetectResponse,
   QuestdbVersion,
   ResumeWalResponse,
+  SkipWalResponse,
+  UpdateApplyResponse,
   UpdateInfo,
   WalDiagnosis,
+  WalDiagnosisTable,
 } from "./api-contract";
 import { buildContainerEnv } from "./container-env";
 import { PathMatcher, RateMatcher, Throttle } from "./path-matcher";
@@ -1774,7 +1777,7 @@ module.exports = (app: App) => {
             status: "updated",
             newVersion: newTag,
             message: `Updated to QuestDB ${newTag}. Container running.`,
-          });
+          } satisfies UpdateApplyResponse);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",
@@ -1881,7 +1884,10 @@ module.exports = (app: App) => {
           );
           const logLines =
             suspended.length > 0 ? await fetchEngineLogLines() : null;
-          const tables = [];
+          // Annotated so every push is checked against the element shape;
+          // `satisfies WalDiagnosis` on the response alone would only check
+          // the wrapper.
+          const tables: WalDiagnosisTable[] = [];
           for (const table of suspended) {
             let segments: PendingSegment[] = [];
             let segmentError: string | null = null;
@@ -1961,7 +1967,7 @@ module.exports = (app: App) => {
               skipped: false,
               healed: true,
               message: `${table} is not suspended — nothing to skip.`,
-            });
+            } satisfies SkipWalResponse);
             return;
           }
 
@@ -1978,7 +1984,7 @@ module.exports = (app: App) => {
               skipped: false,
               healed: true,
               message: `Lossless resume succeeded on ${table} — no data was skipped. The backlog is now replaying.`,
-            });
+            } satisfies SkipWalResponse);
             return;
           }
           if (afterResume.writerTxn !== before.writerTxn) {
@@ -1987,7 +1993,7 @@ module.exports = (app: App) => {
               healed: false,
               progressed: true,
               message: `The writer advanced on ${table} before re-suspending — the situation changed. Re-run the diagnosis.`,
-            });
+            } satisfies SkipWalResponse);
             return;
           }
 
@@ -2086,7 +2092,7 @@ module.exports = (app: App) => {
             message: afterSkip
               ? `Skipped ${plan.skippedTxns} txn(s) on ${table}, but the table re-suspended at txn ${afterSkip.writerTxn + 1} — another segment appears unreadable. Re-run the diagnosis to skip it too.`
               : `Skipped ${plan.skippedTxns} txn(s) on ${table} (${plan.skipWindowStart} → ${plan.skipWindowEnd}). The remaining backlog is replaying.`,
-          });
+          } satisfies SkipWalResponse);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : String(err),

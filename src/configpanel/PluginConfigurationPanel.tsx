@@ -25,6 +25,15 @@ function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * Both fields are optional on every response — a body that failed to parse,
+ * or an error shape from a proxy rather than the plugin, carries neither.
+ * Interpolating them raw renders the literal string "undefined" at the user.
+ */
+function apiText(value: string | undefined, fallback: string): string {
+  return value ?? fallback;
+}
+
 const COMPRESSIONS = ["none", "lz4", "zstd"] as const;
 
 /** A <select> value is `string` to the type system; narrow it back. */
@@ -520,7 +529,9 @@ export default function PluginConfigurationPanel({
       if (res.ok) {
         setResumeOutcome(data.message ?? "");
       } else {
-        setResumeOutcome(`Skip failed: ${data.error}`);
+        setResumeOutcome(
+          `Skip failed: ${apiText(data.error, "unknown error")}`,
+        );
       }
       fetchStatus();
       fetchWalDiagnosis();
@@ -563,7 +574,9 @@ export default function PluginConfigurationPanel({
         const data = (await res
           .json()
           .catch(() => ({ error: res.statusText }))) as UpdateApplyResponse;
-        setActionStatus(`Update failed: ${data.error}`);
+        setActionStatus(
+          `Update failed: ${apiText(data.error, "unknown error")}`,
+        );
         setStatusError(true);
       }
     } catch (e) {
@@ -595,7 +608,9 @@ export default function PluginConfigurationPanel({
         setActionStatus(data.message ?? "");
         fetchStatus();
       } else {
-        setActionStatus(`Remove failed: ${data.error}`);
+        setActionStatus(
+          `Remove failed: ${apiText(data.error, "unknown error")}`,
+        );
         setStatusError(true);
       }
     } catch (e) {
@@ -619,14 +634,16 @@ export default function PluginConfigurationPanel({
         const failed = (data.results || []).filter((r) => !r.ok);
         setResumeOutcome(
           failed.length === 0
-            ? `${data.message}. Recording resumes as the backlog drains — the banner clears once tables catch up.`
-            : `${data.message}. ` +
+            ? `${apiText(data.message, "Resume requested")}. Recording resumes as the backlog drains — the banner clears once tables catch up.`
+            : `${apiText(data.message, "Resume requested")}. ` +
                 failed.map((r) => `${r.table}: ${r.error}`).join(" · "),
         );
         fetchStatus();
         fetchWalDiagnosis();
       } else {
-        setResumeOutcome(`Resume failed: ${data.error}`);
+        setResumeOutcome(
+          `Resume failed: ${apiText(data.error, "unknown error")}`,
+        );
       }
     } catch (e) {
       setResumeOutcome(`Resume failed: ${errorMessage(e)}`);
@@ -744,7 +761,9 @@ export default function PluginConfigurationPanel({
         const data = (await res
           .json()
           .catch(() => ({ error: res.statusText }))) as ApiError;
-        setActionStatus(`Export failed: ${data.error}`);
+        setActionStatus(
+          `Export failed: ${apiText(data.error, "unknown error")}`,
+        );
         setStatusError(true);
         setExporting(false);
         return;
