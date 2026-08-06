@@ -133,6 +133,14 @@ export default function PluginConfigurationPanel({
   );
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
   const [recordOthers, setRecordOthers] = useState(cfg.recordOthers !== false);
+  // Restore is opt-in, so a missing key means off — the inverse of the
+  // recording toggles above.
+  const [restoreOnStart, setRestoreOnStart] = useState(
+    cfg.restoreOnStart === true,
+  );
+  const [restoreMaxAgeMinutes, setRestoreMaxAgeMinutes] = useState(
+    (cfg.restoreMaxAgeMinutes ?? 0) > 0 ? cfg.restoreMaxAgeMinutes! : 9,
+  );
   const [defaultSamplingRate, setDefaultSamplingRate] = useState(
     cfg.defaultSamplingRate ?? 2000,
   );
@@ -519,6 +527,8 @@ export default function PluginConfigurationPanel({
       ilpFlushIntervalMs: batchIntervalMs,
       recordSelf,
       recordOthers,
+      restoreOnStart,
+      restoreMaxAgeMinutes,
       retentionDays,
       compression,
       compressionLevel,
@@ -1159,6 +1169,36 @@ export default function PluginConfigurationPanel({
           onChange={(e) => setRecordOthers(e.target.checked)}
         />
       </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Restore vessels on startup</span>
+        <input
+          type="checkbox"
+          style={S.checkbox}
+          checked={restoreOnStart}
+          onChange={(e) => setRestoreOnStart(e.target.checked)}
+        />
+        <span style={S.hint}>
+          replay each vessel&apos;s last recorded position after a restart, so
+          AIS targets appear at once instead of only when they next transmit
+        </span>
+      </div>
+
+      {restoreOnStart && (
+        <div style={S.fieldRow}>
+          <span style={S.label}>Restore max age (minutes)</span>
+          <input
+            style={S.inputSmall}
+            type="number"
+            value={restoreMaxAgeMinutes}
+            onChange={(e) => setRestoreMaxAgeMinutes(Number(e.target.value))}
+          />
+          <span style={S.hint}>
+            only replay values this recent (default 9, matching Freeboard&apos;s
+            AIS expiry); higher puts staler positions on the chart
+          </span>
+        </div>
+      )}
 
       <div style={S.fieldRow}>
         <span style={S.label}>Retention (days)</span>

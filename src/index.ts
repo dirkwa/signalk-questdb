@@ -7,6 +7,7 @@ import { extractVesselName, routeDeltaValue } from "./delta-routing.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
 import { startRetention } from "./retention.js";
+import { restoreFromHistory } from "./restore.js";
 import { buildFullExportWhere } from "./full-export-range.js";
 import {
   WalMonitor,
@@ -1111,6 +1112,40 @@ export default (app: App) => {
       }
     });
     unsubscribes.push(unsub);
+
+    // Repopulate the model from history. Deliberately AFTER the recorder is
+    // subscribed: a live delta arriving mid-restore then wins on merge order
+    // (it is applied later), so a vessel that transmits during startup is not
+    // overwritten by its own older stored fix.
+    if (config.restoreOnStart) {
+      const restoreGeneration = lifecycleGeneration;
+      void restoreFromHistory(
+        {
+          queryClient,
+          handleMessage: (delta) => {
+            // A restore that outlives its plugin generation would inject data
+            // into a model the operator just stopped recording into.
+            if (!pluginRunning || lifecycleGeneration !== restoreGeneration) {
+              return;
+            }
+            app.handleMessage("signalk-questdb", delta);
+          },
+          selfContext: app.selfContext,
+          debug: (msg) => app.debug(msg),
+        },
+        {
+          maxAgeMs: config.restoreMaxAgeMinutes * 60_000,
+          restoreSelf: config.recordSelf,
+          restoreOthers: config.recordOthers,
+        },
+      ).catch((err: unknown) => {
+        // A failed restore is a cosmetic loss — targets still arrive live —
+        // so it must never take the plugin down with it.
+        app.debug(
+          `restore failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
 
     if (config.retentionDays && config.retentionDays > 0) {
       retentionTimer = startRetention(

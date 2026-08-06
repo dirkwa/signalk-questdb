@@ -113,27 +113,68 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 
 ## Configuration
 
-| Setting                   | Default      | Description                                                                                           |
-| ------------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
-| QuestDB version           | `latest`     | Docker image tag (dropdown shows stable + pre-releases)                                               |
-| Managed container         | `true`       | Let signalk-container manage QuestDB, or connect to external                                          |
-| QuestDB host              | `127.0.0.1`  | External QuestDB host (only used when managed=false)                                                  |
-| HTTP port                 | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                                       |
-| ILP port                  | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                                       |
-| PostgreSQL port           | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                                            |
-| Sampling rate (ms)        | `2000`       | Default min ms between writes per path (0 = every update)                                             |
-| Write batch interval (ms) | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance) |
-| Memory limit              | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)                                          |
-| CPU limit (cores)         | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                                                         |
-| Record own vessel         | `true`       | Record self context                                                                                   |
-| Record AIS targets        | `false`      | Record other vessels                                                                                  |
-| Retention (days)          | `0`          | Auto-delete old partitions (0 = keep forever)                                                         |
-| Path filter mode          | `exclude`    | `exclude` matching paths, or `include` only matching paths                                            |
-| Path filter paths         | _(empty)_    | Glob patterns, one per line (e.g. `navigation.position`); empty = record everything                   |
-| Compression codec         | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                                                     |
-| Compression level         | `3`          | ZSTD level 1-22 (only when codec is zstd)                                                             |
-| Container network         | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0)                                     |
-| Bind to 0.0.0.0           | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)                                            |
+| Setting                    | Default      | Description                                                                                           |
+| -------------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
+| QuestDB version            | `latest`     | Docker image tag (dropdown shows stable + pre-releases)                                               |
+| Managed container          | `true`       | Let signalk-container manage QuestDB, or connect to external                                          |
+| QuestDB host               | `127.0.0.1`  | External QuestDB host (only used when managed=false)                                                  |
+| HTTP port                  | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                                       |
+| ILP port                   | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on                                       |
+| PostgreSQL port            | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                                            |
+| Sampling rate (ms)         | `2000`       | Default min ms between writes per path (0 = every update)                                             |
+| Write batch interval (ms)  | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance) |
+| Memory limit               | `768m`       | Hard cgroup cap on QuestDB container RAM (empty = unlimited)                                          |
+| CPU limit (cores)          | `1.5`        | Max CPU cores QuestDB can use (0 = unlimited)                                                         |
+| Record own vessel          | `true`       | Record self context                                                                                   |
+| Record AIS targets         | `true`       | Record other vessels                                                                                  |
+| Restore vessels on startup | `false`      | Replay each vessel's last recorded position after a restart (see Startup restore)                     |
+| Restore max age (minutes)  | `9`          | Only replay values recorded within this window                                                        |
+| Retention (days)           | `0`          | Auto-delete old partitions (0 = keep forever)                                                         |
+| Path filter mode           | `exclude`    | `exclude` matching paths, or `include` only matching paths                                            |
+| Path filter paths          | _(empty)_    | Glob patterns, one per line (e.g. `navigation.position`); empty = record everything                   |
+| Compression codec          | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                                                     |
+| Compression level          | `3`          | ZSTD level 1-22 (only when codec is zstd)                                                             |
+| Container network          | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0)                                     |
+| Bind to 0.0.0.0            | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)                                            |
+
+## Startup restore
+
+Signal K's data model lives in memory only. After a server restart every vessel
+is gone until it transmits again — for AIS that means roughly 30 seconds for a
+Class B target, up to 3 minutes for a Class A at anchor, and about 6 minutes
+before names arrive. The chart fills in gradually instead of showing the traffic
+that was there a moment ago.
+
+With **Restore vessels on startup** enabled, the plugin replays each vessel's
+last recorded position (plus course, speed, heading and identity) from QuestDB
+as soon as it connects, so the chart is populated immediately.
+
+Restored values are historical, and the plugin is careful to present them as
+such rather than passing them off as live:
+
+- Each delta carries its **original recorded timestamp**, never the restore
+  time. Consumers age these out with their normal staleness rules — Freeboard
+  dims a target after 6 minutes and drops it at 9.
+- Nothing is dead-reckoned forward. A restored position is where the vessel
+  _was_, not where it is now.
+- Values older than **Restore max age** are not replayed at all. The 9-minute
+  default matches Freeboard's AIS expiry, so a restored target is one that
+  would still have been on the chart had the server never stopped.
+- Deltas are tagged `$source: signalk-questdb.restore` so a replayed value is
+  distinguishable from a live one.
+- A context with no position in the window is skipped entirely — an identity
+  with no fix would otherwise become an undrawable target that never expires.
+- Only navigation and identity paths are replayed, not every recorded path.
+  Restoring stale tank levels or engine temperatures as though they were live
+  readings would be misleading.
+
+Restore runs after the recorder is subscribed, so a vessel that transmits during
+startup is not overwritten by its own older stored fix. It respects the two
+recording toggles: with **Record AIS targets** off, no AIS target is restored.
+
+Raising the window puts progressively staler positions on the chart. Treat it as
+a collision-avoidance surface and keep it close to what your chart plotter
+expires anyway.
 
 ## Connectivity
 
