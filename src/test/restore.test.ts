@@ -33,18 +33,34 @@ function mockClient(captured: Captured[], dataset: Row[]) {
   } as unknown as RestoreDeps["queryClient"];
 }
 
+// The delta shape the restore emits — enough to assert on without `any`.
+interface RestoredValue {
+  path: string;
+  value: unknown;
+}
+interface RestoredDelta {
+  context: string;
+  updates: {
+    $source: string;
+    timestamp: string;
+    values: RestoredValue[];
+  }[];
+}
+
 function run(
   dataset: Row[],
   overrides: Partial<RestoreOptions> = {},
   captured: Captured[] = [],
+  hasLiveData?: (context: string) => boolean,
 ) {
-  const deltas: any[] = [];
+  const deltas: RestoredDelta[] = [];
   const promise = restoreFromHistory(
     {
       queryClient: mockClient(captured, dataset),
-      handleMessage: (d) => deltas.push(d),
+      handleMessage: (d) => deltas.push(d as RestoredDelta),
       selfContext: SELF,
       debug: () => {},
+      hasLiveData,
     },
     {
       maxAgeMs: 9 * 60_000,
@@ -175,7 +191,7 @@ describe("restore: positionless contexts", () => {
     // Names were received as empty-path object deltas and must replay in
     // that shape — the only one Freeboard reads names from.
     const nameValue = deltas[0].updates[0].values.find(
-      (v: any) => v.path === "",
+      (v: RestoredValue) => v.path === "",
     );
     assert.deepEqual(nameValue, { path: "", value: { name: "Black Pearl" } });
   });
@@ -190,7 +206,7 @@ describe("restore: positionless contexts", () => {
     await promise;
 
     const entry = deltas[0].updates[0].values.find(
-      (v: any) => v.path === "name",
+      (v: RestoredValue) => v.path === "name",
     );
     assert.deepEqual(entry, { path: "name", value: "not-identity" });
   });
@@ -216,6 +232,77 @@ describe("restore: recording toggles", () => {
   });
 });
 
+describe("restore: vessels already live", () => {
+  it("does not replay a context that transmitted during startup", async () => {
+    // The query is slow enough that vessels report while it runs. Replaying
+    // a stored fix over a live one would move the target BACKWARDS.
+    const rows = [position(AIS, 60_000)];
+    const { promise, deltas } = run(rows, {}, [], (ctx) => ctx === AIS);
+    const result = await promise;
+
+    assert.equal(deltas.length, 0);
+    assert.equal(result.skippedLive, 1);
+  });
+
+  it("still replays contexts that have not been seen live", async () => {
+    const other = "vessels.urn:mrn:imo:mmsi:111111111";
+    const rows = [position(AIS, 60_000), position(other, 60_000)];
+    const { promise, deltas } = run(rows, {}, [], (ctx) => ctx === AIS);
+    const result = await promise;
+
+    assert.equal(deltas.length, 1);
+    assert.equal(deltas[0].context, other);
+    assert.equal(result.skippedLive, 1);
+  });
+
+  it("keys the live check on the stored context, not the resolved one", async () => {
+    // Own vessel is stored as the literal "self"; checking the resolved
+    // self context would never match what the recorder recorded.
+    const seen: string[] = [];
+    const { promise } = run([position("self", 60_000)], {}, [], (ctx) => {
+      seen.push(ctx);
+      return false;
+    });
+    await promise;
+
+    assert.deepEqual(seen, ["self"]);
+  });
+});
+
+describe("restore: duplicate rows across tables", () => {
+  it("keeps the newer row when a path appears in two tables", async () => {
+    // LATEST ON runs PER TABLE, so a path whose type changed over time
+    // returns one row from each. Union order is not timestamp order.
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      [ago(30_000), "navigation.state", AIS, "sailing", null],
+      [ago(300_000), "navigation.state", AIS, "42", "number"],
+    ];
+    const { promise, deltas } = run(rows);
+    await promise;
+
+    const state = deltas[0].updates[0].values.find(
+      (v: RestoredValue) => v.path === "navigation.state",
+    );
+    assert.deepEqual(state, { path: "navigation.state", value: "sailing" });
+  });
+
+  it("emits a path only once even when duplicated", async () => {
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      [ago(30_000), "navigation.state", AIS, "sailing", null],
+      [ago(300_000), "navigation.state", AIS, "42", "number"],
+    ];
+    const { promise, deltas } = run(rows);
+    await promise;
+
+    const states = deltas[0].updates[0].values.filter(
+      (v: RestoredValue) => v.path === "navigation.state",
+    );
+    assert.equal(states.length, 1);
+  });
+});
+
 describe("restore: value decoding", () => {
   it("decodes numbers as numbers, not strings", async () => {
     // Consumers do arithmetic on these; a string COG breaks course maths.
@@ -227,8 +314,9 @@ describe("restore: value decoding", () => {
     await promise;
 
     const sog = deltas[0].updates[0].values.find(
-      (v: any) => v.path === "navigation.speedOverGround",
+      (v: RestoredValue) => v.path === "navigation.speedOverGround",
     );
+    assert.ok(sog, "expected speedOverGround to be restored");
     assert.equal(sog.value, 5.4);
     assert.equal(typeof sog.value, "number");
   });

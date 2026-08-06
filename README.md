@@ -149,32 +149,24 @@ With **Restore vessels on startup** enabled, the plugin replays each vessel's
 last recorded position (plus course, speed, heading and identity) from QuestDB
 as soon as it connects, so the chart is populated immediately.
 
-Restored values are historical, and the plugin is careful to present them as
-such rather than passing them off as live:
+**A restored position is where a vessel _was_, not where it is now.** Nothing is
+dead-reckoned forward. The plugin presents these values as the history they are
+rather than passing them off as live: each delta carries its original recorded
+timestamp, so a chart plotter ages it out under the same staleness rules it
+applies to any other target, and the deltas are tagged
+`$source: signalk-questdb.restore`.
 
-- Each delta carries its **original recorded timestamp**, never the restore
-  time. Consumers age these out with their normal staleness rules — Freeboard
-  dims a target after 6 minutes and drops it at 9.
-- Nothing is dead-reckoned forward. A restored position is where the vessel
-  _was_, not where it is now.
-- Values older than **Restore max age** are not replayed at all. The 9-minute
-  default matches Freeboard's AIS expiry, so a restored target is one that
-  would still have been on the chart had the server never stopped.
-- Deltas are tagged `$source: signalk-questdb.restore` so a replayed value is
-  distinguishable from a live one.
-- A context with no position in the window is skipped entirely — an identity
-  with no fix would otherwise become an undrawable target that never expires.
-- Only navigation and identity paths are replayed, not every recorded path.
-  Restoring stale tank levels or engine temperatures as though they were live
-  readings would be misleading.
+Values outside the **Restore max age** window are not replayed at all. The
+9-minute default matches Freeboard's AIS expiry, so a restored target is one that
+would still have been on the chart had the server never stopped. Raising it puts
+progressively staler positions in front of you — treat the window as a
+collision-avoidance setting, not a convenience one.
 
-Restore runs after the recorder is subscribed, so a vessel that transmits during
-startup is not overwritten by its own older stored fix. It respects the two
-recording toggles: with **Record AIS targets** off, no AIS target is restored.
-
-Raising the window puts progressively staler positions on the chart. Treat it as
-a collision-avoidance surface and keep it close to what your chart plotter
-expires anyway.
+Only navigation and identity paths are replayed, so stale tank levels and engine
+temperatures are not resurrected as though they were current readings. A vessel
+with no position in the window is skipped, as is one that has already transmitted
+since startup. Restore honours the recording toggles: with **Record AIS targets**
+off, no AIS target is restored.
 
 ## Connectivity
 

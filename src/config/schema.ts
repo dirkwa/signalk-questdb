@@ -102,6 +102,7 @@ export const ConfigSchema = Type.Object({
   }),
   restoreMaxAgeMinutes: Type.Number({
     default: 9,
+    minimum: 1,
     title: "Restore max age (minutes)",
     description:
       "Only replay values recorded within this many minutes. Matches Freeboard's default AIS expiry (9 minutes), so a restored target is one that would still have been on the chart. Raising this puts progressively staler positions on the chart.",

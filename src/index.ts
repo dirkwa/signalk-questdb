@@ -355,6 +355,15 @@ export default (app: App) => {
   // (health-wait exhausted, ensureTables/connect threw) leaves them non-null
   // on a plugin that never came up.
   let pluginRunning = false;
+
+  // Contexts seen live while a startup restore is in flight. A stored fix
+  // must never overwrite a vessel that has already transmitted since boot —
+  // that would move it backwards on the chart. Populated by the recorder
+  // subscription and cleared as soon as the restore settles, so this stays a
+  // startup-window set rather than an unbounded one.
+  const liveContexts = new Set<string>();
+  let trackLiveContexts = false;
+
   const withLifecycleLock = <T>(fn: () => Promise<T>): Promise<T> => {
     const run = lifecycleChain.then(fn, fn);
     // Keep the chain alive regardless of this op's outcome.
@@ -1007,6 +1016,11 @@ export default (app: App) => {
     );
     app.registerHistoryProvider(v1Provider);
 
+    // Arm live-context tracking before the first delta can arrive, so the
+    // restore sees every vessel that transmitted during startup.
+    liveContexts.clear();
+    trackLiveContexts = config.restoreOnStart;
+
     const bus = app.streambundle.getBus();
     const unsub = bus.onValue((delta: any) => {
       if (!writer) return;
@@ -1061,6 +1075,11 @@ export default (app: App) => {
       if (isSelf && !config.recordSelf) return;
       if (!isSelf && !config.recordOthers) return;
 
+      // Note this BEFORE the path filter and throttle: those decide what gets
+      // stored, but any delta at all proves the vessel is transmitting now,
+      // which is what makes its stored position obsolete.
+      if (trackLiveContexts) liveContexts.add(isSelf ? "self" : context);
+
       if (!shouldRecord(path, config.pathFilter.mode)) return;
       // Throttled per path AND context: the sampling rate bounds each
       // vessel's stream, not the fleet's (issue #93). The stored context
@@ -1112,40 +1131,6 @@ export default (app: App) => {
       }
     });
     unsubscribes.push(unsub);
-
-    // Repopulate the model from history. Deliberately AFTER the recorder is
-    // subscribed: a live delta arriving mid-restore then wins on merge order
-    // (it is applied later), so a vessel that transmits during startup is not
-    // overwritten by its own older stored fix.
-    if (config.restoreOnStart) {
-      const restoreGeneration = lifecycleGeneration;
-      void restoreFromHistory(
-        {
-          queryClient,
-          handleMessage: (delta) => {
-            // A restore that outlives its plugin generation would inject data
-            // into a model the operator just stopped recording into.
-            if (!pluginRunning || lifecycleGeneration !== restoreGeneration) {
-              return;
-            }
-            app.handleMessage("signalk-questdb", delta);
-          },
-          selfContext: app.selfContext,
-          debug: (msg) => app.debug(msg),
-        },
-        {
-          maxAgeMs: config.restoreMaxAgeMinutes * 60_000,
-          restoreSelf: config.recordSelf,
-          restoreOthers: config.recordOthers,
-        },
-      ).catch((err: unknown) => {
-        // A failed restore is a cosmetic loss — targets still arrive live —
-        // so it must never take the plugin down with it.
-        app.debug(
-          `restore failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
-    }
 
     if (config.retentionDays && config.retentionDays > 0) {
       retentionTimer = startRetention(
@@ -1244,6 +1229,53 @@ export default (app: App) => {
     // Any earlier return/throw leaves the flag false, so a half-started
     // plugin rejects lifecycle-dependent requests like /api/update/apply.
     pluginRunning = true;
+
+    // Repopulate the model from history — only now, because the guard below
+    // reads pluginRunning and everything before this point can still throw
+    // and abandon the start.
+    //
+    // The recorder is already subscribed, so live deltas keep arriving while
+    // the (slow, whole-table) restore query runs. Those are newer by
+    // definition: replaying a stored fix over a vessel that just transmitted
+    // would move it BACKWARDS on the chart. liveSince records what the
+    // recorder saw and the restore skips those contexts entirely.
+    if (config.restoreOnStart) {
+      const restoreGeneration = lifecycleGeneration;
+      void restoreFromHistory(
+        {
+          queryClient,
+          handleMessage: (delta) => {
+            // A restore outliving its generation would inject data into a
+            // model the operator just stopped recording into.
+            if (!pluginRunning || lifecycleGeneration !== restoreGeneration) {
+              return;
+            }
+            app.handleMessage("signalk-questdb", delta);
+          },
+          selfContext: app.selfContext,
+          debug: (msg) => app.debug(msg),
+          hasLiveData: (context) => liveContexts.has(context),
+        },
+        {
+          maxAgeMs: config.restoreMaxAgeMinutes * 60_000,
+          restoreSelf: config.recordSelf,
+          restoreOthers: config.recordOthers,
+        },
+      )
+        .catch((err: unknown) => {
+          // A failed restore is a cosmetic loss — targets still arrive live —
+          // so it must never take the plugin down with it.
+          app.debug(
+            `restore failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        })
+        .finally(() => {
+          // Only needed to shield the restore; tracking every context for the
+          // life of the plugin would be an unbounded set.
+          liveContexts.clear();
+          trackLiveContexts = false;
+        });
+    }
   }
 
   // Public entry: serialize startup behind the lifecycle lock so a purge or
@@ -1289,6 +1321,11 @@ export default (app: App) => {
       lifecycleGeneration++;
       startAbort?.abort();
       pluginRunning = false;
+
+      // A start aborted before its restore ran would otherwise leave tracking
+      // armed, accumulating contexts for a restore that never happens.
+      trackLiveContexts = false;
+      liveContexts.clear();
 
       for (const unsub of unsubscribes) {
         try {

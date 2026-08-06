@@ -23,6 +23,13 @@ export interface RestoreDeps {
   handleMessage: (delta: unknown) => void;
   selfContext: string;
   debug: (msg: string) => void;
+  /**
+   * True if this context has already been seen live since startup. The query
+   * is slow enough that vessels transmit while it runs, and a stored fix
+   * replayed over a live one would move that vessel backwards on the chart.
+   * Keyed on the STORED context ("self" for own vessel), matching the rows.
+   */
+  hasLiveData?: (context: string) => boolean;
 }
 
 export interface RestoreOptions {
@@ -40,6 +47,8 @@ export interface RestoreResult {
   contexts: number;
   values: number;
   skippedStale: number;
+  /** Contexts skipped because the vessel transmitted during startup. */
+  skippedLive: number;
 }
 
 /**
@@ -136,16 +145,6 @@ function decodeValue(row: Record<string, unknown>): unknown {
   }
 }
 
-/**
- * A restored context is only useful if it can be drawn, and only honest if it
- * can be aged out. Position is required for the first; a timestamp for the
- * second. Identity-only rows (a name with no fix) would otherwise create a
- * positionless ghost target that never expires.
- */
-function hasPosition(values: { path: string }[]): boolean {
-  return values.some((v) => v.path === "navigation.position");
-}
-
 export async function restoreFromHistory(
   deps: RestoreDeps,
   options: RestoreOptions,
@@ -163,11 +162,15 @@ export async function restoreFromHistory(
 
   const rows = queryClient.toObjects(result);
 
-  // Group by context, tracking the newest timestamp seen so the replayed
-  // delta carries a real recorded time rather than `now`.
+  // Group by context, keyed per path so a duplicate from another table cannot
+  // win on arrival order, and tracking the newest timestamp seen so the
+  // replayed delta carries a real recorded time rather than `now`.
   const byContext = new Map<
     string,
-    { values: { path: string; value: unknown }[]; latestTs: string }
+    {
+      byPath: Map<string, { ts: string; value: unknown; isName: boolean }>;
+      latestTs: string;
+    }
   >();
 
   let skippedStale = 0;
@@ -192,18 +195,28 @@ export async function restoreFromHistory(
 
     const path = row.path as string;
     const entry = byContext.get(storedContext) ?? {
-      values: [],
+      byPath: new Map<
+        string,
+        { ts: string; value: unknown; isName: boolean }
+      >(),
       latestTs: ts,
     };
 
     // Vessel names are stored under the synthetic path "name" (tagged
-    // "identity") but were received as empty-path object deltas. Replay them
-    // in that original shape — the only one Freeboard reads names from.
-    entry.values.push(
-      path === "name" && row.kind === "identity" && typeof value === "string"
-        ? { path: "", value: { name: value } }
-        : { path, value },
-    );
+    // "identity") but were received as empty-path object deltas, and only
+    // that shape is read as a name. The kind gate keeps a data path literally
+    // called "name" replaying as the plain string it is.
+    const isName =
+      path === "name" && row.kind === "identity" && typeof value === "string";
+
+    // LATEST ON runs PER TABLE, so a path whose type changed over time (a
+    // value recorded as a number, later as a string) yields one row from each
+    // table. Union order is not timestamp order, so keep the newer row rather
+    // than letting whichever arrives last win.
+    const existing = entry.byPath.get(path);
+    if (!existing || ts > existing.ts) {
+      entry.byPath.set(path, { ts, value, isName });
+    }
 
     if (ts > entry.latestTs) entry.latestTs = ts;
     byContext.set(storedContext, entry);
@@ -211,9 +224,27 @@ export async function restoreFromHistory(
 
   let contexts = 0;
   let values = 0;
+  let skippedLive = 0;
 
   for (const [storedContext, entry] of byContext) {
-    if (!hasPosition(entry.values)) continue;
+    // A restored context is only useful if it can be drawn and only honest if
+    // it can be aged out. An identity with no fix would be an undrawable
+    // target that never expires.
+    if (!entry.byPath.has("navigation.position")) continue;
+
+    // A vessel that transmitted while the query ran is already current; its
+    // stored fix is stale by comparison and replaying it would move the
+    // target backwards.
+    if (deps.hasLiveData?.(storedContext)) {
+      skippedLive++;
+      continue;
+    }
+
+    const deltaValues = [...entry.byPath].map(([path, row]) =>
+      row.isName
+        ? { path: "", value: { name: row.value as string } }
+        : { path, value: row.value },
+    );
 
     // Stored "self" is a placeholder for whatever this server's self context
     // is; every other context is already a real Signal K context string.
@@ -227,19 +258,20 @@ export async function restoreFromHistory(
           // stream) can tell a replayed value from a live one.
           $source: "signalk-questdb.restore",
           timestamp: entry.latestTs,
-          values: entry.values,
+          values: deltaValues,
         },
       ],
     });
 
     contexts++;
-    values += entry.values.length;
+    values += deltaValues.length;
   }
 
   debug(
     `restored ${contexts} context(s), ${values} value(s) from history` +
-      (skippedStale ? `, skipped ${skippedStale} stale row(s)` : ""),
+      (skippedStale ? `, skipped ${skippedStale} stale row(s)` : "") +
+      (skippedLive ? `, skipped ${skippedLive} already live` : ""),
   );
 
-  return { contexts, values, skippedStale };
+  return { contexts, values, skippedStale, skippedLive };
 }

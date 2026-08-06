@@ -1175,6 +1175,7 @@ export default function PluginConfigurationPanel({
         <input
           type="checkbox"
           style={S.checkbox}
+          aria-label="Restore vessels on startup"
           checked={restoreOnStart}
           onChange={(e) => setRestoreOnStart(e.target.checked)}
         />
@@ -1190,8 +1191,18 @@ export default function PluginConfigurationPanel({
           <input
             style={S.inputSmall}
             type="number"
+            min={1}
+            aria-label="Restore max age (minutes)"
             value={restoreMaxAgeMinutes}
-            onChange={(e) => setRestoreMaxAgeMinutes(Number(e.target.value))}
+            onChange={(e) => {
+              // Clearing the field yields "" → NaN, which would be saved and
+              // then silently replaced by the default. Hold the last valid
+              // number instead.
+              const next = Number(e.target.value);
+              if (Number.isFinite(next) && next >= 1) {
+                setRestoreMaxAgeMinutes(next);
+              }
+            }}
           />
           <span style={S.hint}>
             only replay values this recent (default 9, matching Freeboard&apos;s
