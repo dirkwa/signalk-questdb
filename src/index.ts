@@ -422,8 +422,14 @@ module.exports = (app: App) => {
   // Last vessel name written per context. Names repeat with every AIS
   // static report (~6 min); a row is only worth writing when the name
   // actually changes — replay works off the last-known value, not a
-  // window, so repeats add nothing.
+  // window, so repeats add nothing. Valid only while the writer has
+  // dropped nothing since: an enqueued name can be discarded when the
+  // disconnected buffer overflows, and unlike data paths a deduplicated
+  // name would never be retried. `nameDedupeDropMark` remembers the
+  // writer's drop counter at the last write; when it advances, the whole
+  // map is invalidated and names re-establish from the next AIS cycle.
   const lastNameByContext = new Map<string, string>();
+  let nameDedupeDropMark = 0;
 
   // The HTTP base URL for QuestDB's REST API (/exp, /exec). Used by the export
   // endpoints, which talk to QuestDB directly rather than through QueryClient.
@@ -1007,6 +1013,10 @@ module.exports = (app: App) => {
       if (vesselName !== null) {
         const nameIsSelf = context === app.selfContext;
         if (nameIsSelf ? config.recordSelf : config.recordOthers) {
+          if (writer.droppedLineCount !== nameDedupeDropMark) {
+            nameDedupeDropMark = writer.droppedLineCount;
+            lastNameByContext.clear();
+          }
           const nameCtx = nameIsSelf ? "self" : context;
           // Context-qualified throttle key: identity writes respect the
           // sampling rate per VESSEL — a shared key would let one AIS
