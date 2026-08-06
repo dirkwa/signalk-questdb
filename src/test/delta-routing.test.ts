@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { routeDeltaValue } from "../delta-routing";
+import { extractVesselName, routeDeltaValue } from "../delta-routing";
 
 describe("routeDeltaValue", () => {
   it("routes numbers to the scalar table", () => {
@@ -91,5 +91,36 @@ describe("routeDeltaValue", () => {
       }),
       null,
     );
+  });
+});
+
+describe("extractVesselName", () => {
+  it("extracts the name from an empty-path object delta", () => {
+    assert.strictEqual(
+      extractVesselName("", { name: "Sea Breeze" }),
+      "Sea Breeze",
+    );
+    // AIS static reports carry siblings alongside the name.
+    assert.strictEqual(
+      extractVesselName("", { name: "Sea Breeze", mmsi: "244813000" }),
+      "Sea Breeze",
+    );
+  });
+
+  it("ignores non-empty paths — a data path named name stays data", () => {
+    assert.strictEqual(extractVesselName("name", "Sea Breeze"), null);
+    assert.strictEqual(
+      extractVesselName("navigation.state", { name: "x" }),
+      null,
+    );
+  });
+
+  it("ignores empty-path deltas without a usable name", () => {
+    assert.strictEqual(extractVesselName("", { mmsi: "244813000" }), null);
+    assert.strictEqual(extractVesselName("", { name: "" }), null);
+    assert.strictEqual(extractVesselName("", { name: "   " }), null);
+    assert.strictEqual(extractVesselName("", { name: 42 }), null);
+    assert.strictEqual(extractVesselName("", null), null);
+    assert.strictEqual(extractVesselName("", "just a string"), null);
   });
 });

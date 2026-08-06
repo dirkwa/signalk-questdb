@@ -8,6 +8,19 @@
 // return null: not recorded.
 export type DeltaRoute = "number" | "string" | "boolean" | "position" | null;
 
+// Static vessel identity arrives as EMPTY-path object deltas —
+// `{path: "", value: {name: "..."}}` is how AIS static reports reach the
+// server, and the exact shape Freeboard reads names from. These never make
+// it past the recorder's path guard, so vessel names were absent from
+// history (issue #91). Returns the name when the delta carries a usable
+// one, null otherwise.
+export function extractVesselName(path: string, value: unknown): string | null {
+  if (path !== "") return null;
+  if (value === null || typeof value !== "object") return null;
+  const name = (value as { name?: unknown }).name;
+  return typeof name === "string" && name.trim() !== "" ? name : null;
+}
+
 export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
   if (typeof value === "number") return "number";
   if (typeof value === "string") return "string";

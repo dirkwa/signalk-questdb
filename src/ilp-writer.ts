@@ -77,6 +77,8 @@ export class ILPWriter {
   // while disconnected. Reported in the unhealthy message so silent data loss
   // is at least counted.
   private droppedLines = 0;
+  private totalDroppedLines = 0;
+  private readonly maxBufferLines: number;
   private unhealthy = false;
   private debug: (msg: string) => void;
   private onUnhealthy: (msg: string) => void;
@@ -101,6 +103,10 @@ export class ILPWriter {
       onUnhealthy?: (msg: string) => void;
       onHealthy?: () => void;
       flushIntervalMs?: number;
+      // Test knob only: shrinks the disconnected-buffer cap so overflow
+      // behaviour is exercisable without 100k writes. Production never
+      // passes it.
+      maxBufferLines?: number;
       timing?: {
         initialReconnectDelay?: number;
         maxReconnectDelay?: number;
@@ -114,6 +120,7 @@ export class ILPWriter {
     this.onHealthy = callbacks?.onHealthy ?? (() => {});
     this.flushIntervalMs =
       callbacks?.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
+    this.maxBufferLines = callbacks?.maxBufferLines ?? MAX_BUFFER_LINES;
     const t = callbacks?.timing ?? {};
     this.initialReconnectDelay =
       t.initialReconnectDelay ?? INITIAL_RECONNECT_DELAY_MS;
@@ -290,7 +297,7 @@ export class ILPWriter {
     context: string,
     value: string,
     timestamp?: Date,
-    kind?: "boolean",
+    kind?: "boolean" | "identity",
   ): void {
     const ts = this.nextNanos(timestamp);
     const kindTag = kind ? `,value_kind=${escapeTag(kind)}` : "";
@@ -335,11 +342,21 @@ export class ILPWriter {
   // the head (oldest samples) — the newest data is the most useful to retain
   // for a live history feed. Count drops so markUnhealthy can report them.
   private enforceBufferCap(): void {
-    if (this.buffer.length > MAX_BUFFER_LINES) {
-      const overflow = this.buffer.length - MAX_BUFFER_LINES;
+    if (this.buffer.length > this.maxBufferLines) {
+      const overflow = this.buffer.length - this.maxBufferLines;
       this.buffer.splice(0, overflow);
       this.droppedLines += overflow;
+      this.totalDroppedLines += overflow;
     }
+  }
+
+  // Monotonic drop counter, NEVER reset (droppedLines above is consumed and
+  // cleared by the health reporting). Callers holding write-once state — the
+  // recorder's vessel-name dedupe — compare it between writes: an advance
+  // means enqueued lines may have been discarded, so anything deduplicated
+  // as "already written" has to be considered unwritten again.
+  get droppedLineCount(): number {
+    return this.totalDroppedLines;
   }
 
   private flush(): void {

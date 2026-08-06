@@ -497,3 +497,21 @@ describe("ILPWriter", () => {
     );
   });
 });
+
+describe("ILPWriter droppedLineCount", () => {
+  it("counts buffer-overflow drops monotonically, never resetting", () => {
+    // The recorder's vessel-name dedupe treats an enqueued name as written;
+    // a buffer overflow silently discards enqueued lines, so the counter is
+    // its only signal to invalidate that assumption. It must only ever grow.
+    const writer = new ILPWriter("127.0.0.1", 1, undefined, {
+      maxBufferLines: 3,
+    });
+    assert.equal(writer.droppedLineCount, 0);
+    for (let i = 0; i < 5; i++) {
+      writer.write("a.b", "self", i, new Date());
+    }
+    assert.equal(writer.droppedLineCount, 2);
+    writer.write("a.b", "self", 9, new Date());
+    assert.equal(writer.droppedLineCount, 3, "monotonic across overflows");
+  });
+});

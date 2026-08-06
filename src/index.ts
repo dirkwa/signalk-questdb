@@ -3,7 +3,7 @@ import { ILPWriter } from "./ilp-writer";
 import { QueryClient, isReadOnlySQL } from "./query-client";
 import type { QuestDBResult } from "./query-client";
 import { Config, ConfigSchema, normalizeConfig } from "./config/schema";
-import { routeDeltaValue } from "./delta-routing";
+import { extractVesselName, routeDeltaValue } from "./delta-routing";
 import { createHistoryProviderV2 } from "./history-v2";
 import { createHistoryProviderV1 } from "./history-v1";
 import { startRetention } from "./retention";
@@ -419,6 +419,17 @@ module.exports = (app: App) => {
   let questdbEndpoints: { http: Endpoint; ilp: Endpoint } | null = null;
   const unsubscribes: (() => void)[] = [];
   const throttleMap = new Map<string, number>();
+  // Last vessel name written per context. Names repeat with every AIS
+  // static report (~6 min); a row is only worth writing when the name
+  // actually changes — replay works off the last-known value, not a
+  // window, so repeats add nothing. Valid only while the writer has
+  // dropped nothing since: an enqueued name can be discarded when the
+  // disconnected buffer overflows, and unlike data paths a deduplicated
+  // name would never be retried. `nameDedupeDropMark` remembers the
+  // writer's drop counter at the last write; when it advances, the whole
+  // map is invalidated and names re-establish from the next AIS cycle.
+  const lastNameByContext = new Map<string, string>();
+  let nameDedupeDropMark = 0;
 
   // The HTTP base URL for QuestDB's REST API (/exp, /exec). Used by the export
   // endpoints, which talk to QuestDB directly rather than through QueryClient.
@@ -988,6 +999,50 @@ module.exports = (app: App) => {
     const unsub = bus.onValue((delta: any) => {
       if (!writer) return;
       const { path, value, context } = delta;
+
+      // Static vessel identity (issue #91): names arrive as empty-path
+      // object deltas, which the path guard below would drop. Stored as
+      // path "name" in the string table; history-v1 replays them in the
+      // original empty-path shape Freeboard reads. Deliberately bypasses
+      // the path filter and throttle: this is identity, not a data
+      // stream — an include-mode filter would silently disable it, and
+      // the shared throttle would drop most of an AIS fleet's initial
+      // burst. The per-context change-dedupe below bounds the volume
+      // instead.
+      const vesselName = extractVesselName(path, value);
+      if (vesselName !== null) {
+        const nameIsSelf = context === app.selfContext;
+        if (nameIsSelf ? config.recordSelf : config.recordOthers) {
+          if (writer.droppedLineCount !== nameDedupeDropMark) {
+            nameDedupeDropMark = writer.droppedLineCount;
+            lastNameByContext.clear();
+          }
+          const nameCtx = nameIsSelf ? "self" : context;
+          // Context-qualified throttle key: identity writes respect the
+          // sampling rate per VESSEL — a shared key would let one AIS
+          // target's name suppress every other's during the initial
+          // fleet burst. The change-dedupe alone can't bound the volume:
+          // two receivers disagreeing on a target's static data would
+          // flap the name on every alternation.
+          if (
+            lastNameByContext.get(nameCtx) !== vesselName &&
+            !isThrottled(`name|${nameCtx}`, config.defaultSamplingRate ?? 2000)
+          ) {
+            lastNameByContext.set(nameCtx, vesselName);
+            // Tagged "identity" so replay can tell these synthetic rows
+            // from a data path literally named "name".
+            writer.writeString(
+              "name",
+              nameCtx,
+              vesselName,
+              undefined,
+              "identity",
+            );
+          }
+        }
+        return;
+      }
+
       if (!path || value === undefined || value === null) return;
 
       const isSelf = context === app.selfContext;
@@ -1214,6 +1269,7 @@ module.exports = (app: App) => {
       }
 
       throttleMap.clear();
+      lastNameByContext.clear();
       // Drop the compiled globs with the config they belong to, so a restart
       // with different patterns cannot match against the previous run's.
       pathFilterMatcher = null;

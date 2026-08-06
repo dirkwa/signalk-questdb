@@ -127,7 +127,18 @@ function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
     if (!byContext.has(context)) {
       byContext.set(context, []);
     }
-    byContext.get(context)!.push({ path, value });
+    // Vessel-name rows are stored under the synthetic path "name" (tagged
+    // kind "identity") but were received as empty-path object deltas —
+    // replay them in that original shape, the only one consumers
+    // (Freeboard) read names from. The kind gate keeps a data path
+    // literally named "name" replaying as the plain string it is.
+    byContext
+      .get(context)!
+      .push(
+        path === "name" && row.kind === "identity" && typeof value === "string"
+          ? { path: "", value: { name: value } }
+          : { path, value },
+      );
   }
 
   const deltas: Delta[] = [];
@@ -141,6 +152,40 @@ function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
   }
 
   return deltas;
+}
+
+// Last-known name per context AT the playback start. Names are static: a
+// vessel's AIS static report repeats every ~6 minutes and the recorder
+// dedupes writes to actual changes, so a playback window almost never
+// contains a name row — the name was written when the vessel was first
+// seen, possibly days ago. Fetching the latest-before-start per context
+// lets playback label every vessel the moment it first appears; bounding
+// at the start keeps a LATER rename out of a historical replay (in-window
+// renames still play back as rows). The kind filter keeps a data path
+// literally named "name" out of identity. Errors degrade to an empty map:
+// playback proceeds unlabeled rather than not at all.
+async function fetchLatestNames(
+  queryClient: QueryClient,
+  startTime: string,
+): Promise<Map<string, string>> {
+  try {
+    const result = await queryClient.exec(
+      `SELECT context, value_str FROM signalk_str ` +
+        `WHERE path = 'name' AND value_kind = 'identity' ` +
+        `AND ts <= '${startTime}' LATEST ON ts PARTITION BY context`,
+    );
+    const names = new Map<string, string>();
+    for (const row of queryClient.toObjects(result)) {
+      const context = (row.context as string) || "self";
+      const name = row.value_str;
+      if (typeof name === "string" && name !== "") {
+        names.set(context, name);
+      }
+    }
+    return names;
+  } catch {
+    return new Map();
+  }
 }
 
 export function createHistoryProviderV1(
@@ -188,6 +233,13 @@ export function createHistoryProviderV1(
     const startTime = validateTimestamp(options.startTime.toISOString());
     const playbackRate = Math.max(1, options.playbackRate);
 
+    // Vessel labels for this playback: last-known name per context,
+    // injected once ahead of a context's first delta so consumers can
+    // label the target immediately (a window almost never carries the
+    // name row itself — see fetchLatestNames).
+    let latestNames: Map<string, string> | null = null;
+    const namedContexts = new Set<string>();
+
     const CHUNK_SECONDS = 60;
     // Rows per read. A window holding more than this is drained across
     // several reads rather than truncated (see the resume logic below).
@@ -222,11 +274,31 @@ export function createHistoryProviderV1(
         const rows = queryClient.toObjects(result);
         const deltas = groupRowsIntoDeltas(rows);
 
+        if (deltas.length > 0 && latestNames === null) {
+          latestNames = await fetchLatestNames(queryClient, startTime);
+          if (stopped) return;
+        }
+
         for (const delta of deltas) {
           if (stopped) return;
 
           const resolvedContext =
             delta.context === "self" ? selfContext : delta.context;
+
+          const name = latestNames?.get(delta.context);
+          if (name !== undefined && !namedContexts.has(delta.context)) {
+            namedContexts.add(delta.context);
+            spark.write({
+              context: resolvedContext,
+              updates: [
+                {
+                  timestamp: delta.updates[0].timestamp,
+                  values: [{ path: "", value: { name } }],
+                },
+              ],
+            });
+          }
+
           spark.write({
             ...delta,
             context: resolvedContext,
