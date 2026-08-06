@@ -209,13 +209,13 @@ your network — see the warning under Grafana Integration).
 ### The "Small transactions — consider batching" alert
 
 The console's Monitoring view flags any table whose 90th-percentile WAL
-transaction stays under 100 rows. `signalk_position` triggers this
-**structurally**: the plugin commits its write buffer every "Write batch
-interval" (default 5 s), each commit is one WAL transaction per table, and the
-position table holds exactly one path — so its share of every commit is just
-the GPS fixes since the last one (2–3 rows at the default 2 s sampling rate).
-The other tables spread hundreds of paths across each transaction and are
-rarely flagged.
+transaction stays under QuestDB's recommended batch size (100 rows).
+`signalk_position` triggers this **structurally**: the plugin commits its
+write buffer every "Write batch interval", each commit is one WAL transaction
+per table, and the position table holds exactly one path — so its share of
+every commit is just the handful of GPS fixes since the last one. The other
+tables spread hundreds of paths across each transaction and are rarely
+flagged.
 
 At vessel data rates this alert is cosmetic. The numbers that actually matter
 are on the same page: **Write Amplification** near 1x, **Pending Rows** 0, and
