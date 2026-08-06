@@ -30,7 +30,7 @@ import {
 } from "./questdb-endpoint";
 import { nofileClampSatisfied, readMaxMapCount } from "./host-limits";
 import { buildContainerEnv } from "./container-env";
-import { PathMatcher, RateMatcher } from "./path-matcher";
+import { PathMatcher, RateMatcher, Throttle } from "./path-matcher";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -418,7 +418,7 @@ module.exports = (app: App) => {
   // stay correct in every topology, not just when questdbHost is loopback.
   let questdbEndpoints: { http: Endpoint; ilp: Endpoint } | null = null;
   const unsubscribes: (() => void)[] = [];
-  const throttleMap = new Map<string, number>();
+  const throttle = new Throttle();
   // Last vessel name written per context. Names repeat with every AIS
   // static report (~6 min); a row is only worth writing when the name
   // actually changes — replay works off the last-known value, not a
@@ -593,19 +593,19 @@ module.exports = (app: App) => {
     return mode === "exclude" ? !matches : matches;
   }
 
-  function isThrottled(path: string, defaultRate: number): boolean {
-    const now = Date.now();
-
+  function isThrottled(
+    path: string,
+    context: string,
+    defaultRate: number,
+  ): boolean {
     // Per-path override wins when one matches; otherwise the default rate.
     const overrideRate = rateMatcher?.rateFor(path) ?? null;
-    const minMs = overrideRate ?? defaultRate;
-    if (minMs > 0) {
-      const lastWrite = throttleMap.get(path) ?? 0;
-      if (now - lastWrite < minMs) return true;
-      throttleMap.set(path, now);
-    }
-
-    return false;
+    return throttle.shouldDrop(
+      path,
+      context,
+      overrideRate ?? defaultRate,
+      Date.now(),
+    );
   }
 
   const WAL_NOTIFICATION_PATH = "notifications.signalk-questdb.walSuspended";
@@ -1026,7 +1026,7 @@ module.exports = (app: App) => {
           // flap the name on every alternation.
           if (
             lastNameByContext.get(nameCtx) !== vesselName &&
-            !isThrottled(`name|${nameCtx}`, config.defaultSamplingRate ?? 2000)
+            !isThrottled("name", nameCtx, config.defaultSamplingRate ?? 2000)
           ) {
             lastNameByContext.set(nameCtx, vesselName);
             // Tagged "identity" so replay can tell these synthetic rows
@@ -1050,7 +1050,17 @@ module.exports = (app: App) => {
       if (!isSelf && !config.recordOthers) return;
 
       if (!shouldRecord(path, config.pathFilter.mode)) return;
-      if (isThrottled(path, config.defaultSamplingRate ?? 2000)) return;
+      // Throttled per path AND context: the sampling rate bounds each
+      // vessel's stream, not the fleet's (issue #93). The stored context
+      // ("self" vs raw) is the key, matching what the rows carry.
+      if (
+        isThrottled(
+          path,
+          isSelf ? "self" : context,
+          config.defaultSamplingRate ?? 2000,
+        )
+      )
+        return;
 
       // Rows are stamped with the server receive time, deliberately NOT the
       // delta's own timestamp: a boat is a set of independent clocks (GPS
@@ -1268,7 +1278,7 @@ module.exports = (app: App) => {
         writer = null;
       }
 
-      throttleMap.clear();
+      throttle.clear();
       lastNameByContext.clear();
       // Drop the compiled globs with the config they belong to, so a restart
       // with different patterns cannot match against the previous run's.

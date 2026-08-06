@@ -110,3 +110,63 @@ export class RateMatcher {
     return result;
   }
 }
+
+// Sampling gate, keyed by path AND context: the rate limits each vessel's
+// stream individually. A per-path-only bucket lets whichever AIS target
+// transmits first claim the slot and drops every other vessel's update
+// inside the window — with recordOthers and a fleet in range, that is one
+// position per interval fleet-wide instead of per target (issue #93).
+// Rate overrides stay per PATH (resolved by the caller via RateMatcher):
+// an override describes the channel, not the vessel.
+export class Throttle {
+  private readonly lastWrite = new Map<string, number>();
+  private maxRateMs = 0;
+
+  // Transient AIS contexts churn for months on a fleet install, and every
+  // (path, context) pair would otherwise stay in the map until shutdown.
+  // The cap triggers a sweep of pairs older than every sampling window —
+  // those can never throttle again — and falls back to a full clear when
+  // that many pairs are genuinely active inside one window (a momentary
+  // under-throttle beats unbounded growth; same pressure valve as
+  // RateMatcher's MAX_CACHE_ENTRIES).
+  constructor(private readonly maxEntries = 10_000) {}
+
+  get size(): number {
+    return this.lastWrite.size;
+  }
+
+  /**
+   * True when this path+context pair already wrote within the past
+   * `minMs`; records `now` as the pair's last write otherwise. A
+   * non-positive rate disables throttling for the call.
+   */
+  shouldDrop(
+    path: string,
+    context: string,
+    minMs: number,
+    now: number,
+  ): boolean {
+    if (minMs <= 0) return false;
+    if (minMs > this.maxRateMs) this.maxRateMs = minMs;
+    const key = `${path}|${context}`;
+    const last = this.lastWrite.get(key) ?? 0;
+    if (now - last < minMs) return true;
+    if (this.lastWrite.size >= this.maxEntries && !this.lastWrite.has(key)) {
+      this.evict(now);
+    }
+    this.lastWrite.set(key, now);
+    return false;
+  }
+
+  private evict(now: number): void {
+    for (const [key, last] of this.lastWrite) {
+      if (now - last >= this.maxRateMs) this.lastWrite.delete(key);
+    }
+    if (this.lastWrite.size >= this.maxEntries) this.lastWrite.clear();
+  }
+
+  clear(): void {
+    this.lastWrite.clear();
+    this.maxRateMs = 0;
+  }
+}
