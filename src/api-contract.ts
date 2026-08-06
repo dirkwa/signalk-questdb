@@ -109,6 +109,8 @@ export interface ResumeWalResult {
 /** POST /api/resume-wal. */
 export interface ResumeWalResponse extends ApiError {
   results?: ResumeWalResult[];
+  /** How many of `results` succeeded. */
+  resumed?: number;
 }
 
 /**

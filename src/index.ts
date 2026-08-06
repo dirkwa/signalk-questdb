@@ -29,6 +29,14 @@ import {
   type Endpoint,
 } from "./questdb-endpoint";
 import { nofileClampSatisfied, readMaxMapCount } from "./host-limits";
+import type {
+  DbStatus,
+  MigrationDetectResponse,
+  QuestdbVersion,
+  ResumeWalResponse,
+  UpdateInfo,
+  WalDiagnosis,
+} from "./api-contract";
 import { buildContainerEnv } from "./container-env";
 import { PathMatcher, RateMatcher, Throttle } from "./path-matcher";
 
@@ -1307,7 +1315,7 @@ module.exports = (app: App) => {
       router.get("/api/status", async (_req, res) => {
         try {
           if (!queryClient) {
-            res.status(503).json({ status: "not_running" });
+            res.status(503).json({ status: "not_running" } satisfies DbStatus);
             return;
           }
 
@@ -1327,7 +1335,10 @@ module.exports = (app: App) => {
 
           const healthy = await queryClient.isHealthy();
           if (!healthy) {
-            res.status(503).json({ status: "unhealthy", hostMaxMapCount });
+            res.status(503).json({
+              status: "unhealthy",
+              hostMaxMapCount,
+            } satisfies DbStatus);
             return;
           }
 
@@ -1441,7 +1452,7 @@ module.exports = (app: App) => {
             endpoint: questdbEndpoints
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
               : null,
-          });
+          } satisfies DbStatus);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",
@@ -1517,7 +1528,7 @@ module.exports = (app: App) => {
             .map((r) => ({
               tag: r.tag_name,
               prerelease: r.prerelease,
-            }));
+            })) satisfies QuestdbVersion[];
           res.json(versions);
         } catch (err) {
           res.status(500).json({
@@ -1577,7 +1588,11 @@ module.exports = (app: App) => {
             latestVersion !== "unknown" &&
             semverGreater(currentVersion, latestVersion);
 
-          res.json({ currentVersion, latestVersion, updateAvailable });
+          res.json({
+            currentVersion,
+            latestVersion,
+            updateAvailable,
+          } satisfies UpdateInfo);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",
@@ -1838,7 +1853,7 @@ module.exports = (app: App) => {
               results.length === 0
                 ? "No suspended tables found"
                 : `Resumed ${results.filter((r) => r.ok).length} of ${results.length} suspended table(s)`,
-          });
+          } satisfies ResumeWalResponse);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : String(err),
@@ -1898,7 +1913,7 @@ module.exports = (app: App) => {
               applyError,
             });
           }
-          res.json({ tables });
+          res.json({ tables } satisfies WalDiagnosis);
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : String(err),
@@ -2297,7 +2312,7 @@ module.exports = (app: App) => {
           // not running
         }
 
-        res.json({ sources });
+        res.json({ sources } satisfies MigrationDetectResponse);
       });
 
       router.get("/api/export", async (req, res) => {
