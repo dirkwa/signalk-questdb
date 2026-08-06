@@ -1026,6 +1026,14 @@ export default (app: App) => {
       if (!writer) return;
       const { path, value, context } = delta;
 
+      // Note the context BEFORE any early return or filter: identity-only
+      // deltas return below, and path filters and throttles decide what gets
+      // STORED — but any delta at all proves the vessel is transmitting now,
+      // which is what makes its stored position obsolete for the restore.
+      if (trackLiveContexts) {
+        liveContexts.add(context === app.selfContext ? "self" : context);
+      }
+
       // Static vessel identity (issue #91): names arrive as empty-path
       // object deltas, which the path guard below would drop. Stored as
       // path "name" in the string table; history-v1 replays them in the
@@ -1074,11 +1082,6 @@ export default (app: App) => {
       const isSelf = context === app.selfContext;
       if (isSelf && !config.recordSelf) return;
       if (!isSelf && !config.recordOthers) return;
-
-      // Note this BEFORE the path filter and throttle: those decide what gets
-      // stored, but any delta at all proves the vessel is transmitting now,
-      // which is what makes its stored position obsolete.
-      if (trackLiveContexts) liveContexts.add(isSelf ? "self" : context);
 
       if (!shouldRecord(path, config.pathFilter.mode)) return;
       // Throttled per path AND context: the sampling rate bounds each
@@ -1271,7 +1274,10 @@ export default (app: App) => {
         })
         .finally(() => {
           // Only needed to shield the restore; tracking every context for the
-          // life of the plugin would be an unbounded set.
+          // life of the plugin would be an unbounded set. Guarded on the
+          // generation so a slow restore settling after a restart does not
+          // disarm the tracking the NEW start just armed.
+          if (lifecycleGeneration !== restoreGeneration) return;
           liveContexts.clear();
           trackLiveContexts = false;
         });
