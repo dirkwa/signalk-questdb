@@ -86,3 +86,36 @@ describe("normalizeConfig recording toggles", () => {
     assert.equal(normalized.recordOthers, false);
   });
 });
+
+describe("normalizeConfig resource limits", () => {
+  it("backfills limits dropped by pre-fix panel saves (issue #98)", () => {
+    // The panel used to replace the config wholesale, stripping the resource
+    // keys — which ran QuestDB with NO memory cap instead of the schema's
+    // 768m. Missing keys must recover the schema defaults.
+    const damaged = { managedContainer: true } as unknown as Config;
+    const normalized = normalizeConfig(damaged);
+    assert.equal(normalized.questdbMemoryLimit, "768m");
+    assert.equal(normalized.questdbCpuLimit, 1.5);
+  });
+
+  it("preserves the documented unlimited opt-outs", () => {
+    // "" (memory) and 0 (CPU) are explicit choices, not missing keys.
+    const config = {
+      questdbMemoryLimit: "",
+      questdbCpuLimit: 0,
+    } as unknown as Config;
+    const normalized = normalizeConfig(config);
+    assert.equal(normalized.questdbMemoryLimit, "");
+    assert.equal(normalized.questdbCpuLimit, 0);
+  });
+
+  it("keeps explicit user limits untouched", () => {
+    const config = {
+      questdbMemoryLimit: "2g",
+      questdbCpuLimit: 3,
+    } as unknown as Config;
+    const normalized = normalizeConfig(config);
+    assert.equal(normalized.questdbMemoryLimit, "2g");
+    assert.equal(normalized.questdbCpuLimit, 3);
+  });
+});
