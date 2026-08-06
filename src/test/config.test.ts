@@ -64,3 +64,25 @@ describe("normalizeConfig", () => {
     );
   });
 });
+
+describe("normalizeConfig recording toggles", () => {
+  it("defaults missing toggles to enabled, matching the schema", () => {
+    // A hand-edited or pre-panel config misses the keys entirely; the
+    // runtime guards read them directly, so missing must mean the schema
+    // default (both ON), not "disabled".
+    const legacy = { managedContainer: true } as unknown as Config;
+    const normalized = normalizeConfig(legacy);
+    assert.equal(normalized.recordSelf, true);
+    assert.equal(normalized.recordOthers, true);
+  });
+
+  it("preserves an explicit opt-out", () => {
+    const config = {
+      recordSelf: false,
+      recordOthers: false,
+    } as unknown as Config;
+    const normalized = normalizeConfig(config);
+    assert.equal(normalized.recordSelf, false);
+    assert.equal(normalized.recordOthers, false);
+  });
+});

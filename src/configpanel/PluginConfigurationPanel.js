@@ -272,7 +272,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     cfg.managedContainer !== false,
   );
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
-  const [recordOthers, setRecordOthers] = useState(cfg.recordOthers || false);
+  const [recordOthers, setRecordOthers] = useState(cfg.recordOthers !== false);
   const [defaultSamplingRate, setDefaultSamplingRate] = useState(
     cfg.defaultSamplingRate ?? 2000,
   );
