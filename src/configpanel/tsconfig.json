@@ -1,0 +1,38 @@
+{
+  // The config panel is a browser bundle, not part of the Node plugin
+  // compile. It needs DOM types and JSX, which must never leak into the
+  // root tsconfig — server code that referenced `document` would typecheck
+  // clean. tsc only typechecks here (noEmit); Babel does the compiling.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+
+    // "react" (classic) is load-bearing and must match the babel-loader
+    // `runtime: "classic"` option in webpack.config.js — see the long
+    // comment there. Under "react-jsx" tsc stops requiring `React` to be in
+    // scope, the import gets dropped as unused, and the classic babel
+    // transform then emits React.createElement against an undefined React:
+    // a runtime crash with no build error.
+    "jsx": "react",
+
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+
+    // The panel imports types from the server tree (../config/schema,
+    // ../wal-monitor), and those files reference NodeJS.Timeout, so node
+    // types must stay available here.
+    "types": ["node"],
+
+    "strict": true,
+    "noEmit": true,
+
+    // Babel compiles one file at a time with no type information, so the
+    // code must be safe to transpile in isolation.
+    "isolatedModules": true,
+
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["."]
+}
