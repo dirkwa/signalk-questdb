@@ -11,7 +11,7 @@ import {
   HOST_GATEWAY,
   QUESTDB_INTERNAL_HTTP_PORT,
   QUESTDB_INTERNAL_ILP_PORT,
-} from "../questdb-endpoint";
+} from "../questdb-endpoint.js";
 
 describe("splitHostPort", () => {
   it("parses host:port", () => {

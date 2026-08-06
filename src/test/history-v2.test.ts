@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createHistoryProviderV2 } from "../history-v2";
+import { createHistoryProviderV2 } from "../history-v2.js";
 
 interface CapturedQuery {
   sql: string;

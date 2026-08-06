@@ -1,4 +1,4 @@
-import { QueryClient } from "./query-client";
+import { QueryClient } from "./query-client.js";
 
 const TABLES = ["signalk", "signalk_str", "signalk_position"];
 const DAY_MS = 24 * 60 * 60 * 1000;

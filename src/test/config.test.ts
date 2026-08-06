@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeConfig, type Config } from "../config/schema";
+import { normalizeConfig, type Config } from "../config/schema.js";
 
 // Signal K hands the plugin its stored configuration verbatim — a config
 // saved before an option existed simply misses the key, and TypeBox

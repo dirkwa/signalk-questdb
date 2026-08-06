@@ -9,8 +9,8 @@
 // The panel is a browser bundle, so this file must stay type-only — no
 // imports that pull runtime code (fs, typebox) into webpack's graph.
 
-import type { MaxMapCountStatus } from "./host-limits";
-import type { SkipPlan, SuspendedTable } from "./wal-monitor";
+import type { MaxMapCountStatus } from "./host-limits.js";
+import type { SkipPlan, SuspendedTable } from "./wal-monitor.js";
 
 /**
  * Every handler answers failures with `{ error }`, and the action endpoints

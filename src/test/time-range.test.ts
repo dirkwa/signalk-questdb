@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Temporal } from "@js-temporal/polyfill";
-import { resolveTimeRange } from "../time-range";
+import { resolveTimeRange } from "../time-range.js";
 
 describe("resolveTimeRange", () => {
   it("resolves from + to", () => {

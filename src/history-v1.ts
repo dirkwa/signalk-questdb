@@ -1,4 +1,4 @@
-import { QueryClient, validateTimestamp } from "./query-client";
+import { QueryClient, validateTimestamp } from "./query-client.js";
 
 interface HistoryOptions {
   startTime: Date;

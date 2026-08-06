@@ -1,13 +1,13 @@
 import { IRouter } from "express";
-import { ILPWriter } from "./ilp-writer";
-import { QueryClient, isReadOnlySQL } from "./query-client";
-import type { QuestDBResult } from "./query-client";
-import { Config, ConfigSchema, normalizeConfig } from "./config/schema";
-import { extractVesselName, routeDeltaValue } from "./delta-routing";
-import { createHistoryProviderV2 } from "./history-v2";
-import { createHistoryProviderV1 } from "./history-v1";
-import { startRetention } from "./retention";
-import { buildFullExportWhere } from "./full-export-range";
+import { ILPWriter } from "./ilp-writer.js";
+import { QueryClient, isReadOnlySQL } from "./query-client.js";
+import type { QuestDBResult } from "./query-client.js";
+import { Config, ConfigSchema, normalizeConfig } from "./config/schema.js";
+import { extractVesselName, routeDeltaValue } from "./delta-routing.js";
+import { createHistoryProviderV2 } from "./history-v2.js";
+import { createHistoryProviderV1 } from "./history-v1.js";
+import { startRetention } from "./retention.js";
+import { buildFullExportWhere } from "./full-export-range.js";
 import {
   WalMonitor,
   buildPendingSegmentsSQL,
@@ -17,7 +17,7 @@ import {
   skipPlansEqual,
   type PendingSegment,
   type SuspendedTable,
-} from "./wal-monitor";
+} from "./wal-monitor.js";
 import {
   QUESTDB_INTERNAL_HTTP_PORT,
   QUESTDB_INTERNAL_ILP_PORT,
@@ -27,8 +27,8 @@ import {
   resolveLanExposureHost,
   lanExposureEndpoints,
   type Endpoint,
-} from "./questdb-endpoint";
-import { nofileClampSatisfied, readMaxMapCount } from "./host-limits";
+} from "./questdb-endpoint.js";
+import { nofileClampSatisfied, readMaxMapCount } from "./host-limits.js";
 import type {
   DbStatus,
   MigrationDetectResponse,
@@ -39,9 +39,9 @@ import type {
   UpdateInfo,
   WalDiagnosis,
   WalDiagnosisTable,
-} from "./api-contract";
-import { buildContainerEnv } from "./container-env";
-import { PathMatcher, RateMatcher, Throttle } from "./path-matcher";
+} from "./api-contract.js";
+import { buildContainerEnv } from "./container-env.js";
+import { PathMatcher, RateMatcher, Throttle } from "./path-matcher.js";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -302,7 +302,7 @@ function buildResourceLimits(config: Config): ContainerResourceLimits {
   };
 }
 
-module.exports = (app: App) => {
+export default (app: App) => {
   let writer: ILPWriter | null = null;
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;

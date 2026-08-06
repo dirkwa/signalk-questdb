@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 // Type-only, always: this file is bundled for the browser, so a value import
 // reaching out of src/configpanel/ would pull the server module's runtime
 // dependencies (typebox, fs/promises) into the panel bundle.
-import type { Config } from "../config/schema";
+import type { Config } from "../config/schema.js";
 import type {
   ApiError,
   DbStatus,
@@ -14,8 +14,8 @@ import type {
   UpdateApplyResponse,
   UpdateInfo,
   WalDiagnosis,
-} from "../api-contract";
-import type { SkipPlan } from "../wal-monitor";
+} from "../api-contract.js";
+import type { SkipPlan } from "../wal-monitor.js";
 
 type FilterMode = Config["pathFilter"]["mode"];
 type Compression = Config["compression"];

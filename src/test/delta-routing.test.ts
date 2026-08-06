@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { extractVesselName, routeDeltaValue } from "../delta-routing";
+import { extractVesselName, routeDeltaValue } from "../delta-routing.js";
 
 describe("routeDeltaValue", () => {
   it("routes numbers to the scalar table", () => {

@@ -7,7 +7,7 @@
 // multi-worker defaults. Anything a future option adds here now reaches both
 // paths by construction.
 
-import { Config } from "./config/schema";
+import { Config } from "./config/schema.js";
 
 // QuestDB's ingest path does not fsync anything under its default
 // `cairo.commit.mode=nosync`: durability is left to the OS page cache, and a
