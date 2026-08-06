@@ -276,6 +276,9 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [defaultSamplingRate, setDefaultSamplingRate] = useState(
     cfg.defaultSamplingRate ?? 2000,
   );
+  const [ilpFlushIntervalMs, setIlpFlushIntervalMs] = useState(
+    cfg.ilpFlushIntervalMs ?? 5000,
+  );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
   // Hydrate defensively: a hand-edited or corrupted config could carry a bad
   // mode or a non-array `paths`, and an unguarded `.join()` would crash the
@@ -608,6 +611,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       questdbVersion,
       managedContainer,
       defaultSamplingRate,
+      ilpFlushIntervalMs,
       recordSelf,
       recordOthers,
       retentionDays,
@@ -1206,6 +1210,22 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         />
         <span style={S.hint}>
           1000 = max 1 write/sec per path (0 = every update)
+        </span>
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Write batch interval (ms)</span>
+        <input
+          style={S.inputSmall}
+          type="number"
+          min={500}
+          max={300000}
+          value={ilpFlushIntervalMs}
+          onChange={(e) => setIlpFlushIntervalMs(Number(e.target.value))}
+        />
+        <span style={S.hint}>
+          one QuestDB transaction per table per interval; longer = bigger
+          batches, but up to this many ms lost on a hard crash (default 5000)
         </span>
       </div>
 
