@@ -154,5 +154,13 @@ export function normalizeConfig(config: Config): Config {
     // pre-panel config silently disabled the recording the schema promises.
     recordSelf: config.recordSelf !== false,
     recordOthers: config.recordOthers !== false,
+    // Missing resource limits get the schema defaults. Config-panel saves
+    // used to drop these keys entirely (issue #98), which ran QuestDB with
+    // NO memory cap instead of the promised 768m — this backfill repairs
+    // configs already damaged by those saves. The documented opt-outs
+    // survive: an explicit "" (memory) or 0 (CPU) means unlimited and is
+    // not a missing key.
+    questdbMemoryLimit: config.questdbMemoryLimit ?? "768m",
+    questdbCpuLimit: config.questdbCpuLimit ?? 1.5,
   };
 }

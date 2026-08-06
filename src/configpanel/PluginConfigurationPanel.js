@@ -621,6 +621,11 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       return;
     }
     save({
+      // Spread the stored configuration first so keys this panel does not
+      // manage (questdbMemoryLimit, questdbCpuLimit, hand-edited extras)
+      // survive a save — replacing the config wholesale silently stripped
+      // them, including the schema's default memory cap (issue #98).
+      ...cfg,
       questdbHost,
       questdbIlpPort,
       questdbHttpPort,
