@@ -1,7 +1,8 @@
 src/
 .github/
+.mf/
 *.tsbuildinfo
 .DS_Store
 eslint.config.cjs
-webpack.config.cjs
+vite.config.ts
 tsconfig.json
