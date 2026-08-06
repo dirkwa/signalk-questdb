@@ -603,6 +603,17 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [exporting, setExporting] = useState(false);
 
   const doSave = () => {
+    // The min/max attributes only hint; a cleared field yields 0 and garbage
+    // yields NaN, and a bad interval reaches the flush timer directly.
+    if (
+      !Number.isFinite(ilpFlushIntervalMs) ||
+      ilpFlushIntervalMs < 500 ||
+      ilpFlushIntervalMs > 300000
+    ) {
+      setActionStatus("Write batch interval must be 500–300000 ms.");
+      setStatusError(true);
+      return;
+    }
     save({
       questdbHost,
       questdbIlpPort,
@@ -1220,6 +1231,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           type="number"
           min={500}
           max={300000}
+          aria-label="Write batch interval in milliseconds"
           value={ilpFlushIntervalMs}
           onChange={(e) => setIlpFlushIntervalMs(Number(e.target.value))}
         />

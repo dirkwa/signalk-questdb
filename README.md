@@ -223,11 +223,12 @@ are on the same page: **Write Amplification** near 1x, **Pending Rows** 0, and
 many small transactions per apply cycle anyway.
 
 If you want bigger transactions regardless, raise **"Write batch interval"**
-in the plugin config (up to 300 s). Clearing the alert for the position table
-needs roughly 100 fixes per commit — about 200 s at the default sampling rate.
-The trade-off is honest: up to that many seconds of buffered data is lost on a
-hard crash (a clean Signal K shutdown flushes first), and live-ish history
-queries see new data that much later.
+in the plugin config. Clearing the alert for the position table needs roughly
+100 fixes per commit — a batch window in the minutes, not seconds (the exact
+numbers depend on your sampling rate; the config panel states the current
+bounds). The trade-off is honest: up to one batch interval of buffered data is
+lost on a hard crash (a clean Signal K shutdown flushes first), and live-ish
+history queries see new data that much later.
 
 ## Performance (Pi / Low-Power Devices)
 
