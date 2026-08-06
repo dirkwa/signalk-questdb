@@ -45,7 +45,9 @@ When `managedContainer` is false, the plugin connects to an external QuestDB at 
 
 ### Config schema
 
-`src/config/schema.ts` uses **TypeBox** (`@sinclair/typebox`) — the schema is the single source of truth for the JSON-schema Signal K shows in the Admin UI **and** for the `Config` TS type. Add new options there.
+`src/config/schema.ts` uses **TypeBox** — the schema is the single source of truth for the JSON-schema Signal K shows in the Admin UI **and** for the `Config` TS type. Add new options there.
+
+The package is the unscoped `typebox` (1.x), not `@sinclair/typebox` (which stopped at 0.34). TypeBox 1 was published under a new name rather than a major bump, so `npm outdated` will never point at it.
 
 ### REST endpoints
 

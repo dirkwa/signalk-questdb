@@ -1,4 +1,4 @@
-import { Type, Static } from "@sinclair/typebox";
+import { Type, Static } from "typebox";
 
 export const ConfigSchema = Type.Object({
   questdbHost: Type.String({
