@@ -207,18 +207,43 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
         // The console has no reason to be sniffed into a different type.
         headers["x-content-type-options"] = "nosniff";
 
-        res.writeHead(proxied.statusCode ?? 502, headers);
-        // A HEAD response carries no body by definition. QuestDB nonetheless
-        // answers HEAD with `405 Transfer-Encoding: chunked` AND a body, which
-        // is protocol-illegal; piping that upstream response through leaves
-        // the client waiting for chunks that never legally arrive and the
-        // connection dies with an empty reply. Terminate the response
-        // ourselves and discard whatever the upstream sent.
-        if (req.method === "HEAD") {
+        // QuestDB's redirect states NEITHER content-length nor
+        // transfer-encoding, so Node cannot know the response is complete and
+        // falls back to `Transfer-Encoding: chunked` — announcing a body that
+        // never arrives. The browser then waits on a 301 that never finishes,
+        // which is exactly how a working console still reported "console
+        // unavailable" after the Location rewrite was already correct.
+        //
+        // Declaring the length explicitly is what stops Node guessing. Applied
+        // to every status that carries no body by definition, not just 3xx.
+        // Deliberately keyed on the STATUS, not on the upstream's framing
+        // headers: an origin that omits both (QuestDB) and one that sends
+        // `chunked` for an empty body (Node's own server does this) must be
+        // handled identically, and only the status tells us a body is absent
+        // by definition.
+        const status = proxied.statusCode;
+        const bodyless =
+          req.method === "HEAD" ||
+          status === 204 ||
+          status === 304 ||
+          (status !== undefined && status >= 300 && status < 400);
+
+        if (bodyless) {
+          // 204/304 must not carry content-length at all (RFC 9110 §6.4.1);
+          // for the rest, an explicit 0 is what keeps Node from chunking.
+          if (status !== 204 && status !== 304) {
+            headers["content-length"] = "0";
+          }
+          res.writeHead(status ?? 502, headers);
+          // Drain whatever the upstream sent regardless: QuestDB answers HEAD
+          // with a body under chunked framing, which is protocol-illegal, and
+          // leaving it unread holds the socket open.
           proxied.resume();
           res.end();
           return;
         }
+
+        res.writeHead(proxied.statusCode ?? 502, headers);
         proxied.pipe(res);
       },
     );

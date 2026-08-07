@@ -294,6 +294,64 @@ describe("console proxy redirect rewriting", () => {
     }
   }
 
+  it("does not announce a chunked body on a bodyless redirect", async () => {
+    // QuestDB's 301 states NEITHER content-length nor transfer-encoding, so
+    // Node falls back to chunked framing — announcing a body that never
+    // arrives. The browser waits on a redirect that never completes, which is
+    // how a working console still reported "console unavailable" even after
+    // the Location rewrite was correct. Rewriting Location was necessary but
+    // not sufficient; this is the other half.
+    const up = http.createServer((_req, res) => {
+      // Exactly QuestDB's shape: no length, no encoding, no body.
+      res.writeHead(301, { location: "/index.html" });
+      res.end();
+    });
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      // Raw client: fetch() normalises framing away, hiding the very header
+      // this test exists to check.
+      const headers = await new Promise<http.IncomingHttpHeaders>(
+        (resolve, reject) => {
+          const r = http.request(
+            {
+              host: "127.0.0.1",
+              port,
+              path: "/",
+              headers: { connection: "close" },
+            },
+            (res) => {
+              res.resume();
+              res.on("end", () => resolve(res.headers));
+            },
+          );
+          r.on("error", reject);
+          r.end();
+        },
+      );
+      assert.equal(
+        headers["transfer-encoding"],
+        undefined,
+        "a bodyless redirect must not be chunked",
+      );
+      assert.equal(headers["content-length"], "0");
+    } finally {
+      front.closeAllConnections?.();
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
+  });
+
   it("keeps a root-relative redirect inside the mount", async () => {
     assert.equal(await locationThrough("/index.html"), `${MOUNT}/index.html`);
   });
