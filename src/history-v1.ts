@@ -230,6 +230,22 @@ export function createHistoryProviderV1(
     onChange: () => void,
   ): () => void {
     let stopped = false;
+    // The pending inter-chunk timer. Tracked so stopping actually CANCELS it:
+    // clearing `stopped` alone leaves a scheduled callback holding the event
+    // loop open for up to CHUNK_SECONDS (60s at playbackRate 1), which kept
+    // the test process alive long past its assertions and tripped the plugin
+    // registry's 60s test budget.
+    let chunkTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleChunk = (delayMs: number) => {
+      if (stopped) return;
+      chunkTimer = setTimeout(() => {
+        chunkTimer = null;
+        streamChunk();
+      }, delayMs);
+      // Never let a playback timer be the only thing keeping the process
+      // alive — the server owns the lifecycle, not this stream.
+      chunkTimer.unref?.();
+    };
     const startTime = validateTimestamp(options.startTime.toISOString());
     const playbackRate = Math.max(1, options.playbackRate);
 
@@ -266,7 +282,7 @@ export function createHistoryProviderV1(
         if (result.dataset.length === 0) {
           currentTime = chunkEnd;
           if (!stopped) {
-            setTimeout(streamChunk, 100);
+            scheduleChunk(100);
           }
           return;
         }
@@ -333,7 +349,7 @@ export function createHistoryProviderV1(
             lastTs > currentTime.getTime() ? lastTs : currentTime.getTime() + 1;
           currentTime = new Date(Math.min(resumeAt, chunkEnd.getTime()));
           if (!stopped) {
-            setTimeout(streamChunk, 0);
+            scheduleChunk(0);
           }
           return;
         }
@@ -341,27 +357,34 @@ export function createHistoryProviderV1(
         currentTime = chunkEnd;
         const wallDelay = (CHUNK_SECONDS * 1000) / playbackRate;
         if (!stopped) {
-          setTimeout(streamChunk, wallDelay);
+          scheduleChunk(wallDelay);
         }
       } catch (err) {
         debug(
           `streamHistory error: ${err instanceof Error ? err.message : String(err)}`,
         );
         if (!stopped) {
-          setTimeout(streamChunk, 1000);
+          scheduleChunk(1000);
         }
       }
     }
 
     streamChunk();
 
-    spark.on("end", () => {
+    // Cancel the pending chunk as well as setting the flag: the flag only
+    // stops the NEXT scheduling decision, while an already-scheduled timer
+    // keeps the event loop alive until it fires.
+    const stop = () => {
       stopped = true;
-    });
-
-    return () => {
-      stopped = true;
+      if (chunkTimer) {
+        clearTimeout(chunkTimer);
+        chunkTimer = null;
+      }
     };
+
+    spark.on("end", stop);
+
+    return stop;
   }
 
   // Snapshot of every path at `date`, for the v1 snapshot API.
