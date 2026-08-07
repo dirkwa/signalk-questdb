@@ -66,7 +66,13 @@ async function throughProxy(
       method: init.method ?? "GET",
       body: init.body,
     });
-    return { status: res.status, text: await res.text(), seen };
+    return {
+      status: res.status,
+      text: await res.text(),
+      csp: res.headers.get("content-security-policy"),
+      nosniff: res.headers.get("x-content-type-options"),
+      seen,
+    };
   } finally {
     await new Promise<void>((r) => front.close(() => r()));
   }
@@ -130,6 +136,68 @@ describe("console proxy forwarding", () => {
     }
     assert.equal(seen[0].headers.cookie, undefined);
     assert.equal(seen[0].headers.authorization, undefined);
+  });
+});
+
+describe("console proxy header hygiene", () => {
+  it("drops headers nominated by Connection, not just the fixed set", async () => {
+    // RFC 7230 §6.1: Connection may list ADDITIONAL single-hop headers. A
+    // fixed blocklist forwards those, leaking connection-scoped state across
+    // the hop.
+    const proxy = createConsoleProxy({
+      baseUrl: () => upstreamUrl,
+      debug: () => {},
+    });
+    seen = [];
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+    try {
+      // Raw socket: fetch() refuses to set Connection.
+      await new Promise<void>((resolve) => {
+        const r = http.request(
+          {
+            port,
+            path: "/",
+            headers: {
+              connection: "keep-alive, x-hop-secret",
+              "x-hop-secret": "must-not-travel",
+              "x-normal": "must-travel",
+            },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve());
+          },
+        );
+        r.end();
+      });
+    } finally {
+      await new Promise<void>((r) => front.close(() => r()));
+    }
+    assert.equal(seen[0].headers["x-hop-secret"], undefined);
+    assert.equal(seen[0].headers["x-normal"], "must-travel");
+  });
+
+  it("sends a CSP narrowing what the same-origin console may do", async () => {
+    const r = await throughProxy("/");
+    assert.match(r.csp ?? "", /form-action 'self'/);
+    assert.match(r.csp ?? "", /frame-ancestors 'self'/);
+    assert.match(r.csp ?? "", /base-uri 'self'/);
+  });
+
+  it("does not send connect-src, which would break the SQL editor", async () => {
+    // Monaco is loaded from a CDN path baked into QuestDB's bundle. A
+    // `connect-src 'self'` here reads as safer but blanks out the query
+    // editor — the console's entire purpose. Pinned so a future tightening is
+    // a deliberate decision, taken with the Monaco question re-checked.
+    const r = await throughProxy("/");
+    assert.doesNotMatch(r.csp ?? "", /connect-src/);
+  });
+
+  it("marks responses nosniff", async () => {
+    const r = await throughProxy("/");
+    assert.equal(r.nosniff, "nosniff");
   });
 });
 

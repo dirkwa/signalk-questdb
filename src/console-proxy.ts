@@ -47,20 +47,61 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ]);
 
-function forwardableHeaders(
+/**
+ * Header names `Connection` nominates for removal. RFC 7230 §6.1 lets a hop
+ * list additional single-hop headers there, so the fixed set above is not the
+ * whole story — forwarding a nominated header leaks connection-scoped state
+ * across the hop.
+ */
+function connectionNominated(headers: IncomingMessage["headers"]): Set<string> {
+  const raw = Array.isArray(headers.connection)
+    ? headers.connection.join(",")
+    : (headers.connection ?? "");
+  return new Set(
+    raw
+      .split(",")
+      .map((v) => v.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+function stripHopByHop(
   headers: IncomingMessage["headers"],
 ): Record<string, string | string[]> {
+  const nominated = connectionNominated(headers);
   const out: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     const lower = key.toLowerCase();
-    if (lower === "host" || HOP_BY_HOP.has(lower)) continue;
-    // Signal K's session cookie is not QuestDB's business, and forwarding it
-    // would leak an admin credential to a process that has no use for it.
-    if (lower === "cookie" || lower === "authorization") continue;
+    if (HOP_BY_HOP.has(lower) || nominated.has(lower)) continue;
     out[key] = value;
   }
   return out;
+}
+
+function forwardableHeaders(
+  headers: IncomingMessage["headers"],
+): Record<string, string | string[]> {
+  const out = stripHopByHop(headers);
+  // `host` must name the upstream, not the Signal K server.
+  delete out.host;
+  // Signal K's session cookie is not QuestDB's business, and forwarding it
+  // would leak an admin credential to a process that has no use for it.
+  delete out.cookie;
+  delete out.authorization;
+  return out;
+}
+
+/**
+ * Response headers must be filtered too. The upstream's own hop-by-hop
+ * headers describe ITS connection to us, not ours to the browser; relaying
+ * them lets QuestDB's framing decisions override the ones Node is making for
+ * the client's connection.
+ */
+function returnableHeaders(
+  headers: IncomingMessage["headers"],
+): Record<string, string | string[]> {
+  return stripHopByHop(headers);
 }
 
 export function createConsoleProxy(deps: ConsoleProxyDeps) {
@@ -103,7 +144,33 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
         headers: forwardableHeaders(req.headers),
       },
       (proxied) => {
-        res.writeHead(proxied.statusCode ?? 502, proxied.headers);
+        const headers = returnableHeaders(proxied.headers);
+
+        // The console is served under the Signal K origin, so its scripts run
+        // with the admin's session. Signal K's auth cookie is httpOnly, so
+        // script cannot read it — but it IS attached to same-origin requests,
+        // which would let a tampered console drive Signal K's admin API as the
+        // logged-in user. A plugin cannot mint a separate origin, so narrow
+        // what the console may do instead.
+        //
+        // Deliberately NOT `connect-src 'self'`: the console's SQL editor is
+        // Monaco, and the bundle carries a jsdelivr loader path for it. Static
+        // analysis could not settle whether that path is actually taken, and
+        // shipping a policy that blanks out the query editor would be a worse
+        // outcome than the risk it mitigates. `form-action` and `base-uri`
+        // still block the two cheapest ways to redirect an admin's submission
+        // or rewrite relative URLs, and `frame-ancestors` blocks clickjacking
+        // from another site.
+        //
+        // Revisit if QuestDB ever bundles Monaco locally — then `connect-src`
+        // and `default-src 'self'` become safe to tighten, which is the real
+        // fix for a same-origin console.
+        headers["content-security-policy"] =
+          "form-action 'self'; frame-ancestors 'self'; base-uri 'self'";
+        // The console has no reason to be sniffed into a different type.
+        headers["x-content-type-options"] = "nosniff";
+
+        res.writeHead(proxied.statusCode ?? 502, headers);
         // A HEAD response carries no body by definition. QuestDB nonetheless
         // answers HEAD with `405 Transfer-Encoding: chunked` AND a body, which
         // is protocol-illegal; piping that upstream response through leaves
