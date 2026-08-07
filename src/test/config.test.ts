@@ -87,6 +87,47 @@ describe("normalizeConfig recording toggles", () => {
   });
 });
 
+describe("normalizeConfig startup restore", () => {
+  it("defaults a missing restore toggle to OFF", () => {
+    // Restore is opt-in — the inverse of the recording toggles. Defaulting a
+    // missing key to ON would start replaying history for every existing
+    // install on upgrade.
+    const legacy = { managedContainer: true } as unknown as Config;
+    const normalized = normalizeConfig(legacy);
+    assert.equal(normalized.restoreOnStart, false);
+  });
+
+  it("preserves an explicit opt-in", () => {
+    const config = { restoreOnStart: true } as unknown as Config;
+    assert.equal(normalizeConfig(config).restoreOnStart, true);
+  });
+
+  it("backfills a missing window with the schema default", () => {
+    const legacy = { restoreOnStart: true } as unknown as Config;
+    assert.equal(normalizeConfig(legacy).restoreMaxAgeMinutes, 9);
+  });
+
+  it("treats a zero or negative window as unset rather than disabling silently", () => {
+    // A zero window would replay nothing while the toggle still reads "on",
+    // which is indistinguishable from the feature being broken.
+    for (const value of [0, -5]) {
+      const config = {
+        restoreOnStart: true,
+        restoreMaxAgeMinutes: value,
+      } as unknown as Config;
+      assert.equal(normalizeConfig(config).restoreMaxAgeMinutes, 9);
+    }
+  });
+
+  it("preserves a custom window", () => {
+    const config = {
+      restoreOnStart: true,
+      restoreMaxAgeMinutes: 30,
+    } as unknown as Config;
+    assert.equal(normalizeConfig(config).restoreMaxAgeMinutes, 30);
+  });
+});
+
 describe("normalizeConfig resource limits", () => {
   it("backfills limits dropped by pre-fix panel saves (issue #98)", () => {
     // The panel used to replace the config wholesale, stripping the resource

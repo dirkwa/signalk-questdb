@@ -7,6 +7,7 @@ import { extractVesselName, routeDeltaValue } from "./delta-routing.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
 import { startRetention } from "./retention.js";
+import { RESTORE_SOURCE, restoreFromHistory } from "./restore.js";
 import { buildFullExportWhere } from "./full-export-range.js";
 import {
   WalMonitor,
@@ -354,6 +355,15 @@ export default (app: App) => {
   // (health-wait exhausted, ensureTables/connect threw) leaves them non-null
   // on a plugin that never came up.
   let pluginRunning = false;
+
+  // Contexts seen live while a startup restore is in flight. A stored fix
+  // must never overwrite a vessel that has already transmitted since boot —
+  // that would move it backwards on the chart. Populated by the recorder
+  // subscription and cleared as soon as the restore settles, so this stays a
+  // startup-window set rather than an unbounded one.
+  const liveContexts = new Set<string>();
+  let trackLiveContexts = false;
+
   const withLifecycleLock = <T>(fn: () => Promise<T>): Promise<T> => {
     const run = lifecycleChain.then(fn, fn);
     // Keep the chain alive regardless of this op's outcome.
@@ -1006,10 +1016,31 @@ export default (app: App) => {
     );
     app.registerHistoryProvider(v1Provider);
 
+    // Arm live-context tracking before the first delta can arrive, so the
+    // restore sees every vessel that transmitted during startup.
+    liveContexts.clear();
+    trackLiveContexts = config.restoreOnStart;
+
     const bus = app.streambundle.getBus();
     const unsub = bus.onValue((delta: any) => {
       if (!writer) return;
       const { path, value, context } = delta;
+
+      // Values this plugin replayed at startup come straight back around
+      // through the streambundle. Recording them would re-stamp historical
+      // fixes with the current receive time — inventing present-tense
+      // positions for vessels that may be long gone — and marking their
+      // context live would defeat the guard that stops a restore from
+      // overwriting a vessel that actually transmitted.
+      if (delta.$source === RESTORE_SOURCE) return;
+
+      // Note the context BEFORE any early return or filter: identity-only
+      // deltas return below, and path filters and throttles decide what gets
+      // STORED — but any delta at all proves the vessel is transmitting now,
+      // which is what makes its stored position obsolete for the restore.
+      if (trackLiveContexts) {
+        liveContexts.add(context === app.selfContext ? "self" : context);
+      }
 
       // Static vessel identity (issue #91): names arrive as empty-path
       // object deltas, which the path guard below would drop. Stored as
@@ -1209,6 +1240,56 @@ export default (app: App) => {
     // Any earlier return/throw leaves the flag false, so a half-started
     // plugin rejects lifecycle-dependent requests like /api/update/apply.
     pluginRunning = true;
+
+    // Repopulate the model from history — only now, because the guard below
+    // reads pluginRunning and everything before this point can still throw
+    // and abandon the start.
+    //
+    // The recorder is already subscribed, so live deltas keep arriving while
+    // the (slow, whole-table) restore query runs. Those are newer by
+    // definition: replaying a stored fix over a vessel that just transmitted
+    // would move it BACKWARDS on the chart. liveContexts records what the
+    // recorder saw and the restore skips those contexts entirely.
+    if (config.restoreOnStart) {
+      const restoreGeneration = lifecycleGeneration;
+      void restoreFromHistory(
+        {
+          queryClient,
+          handleMessage: (delta) => {
+            // A restore outliving its generation would inject data into a
+            // model the operator just stopped recording into.
+            if (!pluginRunning || lifecycleGeneration !== restoreGeneration) {
+              return;
+            }
+            app.handleMessage("signalk-questdb", delta);
+          },
+          selfContext: app.selfContext,
+          debug: (msg) => app.debug(msg),
+          hasLiveData: (context) => liveContexts.has(context),
+        },
+        {
+          maxAgeMs: config.restoreMaxAgeMinutes * 60_000,
+          restoreSelf: config.recordSelf,
+          restoreOthers: config.recordOthers,
+        },
+      )
+        .catch((err: unknown) => {
+          // A failed restore is a cosmetic loss — targets still arrive live —
+          // so it must never take the plugin down with it.
+          app.debug(
+            `restore failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        })
+        .finally(() => {
+          // Only needed to shield the restore; tracking every context for the
+          // life of the plugin would be an unbounded set. Guarded on the
+          // generation so a slow restore settling after a restart does not
+          // disarm the tracking the NEW start just armed.
+          if (lifecycleGeneration !== restoreGeneration) return;
+          liveContexts.clear();
+          trackLiveContexts = false;
+        });
+    }
   }
 
   // Public entry: serialize startup behind the lifecycle lock so a purge or
@@ -1254,6 +1335,11 @@ export default (app: App) => {
       lifecycleGeneration++;
       startAbort?.abort();
       pluginRunning = false;
+
+      // A start aborted before its restore ran would otherwise leave tracking
+      // armed, accumulating contexts for a restore that never happens.
+      trackLiveContexts = false;
+      liveContexts.clear();
 
       for (const unsub of unsubscribes) {
         try {

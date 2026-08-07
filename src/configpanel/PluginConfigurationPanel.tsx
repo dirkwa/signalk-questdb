@@ -133,6 +133,14 @@ export default function PluginConfigurationPanel({
   );
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
   const [recordOthers, setRecordOthers] = useState(cfg.recordOthers !== false);
+  // Restore is opt-in, so a missing key means off — the inverse of the
+  // recording toggles above.
+  const [restoreOnStart, setRestoreOnStart] = useState(
+    cfg.restoreOnStart === true,
+  );
+  const [restoreMaxAgeMinutes, setRestoreMaxAgeMinutes] = useState(
+    (cfg.restoreMaxAgeMinutes ?? 0) > 0 ? cfg.restoreMaxAgeMinutes! : 9,
+  );
   const [defaultSamplingRate, setDefaultSamplingRate] = useState(
     cfg.defaultSamplingRate ?? 2000,
   );
@@ -519,6 +527,8 @@ export default function PluginConfigurationPanel({
       ilpFlushIntervalMs: batchIntervalMs,
       recordSelf,
       recordOthers,
+      restoreOnStart,
+      restoreMaxAgeMinutes,
       retentionDays,
       compression,
       compressionLevel,
@@ -1159,6 +1169,47 @@ export default function PluginConfigurationPanel({
           onChange={(e) => setRecordOthers(e.target.checked)}
         />
       </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Restore vessels on startup</span>
+        <input
+          type="checkbox"
+          style={S.checkbox}
+          aria-label="Restore vessels on startup"
+          checked={restoreOnStart}
+          onChange={(e) => setRestoreOnStart(e.target.checked)}
+        />
+        <span style={S.hint}>
+          replay each vessel&apos;s last recorded position after a restart, so
+          AIS targets appear at once instead of only when they next transmit
+        </span>
+      </div>
+
+      {restoreOnStart && (
+        <div style={S.fieldRow}>
+          <span style={S.label}>Restore max age (minutes)</span>
+          <input
+            style={S.inputSmall}
+            type="number"
+            min={1}
+            aria-label="Restore max age (minutes)"
+            value={restoreMaxAgeMinutes}
+            onChange={(e) => {
+              // Clearing the field yields "" → NaN, which would be saved and
+              // then silently replaced by the default. Hold the last valid
+              // number instead.
+              const next = Number(e.target.value);
+              if (Number.isFinite(next) && next >= 1) {
+                setRestoreMaxAgeMinutes(next);
+              }
+            }}
+          />
+          <span style={S.hint}>
+            only replay values this recent (default 9, matching Freeboard&apos;s
+            AIS expiry); higher puts staler positions on the chart
+          </span>
+        </div>
+      )}
 
       <div style={S.fieldRow}>
         <span style={S.label}>Retention (days)</span>

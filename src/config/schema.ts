@@ -94,6 +94,20 @@ export const ConfigSchema = Type.Object({
     title: "Record AIS targets",
   }),
 
+  restoreOnStart: Type.Boolean({
+    default: false,
+    title: "Restore vessels on startup",
+    description:
+      "After a server restart, replay each vessel's last recorded position from QuestDB so AIS targets appear on the chart immediately instead of only when they next transmit. Restored values are historical — they carry their original timestamp and are aged out normally by the consumer.",
+  }),
+  restoreMaxAgeMinutes: Type.Number({
+    default: 9,
+    minimum: 1,
+    title: "Restore max age (minutes)",
+    description:
+      "Only replay values recorded within this many minutes. Matches Freeboard's default AIS expiry (9 minutes), so a restored target is one that would still have been on the chart. Raising this puts progressively staler positions on the chart.",
+  }),
+
   retentionDays: Type.Number({
     default: 0,
     title: "Retention (days, 0 = keep forever)",
@@ -154,6 +168,15 @@ export function normalizeConfig(config: Config): Config {
     // pre-panel config silently disabled the recording the schema promises.
     recordSelf: config.recordSelf !== false,
     recordOthers: config.recordOthers !== false,
+    // Restore is opt-in, so a missing key means OFF — the inverse of the
+    // recording toggles above. A zero or negative window would replay
+    // nothing; treat it as "unset" and use the schema default rather than
+    // silently disabling a feature the user turned on.
+    restoreOnStart: config.restoreOnStart === true,
+    restoreMaxAgeMinutes:
+      config.restoreMaxAgeMinutes && config.restoreMaxAgeMinutes > 0
+        ? config.restoreMaxAgeMinutes
+        : 9,
     // Missing resource limits get the schema defaults. Config-panel saves
     // used to drop these keys entirely (issue #98), which ran QuestDB with
     // NO memory cap instead of the promised 768m — this backfill repairs
