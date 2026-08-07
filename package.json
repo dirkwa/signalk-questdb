@@ -1,6 +1,6 @@
 {
   "name": "signalk-questdb",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "type": "module",
   "description": "QuestDB history provider for Signal K — replaces signalk-to-influxdb",
   "keywords": [
