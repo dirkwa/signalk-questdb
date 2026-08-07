@@ -58,6 +58,24 @@ export interface DbStatus extends ApiError {
   ulimitClamp?: UlimitClampStatus | null;
   hostMaxMapCount?: MaxMapCountStatus | null;
   endpoint?: string | null;
+  /**
+   * Outcome of the startup restore, or null when it did not run (disabled, or
+   * still in flight). Surfaced here rather than only through
+   * `setPluginStatus`, because Signal K stores plugin status under
+   * `plugin.id` but reads it back by `plugin.name` — so any plugin with a
+   * display name gets an empty statusMessage and the count would be invisible.
+   */
+  restore?: RestoreStatus | null;
+}
+
+/** Startup-restore outcome, shown on the config panel. */
+export interface RestoreStatus {
+  /** Vessels replayed into the Signal K model. */
+  contexts: number;
+  /** Contexts skipped because the vessel had already transmitted. */
+  skippedLive: number;
+  /** True when the restore threw; `contexts` is then not meaningful. */
+  failed: boolean;
 }
 
 /** GET /api/versions — QuestDB releases, drafts filtered out. */

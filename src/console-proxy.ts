@@ -32,6 +32,30 @@ export interface ConsoleProxyDeps {
   /** Base URL of QuestDB's HTTP interface, e.g. `http://127.0.0.1:9000`. */
   baseUrl: () => string | null;
   debug: (msg: string) => void;
+  /**
+   * Where this proxy is mounted, e.g. `/plugins/signalk-questdb/console`.
+   * Needed to rewrite upstream redirects: QuestDB answers `/` with
+   * `301 Location: /index.html`, an ABSOLUTE path that escapes the mount and
+   * lands on the Signal K root — a 404, and the reason the webapp reported
+   * "console unavailable" while the console itself was fine.
+   */
+  mountPath: string;
+}
+
+/**
+ * Rewrite an upstream redirect so it stays inside the mount.
+ *
+ * Only root-relative targets need it: a relative `Location` already resolves
+ * against the proxied URL, and an absolute one pointing elsewhere is not ours
+ * to rewrite (and is left alone rather than silently retargeted).
+ */
+function rewriteLocation(
+  location: string | string[] | undefined,
+  mountPath: string,
+): string | undefined {
+  if (typeof location !== "string") return undefined;
+  if (!location.startsWith("/") || location.startsWith("//")) return undefined;
+  return `${mountPath.replace(/\/$/, "")}${location}`;
 }
 
 // Hop-by-hop headers must not be forwarded (RFC 7230 §6.1). `host` is dropped
@@ -152,6 +176,12 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
       },
       (proxied) => {
         const headers = returnableHeaders(proxied.headers);
+
+        const rewritten = rewriteLocation(
+          proxied.headers.location,
+          deps.mountPath,
+        );
+        if (rewritten) headers.location = rewritten;
 
         // The console is served under the Signal K origin, so its scripts run
         // with the admin's session. Signal K's auth cookie is httpOnly, so

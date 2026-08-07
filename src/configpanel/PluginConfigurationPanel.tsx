@@ -895,6 +895,23 @@ export default function PluginConfigurationPanel({
               </div>
               <div style={S.statLabel}>Active Paths Today</div>
             </div>
+            {/* Only when a restore actually ran. Absent means the feature is
+                off, or the query is still in flight — showing "0" for either
+                would read as "it ran and found nothing". */}
+            {dbStatus.restore && (
+              <div style={S.statCard}>
+                <div style={S.statValue}>
+                  {dbStatus.restore.failed
+                    ? "—"
+                    : formatNumber(dbStatus.restore.contexts)}
+                </div>
+                <div style={S.statLabel}>
+                  {dbStatus.restore.failed
+                    ? "Restore failed"
+                    : "Vessels Restored"}
+                </div>
+              </div>
+            )}
           </div>
 
           <div

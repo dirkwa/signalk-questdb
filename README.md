@@ -201,6 +201,8 @@ with no position in the window is skipped, as is one that has already transmitte
 since startup. Restore honours the recording toggles: with **Record AIS targets**
 off, no AIS target is restored.
 
+The config panel reports the outcome once startup finishes: **Vessels Restored** with the count, or **Restore failed** if the replay could not run. Neither appears when the option is off.
+
 ## Connectivity
 
 In **managed mode** the plugin no longer needs `QuestDB host` to be correct for
