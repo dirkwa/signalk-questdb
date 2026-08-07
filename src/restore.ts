@@ -171,13 +171,18 @@ export async function restoreFromHistory(
   const rows = queryClient.toObjects(result);
 
   // Group by context, keyed per path so a duplicate from another table cannot
-  // win on arrival order, and tracking the newest timestamp seen so the
-  // replayed delta carries a real recorded time rather than `now`.
+  // win on arrival order. Each path keeps its OWN recorded timestamp — they are
+  // replayed under separate updates rather than collapsed to a single time.
+  // `time` is the parsed form of `ts`, compared instead of the string so the
+  // newer-row decision cannot hinge on three subqueries rendering ISO-8601
+  // identically.
   const byContext = new Map<
     string,
     {
-      byPath: Map<string, { ts: string; value: unknown; isName: boolean }>;
-      latestTs: string;
+      byPath: Map<
+        string,
+        { ts: string; time: number; value: unknown; isName: boolean }
+      >;
     }
   >();
 
@@ -205,9 +210,8 @@ export async function restoreFromHistory(
     const entry = byContext.get(storedContext) ?? {
       byPath: new Map<
         string,
-        { ts: string; value: unknown; isName: boolean }
+        { ts: string; time: number; value: unknown; isName: boolean }
       >(),
-      latestTs: ts,
     };
 
     // Vessel names are stored under the synthetic path "name" (tagged
@@ -222,11 +226,10 @@ export async function restoreFromHistory(
     // table. Union order is not timestamp order, so keep the newer row rather
     // than letting whichever arrives last win.
     const existing = entry.byPath.get(path);
-    if (!existing || ts > existing.ts) {
-      entry.byPath.set(path, { ts, value, isName });
+    if (!existing || rowTime > existing.time) {
+      entry.byPath.set(path, { ts, time: rowTime, value, isName });
     }
 
-    if (ts > entry.latestTs) entry.latestTs = ts;
     byContext.set(storedContext, entry);
   }
 

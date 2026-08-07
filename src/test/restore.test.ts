@@ -340,6 +340,22 @@ describe("restore: duplicate rows across tables", () => {
     assert.deepEqual(state, { path: "navigation.state", value: "sailing" });
   });
 
+  it("compares timestamps by instant, not by string shape", async () => {
+    // The three subqueries render ts independently. If a rendering ever differs
+    // in fractional precision, a lexicographic compare inverts newer/older —
+    // "...:30Z" sorts above "...:30.500000Z" despite being earlier.
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      ["2024-06-01T11:55:30.500000Z", "navigation.state", AIS, "newer", null],
+      ["2024-06-01T11:55:30Z", "navigation.state", AIS, "older", "number"],
+    ];
+    const { promise, deltas } = run(rows);
+    await promise;
+
+    const state = valueAt(deltas[0], "navigation.state");
+    assert.equal(state?.value, "newer");
+  });
+
   it("emits a path only once even when duplicated", async () => {
     const rows: Row[] = [
       position(AIS, 60_000),
@@ -370,6 +386,35 @@ describe("restore: value decoding", () => {
     assert.ok(sog, "expected speedOverGround to be restored");
     assert.equal(sog.value, 5.4);
     assert.equal(typeof sog.value, "number");
+  });
+
+  it("decodes a tagged boolean as a boolean, not the string 'true'", async () => {
+    // The recorder tags booleans on write (src/index.ts), so this branch is
+    // reachable. Returning the text would make a consumer's truthiness check
+    // pass for "false" too.
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      [ago(60_000), "navigation.state", AIS, "true", "boolean"],
+    ];
+    const { promise, deltas } = run(rows);
+    await promise;
+
+    const state = valueAt(deltas[0], "navigation.state");
+    assert.equal(state?.value, true);
+    assert.equal(typeof state?.value, "boolean");
+  });
+
+  it("decodes a tagged false as false, not a truthy string", async () => {
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      [ago(60_000), "navigation.state", AIS, "false", "boolean"],
+    ];
+    const { promise, deltas } = run(rows);
+    await promise;
+
+    const state = valueAt(deltas[0], "navigation.state");
+    assert.equal(state?.value, false);
+    assert.equal(typeof state?.value, "boolean");
   });
 
   it("drops a position whose coordinates are not finite", async () => {
