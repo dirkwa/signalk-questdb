@@ -3,6 +3,6 @@ src/
 .mf/
 *.tsbuildinfo
 .DS_Store
-eslint.config.cjs
+eslint.config.ts
 vite.config.ts
 tsconfig.json
