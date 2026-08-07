@@ -35,6 +35,7 @@ import type {
   DbStatus,
   MigrationDetectResponse,
   QuestdbVersion,
+  RestoreStatus,
   ResumeWalResponse,
   SkipWalResponse,
   UpdateApplyResponse,
@@ -357,6 +358,21 @@ export default (app: App) => {
   // on a plugin that never came up.
   let pluginRunning = false;
 
+  // Summary of the startup restore, appended to the plugin status so the
+  // result is visible on the plugin card. Without this the only report was an
+  // app.debug() line, invisible unless DEBUG is set — so a user had no way to
+  // tell whether a feature whose entire point is "did it repopulate?" had run.
+  let restoreSummary: string | null = null;
+  // Structured form of the same result, served on /api/status. The status
+  // string above is kept because it is correct and will start working if
+  // Signal K's plugin.id/plugin.name status mismatch is ever fixed, but the
+  // config panel reads THIS — it is the only path that is visible today.
+  let restoreStatus: RestoreStatus | null = null;
+
+  const recordingStatus = (host: string, port: number): string =>
+    `Recording to QuestDB at ${host}:${port}` +
+    (restoreSummary ? ` — ${restoreSummary}` : "");
+
   // Contexts seen live while a startup restore is in flight. A stored fix
   // must never overwrite a vessel that has already transmitted since boot —
   // that would move it backwards on the chart. Populated by the recorder
@@ -481,6 +497,7 @@ export default (app: App) => {
   const consoleProxy = createConsoleProxy({
     baseUrl: () => (currentConfig ? questdbHttpBaseUrl() : null),
     debug: (msg) => app.debug(msg),
+    mountPath: "/plugins/signalk-questdb/console",
   });
 
   /**
@@ -986,8 +1003,7 @@ export default (app: App) => {
       // Surface a flapping ILP connection instead of leaving the status line
       // stuck on a cheerful "Recording" while every sample is dropped.
       onUnhealthy: (msg) => app.setPluginError(msg),
-      onHealthy: () =>
-        app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`),
+      onHealthy: () => app.setPluginStatus(recordingStatus(ilpHost, ilpPort)),
       flushIntervalMs: config.ilpFlushIntervalMs,
     });
     await writer.connect();
@@ -1222,7 +1238,7 @@ export default (app: App) => {
           "QuestDB history recording has recovered.",
           "normal:recovered",
         );
-        app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
+        app.setPluginStatus(recordingStatus(ilpHost, ilpPort));
       },
       debug: (msg) => app.debug(msg),
       error: (msg) => app.error(msg),
@@ -1250,7 +1266,7 @@ export default (app: App) => {
       }
     }
 
-    app.setPluginStatus(`Recording to QuestDB at ${ilpHost}:${ilpPort}`);
+    app.setPluginStatus(recordingStatus(ilpHost, ilpPort));
     // Everything is registered — only now does the plugin count as running.
     // Any earlier return/throw leaves the flag false, so a half-started
     // plugin rejects lifecycle-dependent requests like /api/update/apply.
@@ -1288,12 +1304,38 @@ export default (app: App) => {
           restoreOthers: config.recordOthers,
         },
       )
+        .then((result) => {
+          if (lifecycleGeneration !== restoreGeneration) return;
+          restoreSummary =
+            result.contexts > 0
+              ? `restored ${result.contexts} vessel${result.contexts === 1 ? "" : "s"} at startup`
+              : "no vessels to restore at startup";
+          restoreStatus = {
+            contexts: result.contexts,
+            skippedLive: result.skippedLive,
+            failed: false,
+          };
+          // Re-publish so the summary lands on the card even when the status
+          // was already set before the (slow) restore query finished.
+          if (questdbEndpoints) {
+            const { host, port } = questdbEndpoints.ilp;
+            app.setPluginStatus(recordingStatus(host, port));
+          }
+        })
         .catch((err: unknown) => {
           // A failed restore is a cosmetic loss — targets still arrive live —
-          // so it must never take the plugin down with it.
-          app.debug(
-            `restore failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
+          // so it must never take the plugin down with it. Surfaced on the
+          // card rather than only in debug: silence is indistinguishable from
+          // "restore is off".
+          const message = err instanceof Error ? err.message : String(err);
+          app.debug(`restore failed: ${message}`);
+          if (lifecycleGeneration !== restoreGeneration) return;
+          restoreSummary = "startup restore failed";
+          restoreStatus = { contexts: 0, skippedLive: 0, failed: true };
+          if (questdbEndpoints) {
+            const { host, port } = questdbEndpoints.ilp;
+            app.setPluginStatus(recordingStatus(host, port));
+          }
         })
         .finally(() => {
           // Only needed to shield the restore; tracking every context for the
@@ -1355,6 +1397,10 @@ export default (app: App) => {
       // armed, accumulating contexts for a restore that never happens.
       trackLiveContexts = false;
       liveContexts.clear();
+      // Stale across a restart otherwise: the card would still claim a
+      // restore count from the previous run.
+      restoreSummary = null;
+      restoreStatus = null;
 
       for (const unsub of unsubscribes) {
         try {
@@ -1578,6 +1624,7 @@ export default (app: App) => {
             endpoint: questdbEndpoints
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
               : null,
+            restore: restoreStatus,
           } satisfies DbStatus);
         } catch (err) {
           res.status(500).json({

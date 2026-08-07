@@ -17,6 +17,9 @@ let upstream: http.Server;
 let upstreamUrl: string;
 let seen: Seen[] = [];
 
+// Where the proxy is mounted in the real server.
+const MOUNT = "/plugins/signalk-questdb/console";
+
 before(async () => {
   upstream = http.createServer((req, res) => {
     let body = "";
@@ -57,6 +60,7 @@ async function throughProxy(
   const proxy = createConsoleProxy({
     baseUrl: init.baseUrl ?? (() => upstreamUrl),
     debug: () => {},
+    mountPath: MOUNT,
   });
   const front = http.createServer((req, res) => proxy(req, res));
   await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
@@ -119,6 +123,7 @@ describe("console proxy forwarding", () => {
     const proxy = createConsoleProxy({
       baseUrl: () => upstreamUrl,
       debug: () => {},
+      mountPath: MOUNT,
     });
     seen = [];
     const front = http.createServer((req, res) => proxy(req, res));
@@ -147,6 +152,7 @@ describe("console proxy header hygiene", () => {
     const proxy = createConsoleProxy({
       baseUrl: () => upstreamUrl,
       debug: () => {},
+      mountPath: MOUNT,
     });
     seen = [];
     const front = http.createServer((req, res) => proxy(req, res));
@@ -227,6 +233,7 @@ describe("console proxy header hygiene", () => {
     const proxy = createConsoleProxy({
       baseUrl: () => `http://127.0.0.1:${upPort}`,
       debug: () => {},
+      mountPath: MOUNT,
     });
     const front = http.createServer((req, res) => proxy(req, res));
     await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
@@ -244,6 +251,73 @@ describe("console proxy header hygiene", () => {
   it("marks responses nosniff", async () => {
     const r = await throughProxy("/");
     assert.equal(r.nosniff, "nosniff");
+  });
+});
+
+describe("console proxy redirect rewriting", () => {
+  // QuestDB answers `/` with `301 Location: /index.html` — an ABSOLUTE path.
+  // Relayed unchanged it escapes the mount and lands on the Signal K root,
+  // which 404s. That is what made the webapp report "console unavailable"
+  // while the console itself was serving fine. My own testing missed it
+  // because `curl -L` follows the redirect and papers over the escape.
+  function redirectingUpstream(location: string) {
+    return http.createServer((_req, res) => {
+      res.writeHead(301, { location });
+      res.end();
+    });
+  }
+
+  async function locationThrough(upstreamLocation: string) {
+    const up = redirectingUpstream(upstreamLocation);
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        redirect: "manual",
+      });
+      return res.headers.get("location");
+    } finally {
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
+  }
+
+  it("keeps a root-relative redirect inside the mount", async () => {
+    assert.equal(await locationThrough("/index.html"), `${MOUNT}/index.html`);
+  });
+
+  it("preserves the query string on a redirect", async () => {
+    assert.equal(
+      await locationThrough("/index.html?a=1"),
+      `${MOUNT}/index.html?a=1`,
+    );
+  });
+
+  it("leaves a relative redirect alone", async () => {
+    // Already resolves against the proxied URL; rewriting would break it.
+    assert.equal(await locationThrough("other.html"), "other.html");
+  });
+
+  it("does not retarget an absolute redirect to another host", async () => {
+    const target = "https://questdb.io/docs";
+    assert.equal(await locationThrough(target), target);
+  });
+
+  it("does not treat a protocol-relative target as root-relative", async () => {
+    // `//evil.example.com/` starts with "/" but names another host; prefixing
+    // the mount would silently rewrite it into a path on this origin.
+    assert.equal(
+      await locationThrough("//evil.example.com/"),
+      "//evil.example.com/",
+    );
   });
 });
 
@@ -267,6 +341,7 @@ describe("console proxy HEAD handling", () => {
     const proxy = createConsoleProxy({
       baseUrl: () => `http://127.0.0.1:${badPort}`,
       debug: () => {},
+      mountPath: MOUNT,
     });
     const front = http.createServer((req, res) => proxy(req, res));
     await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
@@ -326,6 +401,7 @@ describe("console mount gating", () => {
     const proxy = createConsoleProxy({
       baseUrl: () => upstreamUrl,
       debug: () => {},
+      mountPath: MOUNT,
     });
     return (req: http.IncomingMessage, res: http.ServerResponse) => {
       if (getConfig()?.enableConsole === false) {
