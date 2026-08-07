@@ -207,18 +207,74 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
         // The console has no reason to be sniffed into a different type.
         headers["x-content-type-options"] = "nosniff";
 
-        res.writeHead(proxied.statusCode ?? 502, headers);
-        // A HEAD response carries no body by definition. QuestDB nonetheless
-        // answers HEAD with `405 Transfer-Encoding: chunked` AND a body, which
-        // is protocol-illegal; piping that upstream response through leaves
-        // the client waiting for chunks that never legally arrive and the
-        // connection dies with an empty reply. Terminate the response
-        // ourselves and discard whatever the upstream sent.
-        if (req.method === "HEAD") {
+        // QuestDB's redirect states NEITHER content-length nor
+        // transfer-encoding, so Node cannot know the response is complete and
+        // falls back to `Transfer-Encoding: chunked` — announcing a body that
+        // never arrives. The browser then waits on a 301 that never finishes,
+        // which is exactly how a working console still reported "console
+        // unavailable" after the Location rewrite was already correct.
+        //
+        // Declaring the length explicitly is what stops Node guessing. Applied
+        // to every status that carries no body by definition, not just 3xx.
+        // Deliberately keyed on the STATUS, not on the upstream's framing
+        // headers: an origin that omits both (QuestDB) and one that sends
+        // `chunked` for an empty body (Node's own server does this) must be
+        // handled identically, and only the status tells us a body is absent
+        // by definition.
+        const status = proxied.statusCode;
+
+        // 204 and 304 carry no body by protocol, whatever the origin sends.
+        // Node already frames these correctly, so they only need the upstream
+        // drained.
+        const neverHasBody = status === 204 || status === 304;
+
+        // A 3xx MAY carry a body (RFC 9110 §15.4) and browsers render it, so
+        // this cannot simply assume every redirect is empty — doing so dropped
+        // the body and overwrote a correct content-length with 0.
+        //
+        // `content-length` is the reliable signal. `transfer-encoding` is not:
+        // QuestDB omits both (the case Node then has to guess about), while
+        // Node's own http server answers an empty `res.end()` with `chunked`.
+        // Both are genuinely bodyless and must be treated alike, so key on the
+        // absence of a declared length and let the drain below cover the rest.
+        const redirectWithoutBody =
+          status !== undefined &&
+          status >= 300 &&
+          status < 400 &&
+          proxied.headers["content-length"] === undefined;
+
+        if (req.method === "HEAD" || neverHasBody || redirectWithoutBody) {
+          if (!neverHasBody) {
+            // Explicit 0 is what stops Node falling back to chunked framing
+            // for a body that will never arrive. 204/304 must not carry it at
+            // all (RFC 9110 §6.4.1).
+            headers["content-length"] = "0";
+          }
+          res.writeHead(status ?? 502, headers);
+          // Drain whatever the upstream sent regardless: QuestDB answers HEAD
+          // with a body under chunked framing, which is protocol-illegal, and
+          // leaving it unread holds the socket open.
           proxied.resume();
           res.end();
           return;
         }
+
+        res.writeHead(status ?? 502, headers);
+
+        // If the upstream dies mid-body, `pipe` alone never ends `res` — the
+        // browser sits on a response that will never complete. Node signals
+        // truncation to a direct client by aborting the socket; destroying our
+        // response does the same for ours, so a truncated console query fails
+        // visibly instead of hanging the tab.
+        proxied.on("aborted", () => {
+          deps.debug("console proxy: upstream aborted mid-response");
+          res.destroy();
+        });
+        proxied.on("error", (err) => {
+          deps.debug(`console proxy: upstream stream error: ${err.message}`);
+          res.destroy();
+        });
+
         proxied.pipe(res);
       },
     );

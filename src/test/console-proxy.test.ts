@@ -294,6 +294,159 @@ describe("console proxy redirect rewriting", () => {
     }
   }
 
+  it("does not announce a chunked body on a bodyless redirect", async () => {
+    // QuestDB's 301 states NEITHER content-length nor transfer-encoding, so
+    // Node falls back to chunked framing — announcing a body that never
+    // arrives. The browser waits on a redirect that never completes, which is
+    // how a working console still reported "console unavailable" even after
+    // the Location rewrite was correct. Rewriting Location was necessary but
+    // not sufficient; this is the other half.
+    const up = http.createServer((_req, res) => {
+      // Exactly QuestDB's shape: no length, no encoding, no body.
+      res.writeHead(301, { location: "/index.html" });
+      res.end();
+    });
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      // Raw client: fetch() normalises framing away, hiding the very header
+      // this test exists to check.
+      const headers = await new Promise<http.IncomingHttpHeaders>(
+        (resolve, reject) => {
+          const r = http.request(
+            {
+              host: "127.0.0.1",
+              port,
+              path: "/",
+              headers: { connection: "close" },
+            },
+            (res) => {
+              res.resume();
+              res.on("end", () => resolve(res.headers));
+            },
+          );
+          r.on("error", reject);
+          r.end();
+        },
+      );
+      assert.equal(
+        headers["transfer-encoding"],
+        undefined,
+        "a bodyless redirect must not be chunked",
+      );
+      assert.equal(headers["content-length"], "0");
+    } finally {
+      front.closeAllConnections?.();
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
+  });
+
+  it("passes a 304 through without inventing a content-length", async () => {
+    // QuestDB really does serve 304 for the console's assets, so this is the
+    // browser-caching path, not a hypothetical. RFC 9110 §6.4.1: a 304 must
+    // not carry content-length — adding one here would be a protocol error on
+    // every cached asset load.
+    const up = http.createServer((_req, res) => {
+      res.writeHead(304, { etag: '"abc"' });
+      res.end();
+    });
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      const headers = await new Promise<http.IncomingHttpHeaders>(
+        (resolve, reject) => {
+          const r = http.request(
+            {
+              host: "127.0.0.1",
+              port,
+              path: "/",
+              headers: { connection: "close" },
+            },
+            (res) => {
+              res.resume();
+              res.on("end", () => resolve(res.headers));
+            },
+          );
+          r.on("error", reject);
+          r.end();
+        },
+      );
+      assert.equal(headers["content-length"], undefined);
+      assert.equal(headers["transfer-encoding"], undefined);
+      assert.equal(headers.etag, '"abc"');
+    } finally {
+      front.closeAllConnections?.();
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
+  });
+
+  it("preserves a redirect that legitimately carries a body", async () => {
+    // Self-audit catch. A 3xx MAY carry a body (RFC 9110 §15.4) and browsers
+    // render it. The first version of the bodyless fix keyed purely on status,
+    // so it dropped that body AND overwrote a correct content-length with 0 —
+    // trading one framing bug for a worse, silent one.
+    const body = "<html>Moved. <a href='/x'>here</a></html>";
+    const up = http.createServer((_req, res) => {
+      res.writeHead(302, {
+        location: "/x",
+        "content-type": "text/html",
+        "content-length": String(Buffer.byteLength(body)),
+      });
+      res.end(body);
+    });
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        redirect: "manual",
+        headers: { connection: "close" },
+      });
+      assert.equal(res.status, 302);
+      assert.equal(
+        await res.text(),
+        body,
+        "a redirect body must not be dropped",
+      );
+      assert.equal(res.headers.get("content-length"), String(body.length));
+    } finally {
+      front.closeAllConnections?.();
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
+  });
+
   it("keeps a root-relative redirect inside the mount", async () => {
     assert.equal(await locationThrough("/index.html"), `${MOUNT}/index.html`);
   });
@@ -322,6 +475,69 @@ describe("console proxy redirect rewriting", () => {
       await locationThrough("//evil.example.com/"),
       "//evil.example.com/",
     );
+  });
+});
+
+describe("console proxy upstream failure mid-response", () => {
+  it("does not leave the client hanging when the upstream dies mid-body", async () => {
+    // Self-audit catch. `proxied.pipe(res)` had no error/abort handler, so an
+    // upstream that dies after headers were sent never ended our response —
+    // the browser tab sat on a request that would never complete. Node signals
+    // truncation to a direct client by aborting; the proxy must do the same.
+    const up = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/plain",
+        "content-length": "100",
+      });
+      res.write("partial");
+      setTimeout(() => res.socket?.destroy(), 30);
+    });
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      const outcome = await new Promise<string>((resolve) => {
+        const timer = setTimeout(() => resolve("HUNG"), 4000);
+        const settle = (v: string) => {
+          clearTimeout(timer);
+          resolve(v);
+        };
+        const r = http.request(
+          {
+            host: "127.0.0.1",
+            port,
+            path: "/",
+            headers: { connection: "close" },
+          },
+          (res) => {
+            res.resume();
+            res.on("aborted", () => settle("aborted"));
+            res.on("end", () => settle("ended"));
+          },
+        );
+        r.on("error", () => settle("error"));
+        r.end();
+      });
+      assert.notEqual(outcome, "HUNG", "a truncated response must not hang");
+      assert.notEqual(
+        outcome,
+        "ended",
+        "a truncated response must not look like a clean end",
+      );
+    } finally {
+      front.closeAllConnections?.();
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
   });
 });
 
