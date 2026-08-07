@@ -36,6 +36,8 @@ Both build outputs are shipped in the npm package; `prepublishOnly` rebuilds the
   - **v2** (`src/history-v2.ts`) — `app.registerHistoryApiProvider()`, REST under `/signalk/v2/api/history/`. Aggregates map directly to QuestDB SQL except `sma`/`ema` (computed client-side).
   - **v1** (`src/history-v1.ts`) — `app.registerHistoryProvider()`, WebSocket playback with chunked reads.
 - Retention (`src/retention.ts`) drops old daily partitions on a timer.
+- Startup restore (`src/restore.ts`) optionally replays each vessel's last recorded position back into the live model after a server restart.
+- Console proxy (`src/console-proxy.ts`) reverse-proxies QuestDB's own web console so the embeddable webapp (`public/index.html`) can host it in the admin UI.
 
 ### Container integration
 
@@ -52,6 +54,8 @@ The package is the unscoped `typebox` (1.x), not `@sinclair/typebox` (which stop
 ### REST endpoints
 
 All extra plugin endpoints live under `/plugins/signalk-questdb/api/` and are wired in `src/index.ts` via the `IRouter` Signal K passes to `registerWithRouter`. The `/query` endpoint is gated by `isReadOnlySQL` in `src/query-client.ts` — DDL/DML must remain blocked.
+
+⚠️ **`/console` is deliberately NOT gated that way.** It proxies QuestDB's own console, which is a full SQL client and can drop tables. It is safe only because signalk-server gives plugin routes an **admin-only default**, and routes are downgraded to readwrite/readonly _only_ by registering them through `router.access(...)`. Never wrap the console mount in `.access()` — doing so hands non-admins the ability to delete recorded history. The mount is also gated on the `enableConsole` config flag, so turning it off removes the route rather than leaving it to refuse.
 
 Their wire shapes live in `src/api-contract.ts` and are shared by both surfaces: handlers assert responses with `satisfies`, and the panel casts fetch results to the same types. Add or rename a response field there, not inline — that is what stops the server and panel drifting apart silently.
 

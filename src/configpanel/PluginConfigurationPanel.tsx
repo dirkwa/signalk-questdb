@@ -138,6 +138,11 @@ export default function PluginConfigurationPanel({
   const [restoreOnStart, setRestoreOnStart] = useState(
     cfg.restoreOnStart === true,
   );
+  // On unless explicitly disabled — matches normalizeConfig, so a save from
+  // this panel cannot silently flip the documented default.
+  const [enableConsole, setEnableConsole] = useState(
+    cfg.enableConsole !== false,
+  );
   const [restoreMaxAgeMinutes, setRestoreMaxAgeMinutes] = useState(
     (cfg.restoreMaxAgeMinutes ?? 0) > 0 ? cfg.restoreMaxAgeMinutes! : 9,
   );
@@ -534,6 +539,7 @@ export default function PluginConfigurationPanel({
       recordSelf,
       recordOthers,
       restoreOnStart,
+      enableConsole,
       restoreMaxAgeMinutes,
       retentionDays,
       compression,
@@ -1188,6 +1194,22 @@ export default function PluginConfigurationPanel({
         <span style={S.hint}>
           replay each vessel&apos;s last recorded position after a restart, so
           AIS targets appear at once instead of only when they next transmit
+        </span>
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>QuestDB console webapp</span>
+        <input
+          type="checkbox"
+          style={S.checkbox}
+          aria-label="QuestDB console webapp"
+          checked={enableConsole}
+          onChange={(e) => setEnableConsole(e.target.checked)}
+        />
+        <span style={S.hint}>
+          serve QuestDB&apos;s own console inside the Signal K admin UI (admin
+          only). It is a full SQL client — unlike the read-only query endpoint
+          it can modify and delete recorded data
         </span>
       </div>
 

@@ -8,6 +8,7 @@ import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
 import { startRetention } from "./retention.js";
 import { RESTORE_SOURCE, restoreFromHistory } from "./restore.js";
+import { createConsoleProxy } from "./console-proxy.js";
 import { buildFullExportWhere } from "./full-export-range.js";
 import {
   WalMonitor,
@@ -467,6 +468,20 @@ export default (app: App) => {
     const port = currentConfig?.questdbHttpPort ?? QUESTDB_INTERNAL_HTTP_PORT;
     return `http://${host}:${port}`;
   }
+
+  // Built once; it resolves the upstream lazily on every request so a
+  // container restart (which can change the resolved address) is picked up
+  // without re-registering the route.
+  //
+  // Gated on config rather than on `questdbEndpoints`: that is only populated
+  // on the managed-container path, so keying off it made the console return
+  // 503 forever in external mode, where the host/port come from config and
+  // questdbHttpBaseUrl() already falls back to them. Null only before any
+  // config has loaded, which is the one moment there is nothing to point at.
+  const consoleProxy = createConsoleProxy({
+    baseUrl: () => (currentConfig ? questdbHttpBaseUrl() : null),
+    debug: (msg) => app.debug(msg),
+  });
 
   /**
    * Compute the bind-mount source for QuestDB's /var/lib/questdb volume.
@@ -1401,6 +1416,28 @@ export default (app: App) => {
     },
 
     registerWithRouter(router: IRouter) {
+      // QuestDB's own console, proxied so the Signal K admin UI can embed it.
+      //
+      // Registered DIRECTLY on the router and NOT through router.access(...):
+      // plugin routes default to admin-only in signalk-server, and only
+      // .access() downgrades them. The console is a full SQL client that can
+      // drop tables, so downgrading it would hand a non-admin the ability to
+      // delete the vessel's recorded history. Leave this as it is.
+      //
+      // The enableConsole check lives INSIDE the handler, not around the
+      // mount: registerWithRouter runs at plugin registration, before start()
+      // has loaded any configuration, so `currentConfig` is still null here
+      // and gating the mount would ignore a saved opt-out entirely. Checking
+      // per-request also means toggling the option takes effect on plugin
+      // restart without the route going stale.
+      router.use("/console", (req, res, next) => {
+        if (currentConfig?.enableConsole === false) {
+          next();
+          return;
+        }
+        consoleProxy(req, res);
+      });
+
       router.get("/api/status", async (_req, res) => {
         try {
           if (!queryClient) {

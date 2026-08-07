@@ -20,6 +20,7 @@ Stores all vessel data in QuestDB running as a managed container (via [signalk-c
 - **CSV export** -- download historical data via REST endpoint
 - **InfluxDB migration** -- auto-detect InfluxDB 1.x/2.x on localhost or remote URL
 - **One-click updates** -- check for new QuestDB releases and update from the config panel
+- **Console webapp** -- QuestDB's own SQL console embedded in the Signal K admin UI (admin only)
 - **Config panel** -- status dashboard with row counts, version picker, update check, collapsible compression/migration/export sections
 - **SQL injection protection** -- strict input validation on all query endpoints
 - **Container lifecycle** -- container stops when plugin is disabled, starts on enable
@@ -32,7 +33,7 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 - **Update check** -- compares running version against latest GitHub release, one-click update
 - **Image Version** -- dropdown with latest, pre-releases, and last 3 stable releases
 - **Connection** -- managed container toggle, host/ports, PostgreSQL port for Grafana
-- **Recording** -- record self, record AIS targets, retention days
+- **Recording** -- record self, record AIS targets, startup restore, console webapp, retention days
 - **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns (e.g. exclude `navigation.position`)
 - **Compression** (collapsible) -- LZ4/ZSTD codec selection for on-disk storage
 - **InfluxDB Migration** (collapsible) -- auto-detect with manual URL for remote instances
@@ -129,6 +130,7 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 | Record AIS targets         | `true`       | Record other vessels                                                                                  |
 | Restore vessels on startup | `false`      | Replay each vessel's last recorded position after a restart (see Startup restore)                     |
 | Restore max age (minutes)  | `9`          | Only replay values recorded within this window                                                        |
+| QuestDB console webapp     | `true`       | Serve QuestDB's console in the Signal K admin UI, admin only (see Console webapp)                     |
 | Retention (days)           | `0`          | Auto-delete old partitions (0 = keep forever)                                                         |
 | Path filter mode           | `exclude`    | `exclude` matching paths, or `include` only matching paths                                            |
 | Path filter paths          | _(empty)_    | Glob patterns, one per line (e.g. `navigation.position`); empty = record everything                   |
@@ -136,6 +138,37 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 | Compression level          | `3`          | ZSTD level 1-22 (only when codec is zstd)                                                             |
 | Container network          | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0)                                     |
 | Bind to 0.0.0.0            | `false`      | Expose QuestDB's ports on the LAN (see Connectivity below)                                            |
+
+## Console webapp
+
+QuestDB ships its own web console — a full SQL workbench with schema browsing,
+query history and CSV import. It normally lives on QuestDB's HTTP port (9000),
+which is bound to loopback unless you turn on **Bind to 0.0.0.0**, so from any
+other device on the boat it is effectively unreachable.
+
+With **QuestDB console webapp** enabled (the default) the plugin appears in the
+Signal K webapp list and serves that console inside the admin UI, with Signal
+K's own navigation panel still in place.
+
+**It is admin only.** The console is proxied at
+`/plugins/signalk-questdb/console/`, and Signal K gives plugin routes an
+admin-only default — the plugin deliberately does not relax that. A non-admin
+who opens the webapp sees the page frame and an authorization error, never the
+console.
+
+**It can modify data.** Unlike the read-only `/query` endpoint, which rejects
+anything that is not a `SELECT`, the console is a real SQL client: it can drop
+tables and delete recorded history. That is the point of having it, and it is
+what an administrator would use it for — but it is worth knowing before handing
+someone an admin account.
+
+If you would rather not serve it at all, switch the option off and the route is
+not registered.
+
+> Note this is _safer_ than the alternative it replaces. Reaching the console
+> from another device previously meant enabling **Bind to 0.0.0.0**, which
+> publishes an unauthenticated SQL endpoint on your network. The webapp route
+> requires a Signal K admin session.
 
 ## Startup restore
 
