@@ -373,6 +373,21 @@ export default (app: App) => {
     `Recording to QuestDB at ${host}:${port}` +
     (restoreSummary ? ` — ${restoreSummary}` : "");
 
+  // True while a writer/WAL failure is on the status line. Signal K keeps ONE
+  // status entry per plugin, so publishing "Recording…" over an active error
+  // hides it — and the restore result, which lands seconds after startup on a
+  // timer of its own, is exactly the kind of late writer that would do it.
+  let pluginErrorActive = false;
+  const publishError = (msg: string) => {
+    pluginErrorActive = true;
+    app.setPluginError(msg);
+  };
+  // Republish the recording line, but never at the cost of an active error.
+  const publishRecordingStatus = (host: string, port: number) => {
+    if (pluginErrorActive) return;
+    app.setPluginStatus(recordingStatus(host, port));
+  };
+
   // Contexts seen live while a startup restore is in flight. A stored fix
   // must never overwrite a vessel that has already transmitted since boot —
   // that would move it backwards on the chart. Populated by the recorder
@@ -877,7 +892,7 @@ export default (app: App) => {
 
       if (!containers) {
         app.debug("containerManager not found");
-        app.setPluginError(
+        publishError(
           "signalk-container plugin required for managed mode. Install it or set managedContainer=false.",
         );
         return;
@@ -891,7 +906,7 @@ export default (app: App) => {
 
       if (!containers.getRuntime()) {
         app.debug("container runtime not detected");
-        app.setPluginError(
+        publishError(
           "No container runtime detected. Check signalk-container plugin.",
         );
         return;
@@ -958,7 +973,7 @@ export default (app: App) => {
         questdbEndpoints = resolved;
       } catch (err) {
         app.debug("ensureRunning failed:", err);
-        app.setPluginError(
+        publishError(
           `Failed to start QuestDB container: ${err instanceof Error ? err.message : String(err)}`,
         );
         return;
@@ -988,7 +1003,7 @@ export default (app: App) => {
     }
 
     if (!(await queryClient.isHealthy())) {
-      app.setPluginError(`QuestDB not responding at ${httpHost}:${httpPort}`);
+      publishError(`QuestDB not responding at ${httpHost}:${httpPort}`);
       return;
     }
 
@@ -1002,8 +1017,13 @@ export default (app: App) => {
     writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg), {
       // Surface a flapping ILP connection instead of leaving the status line
       // stuck on a cheerful "Recording" while every sample is dropped.
-      onUnhealthy: (msg) => app.setPluginError(msg),
-      onHealthy: () => app.setPluginStatus(recordingStatus(ilpHost, ilpPort)),
+      onUnhealthy: (msg) => publishError(msg),
+      onHealthy: () => {
+        // The writer recovered: the error is no longer current, so the
+        // recording line may take the status entry back.
+        pluginErrorActive = false;
+        app.setPluginStatus(recordingStatus(ilpHost, ilpPort));
+      },
       flushIntervalMs: config.ilpFlushIntervalMs,
     });
     await writer.connect();
@@ -1213,7 +1233,7 @@ export default (app: App) => {
         const summary = tables
           .map((t) => `${t.name} (${t.txnLag} txns behind)`)
           .join(", ");
-        app.setPluginError(`QuestDB WAL suspended: ${summary}`);
+        publishError(`QuestDB WAL suspended: ${summary}`);
         const key =
           "alert:" +
           tables
@@ -1319,7 +1339,7 @@ export default (app: App) => {
           // was already set before the (slow) restore query finished.
           if (questdbEndpoints) {
             const { host, port } = questdbEndpoints.ilp;
-            app.setPluginStatus(recordingStatus(host, port));
+            publishRecordingStatus(host, port);
           }
         })
         .catch((err: unknown) => {
@@ -1334,7 +1354,7 @@ export default (app: App) => {
           restoreStatus = { contexts: 0, skippedLive: 0, failed: true };
           if (questdbEndpoints) {
             const { host, port } = questdbEndpoints.ilp;
-            app.setPluginStatus(recordingStatus(host, port));
+            publishRecordingStatus(host, port);
           }
         })
         .finally(() => {
@@ -1376,7 +1396,7 @@ export default (app: App) => {
       // self-contained promise that handles its own errors.
 
       asyncStart(config).catch((err) => {
-        app.setPluginError(
+        publishError(
           `Startup failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
@@ -1401,6 +1421,7 @@ export default (app: App) => {
       // restore count from the previous run.
       restoreSummary = null;
       restoreStatus = null;
+      pluginErrorActive = false;
 
       for (const unsub of unsubscribes) {
         try {

@@ -17,7 +17,6 @@ let upstream: http.Server;
 let upstreamUrl: string;
 let seen: Seen[] = [];
 
-// Where the proxy is mounted in the real server.
 const MOUNT = "/plugins/signalk-questdb/console";
 
 before(async () => {
@@ -240,7 +239,9 @@ describe("console proxy header hygiene", () => {
     const { port } = front.address() as AddressInfo;
 
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/`);
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        headers: { connection: "close" },
+      });
       assert.equal(res.headers.get("set-cookie"), null);
     } finally {
       await new Promise<void>((r) => front.close(() => r()));
@@ -280,8 +281,11 @@ describe("console proxy redirect rewriting", () => {
     await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
     const { port } = front.address() as AddressInfo;
     try {
+      // `Connection: close` so no keep-alive socket survives the request —
+      // server.close() waits for open connections and would otherwise hang.
       const res = await fetch(`http://127.0.0.1:${port}/`, {
         redirect: "manual",
+        headers: { connection: "close" },
       });
       return res.headers.get("location");
     } finally {

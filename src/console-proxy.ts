@@ -177,7 +177,6 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
       (proxied) => {
         const headers = returnableHeaders(proxied.headers);
 
-        // Keep redirects inside the mount (see rewriteLocation).
         const rewritten = rewriteLocation(
           proxied.headers.location,
           deps.mountPath,
