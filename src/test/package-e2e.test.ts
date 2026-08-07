@@ -266,6 +266,48 @@ describe("federated config panel (what the Admin UI fetches)", () => {
     );
   });
 
+  it("actually exposes ./AppPanel", async () => {
+    requirePanelBuild();
+    // The embeddable webapp. Signal K's Embedded route (/admin/#/e/<name>)
+    // resolves this exact module name; without it the admin UI fails with
+    // "Module ./AppPanel does not exist in container". Shipping a static
+    // public/index.html is NOT a substitute — that file is never loaded, which
+    // is precisely how 1.8.0 went out with a webapp that could not open.
+    const entry = await import(
+      pathToFileURL(path.join(publicDir, "remoteEntry.js")).href
+    );
+    const factory = await entry.get("./AppPanel");
+    assert.equal(
+      typeof factory,
+      "function",
+      "get('./AppPanel') must return a module factory",
+    );
+  });
+
+  it("serves the app icon at the URL the Admin UI builds", () => {
+    // The webapp card builds `/<package>/<appIcon>`, and Signal K serves the
+    // package's public/ directory there. An icon sitting only at the repo
+    // root, or a path written as "./app-icon.svg", both render a blank card.
+    const pkg = JSON.parse(
+      readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+    );
+    const appIcon: string | undefined = pkg.signalk?.appIcon;
+    assert.ok(appIcon, "package.json signalk.appIcon must be set");
+    assert.ok(
+      !appIcon.startsWith("./") && !appIcon.startsWith("/"),
+      `appIcon must be a bare filename (got "${appIcon}") — the Admin UI ` +
+        `interpolates it into /<package>/<appIcon>`,
+    );
+    assert.ok(
+      existsSync(path.join(publicDir, appIcon)),
+      `${appIcon} must exist in public/ — that is what Signal K serves`,
+    );
+    assert.ok(
+      publishedFiles().includes(`public/${appIcon}`),
+      `public/${appIcon} must be in the published package`,
+    );
+  });
+
   it("ships every chunk the remote entry imports", () => {
     requirePanelBuild();
     // The panel 404s at load if a chunk is missing — which is what

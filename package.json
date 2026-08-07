@@ -2,7 +2,7 @@
   "name": "signalk-questdb",
   "version": "1.8.0",
   "type": "module",
-  "description": "QuestDB history provider for Signal K — replaces signalk-to-influxdb",
+  "description": "QuestDB history provider for Signal K \u2014 replaces signalk-to-influxdb",
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-plugin-configurator",
@@ -11,7 +11,7 @@
   ],
   "signalk": {
     "displayName": "QuestDB History",
-    "appIcon": "./app-icon.svg",
+    "appIcon": "app-icon.svg",
     "screenshots": [
       "./doc/screenshots/signalk-questdb-1.png"
     ],

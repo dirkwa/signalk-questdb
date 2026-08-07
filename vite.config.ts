@@ -35,6 +35,11 @@ export default defineConfig({
       exposes: {
         "./PluginConfigurationPanel":
           "./src/configpanel/PluginConfigurationPanel.tsx",
+        // The embeddable webapp. Signal K's Embedded route resolves this exact
+        // module name; without it the admin UI fails with "Module ./AppPanel
+        // does not exist in container" and a static index.html is no
+        // substitute — it is never loaded.
+        "./AppPanel": "./src/configpanel/AppPanel.tsx",
       },
       shared: {
         react: {
