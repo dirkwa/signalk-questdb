@@ -104,6 +104,17 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
       },
       (proxied) => {
         res.writeHead(proxied.statusCode ?? 502, proxied.headers);
+        // A HEAD response carries no body by definition. QuestDB nonetheless
+        // answers HEAD with `405 Transfer-Encoding: chunked` AND a body, which
+        // is protocol-illegal; piping that upstream response through leaves
+        // the client waiting for chunks that never legally arrive and the
+        // connection dies with an empty reply. Terminate the response
+        // ourselves and discard whatever the upstream sent.
+        if (req.method === "HEAD") {
+          proxied.resume();
+          res.end();
+          return;
+        }
         proxied.pipe(res);
       },
     );

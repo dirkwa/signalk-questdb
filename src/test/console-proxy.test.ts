@@ -133,6 +133,45 @@ describe("console proxy forwarding", () => {
   });
 });
 
+describe("console proxy HEAD handling", () => {
+  it("answers HEAD without hanging", async () => {
+    // QuestDB replies to HEAD with `405 Transfer-Encoding: chunked` AND a
+    // body, which is protocol-illegal. Piping that through left the client
+    // waiting for chunks that never legally arrive, so the connection died
+    // with an empty reply — every HEAD probe of the console reported it broken
+    // while the console itself worked perfectly.
+    const badHead = http.createServer((req, res) => {
+      res.writeHead(405, {
+        "transfer-encoding": "chunked",
+        "content-type": "text/plain",
+      });
+      res.end("Method HEAD not supported");
+    });
+    await new Promise<void>((r) => badHead.listen(0, "127.0.0.1", r));
+    const badPort = (badHead.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${badPort}`,
+      debug: () => {},
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        method: "HEAD",
+        signal: AbortSignal.timeout(4000),
+      });
+      assert.equal(res.status, 405);
+      assert.equal(await res.text(), "", "a HEAD response carries no body");
+    } finally {
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => badHead.close(() => r()));
+    }
+  });
+});
+
 describe("console proxy failure handling", () => {
   it("returns 503 when QuestDB is not running", async () => {
     const r = await throughProxy("/", { baseUrl: () => null });
@@ -142,7 +181,18 @@ describe("console proxy failure handling", () => {
 
   it("returns a readable 502 when the upstream refuses", async () => {
     // Port 1 is reserved and never listening: a stopped container in practice.
-    const r = await throughProxy("/", { baseUrl: () => "http://127.0.0.1:1" });
+    // Bind an ephemeral port and immediately release it: guarantees a closed
+    // port on this host, rather than assuming a well-known one (port 1) is
+    // free — on a machine where something holds it, the test would silently
+    // stop testing refusal.
+    const probe = http.createServer();
+    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+    const deadPort = (probe.address() as AddressInfo).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+
+    const r = await throughProxy("/", {
+      baseUrl: () => `http://127.0.0.1:${deadPort}`,
+    });
     assert.equal(r.status, 502);
     assert.match(r.text, /not reachable/i);
     assert.doesNotMatch(r.text, /ECONNREFUSED/, "must not leak a raw error");

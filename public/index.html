@@ -76,16 +76,21 @@
       // A failed proxy returns an error status rather than failing to load, so
       // `onerror` never fires. Probe the endpoint instead and swap in a
       // readable explanation rather than leaving a bare 502 in the frame.
-      fetch("/plugins/signalk-questdb/console/", { method: "HEAD" })
+      //
+      // GET, not HEAD: QuestDB answers HEAD with 405, so probing with it would
+      // report the console as broken every single time while the iframe beside
+      // it loaded perfectly. Match the method the iframe actually uses.
+      fetch("/plugins/signalk-questdb/console/", { method: "GET" })
         .then((res) => {
           if (res.ok) return;
-          document.getElementById("console").style.display = "none";
-          document.getElementById("fallback").style.display = "block";
+          showFallback();
         })
-        .catch(() => {
-          document.getElementById("console").style.display = "none";
-          document.getElementById("fallback").style.display = "block";
-        });
+        .catch(showFallback);
+
+      function showFallback() {
+        document.getElementById("console").style.display = "none";
+        document.getElementById("fallback").style.display = "block";
+      }
     </script>
   </body>
 </html>

@@ -472,8 +472,14 @@ export default (app: App) => {
   // Built once; it resolves the upstream lazily on every request so a
   // container restart (which can change the resolved address) is picked up
   // without re-registering the route.
+  //
+  // Gated on config rather than on `questdbEndpoints`: that is only populated
+  // on the managed-container path, so keying off it made the console return
+  // 503 forever in external mode, where the host/port come from config and
+  // questdbHttpBaseUrl() already falls back to them. Null only before any
+  // config has loaded, which is the one moment there is nothing to point at.
   const consoleProxy = createConsoleProxy({
-    baseUrl: () => (questdbEndpoints ? questdbHttpBaseUrl() : null),
+    baseUrl: () => (currentConfig ? questdbHttpBaseUrl() : null),
     debug: (msg) => app.debug(msg),
   });
 
