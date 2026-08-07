@@ -63,6 +63,18 @@ export default function AppPanel() {
       // The admin shell gives the panel a sized container; fill it rather than
       // guessing a viewport height, which would double-scroll inside the shell.
       style={{ width: "100%", height: "100%", minHeight: "80vh", border: 0 }}
+      // Same list Signal K's own admin uses to embed the server docs
+      // (EmbeddedDocs.tsx). `allow-same-origin` is required — the console
+      // reads localStorage and calls its API relatively, and dropping it
+      // breaks both. It therefore does NOT isolate the frame from the Signal K
+      // origin; what the sandbox does buy is everything left OUT of the list:
+      // no top-level navigation away from the admin UI, no popups, no form
+      // submission, no downloads, no pointer lock.
+      //
+      // Real isolation needs a separate origin, which a Signal K plugin cannot
+      // mint — its routes are mounted under the server's own origin. The
+      // console is admin-only for exactly this reason.
+      sandbox="allow-scripts allow-same-origin"
     />
   );
 }
