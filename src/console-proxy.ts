@@ -101,7 +101,14 @@ function forwardableHeaders(
 function returnableHeaders(
   headers: IncomingMessage["headers"],
 ): Record<string, string | string[]> {
-  return stripHopByHop(headers);
+  const out = stripHopByHop(headers);
+  // The console shares the Signal K origin, so a proxied Set-Cookie would be
+  // applied to it — letting a misconfigured or compromised QuestDB write
+  // cookies that collide with Signal K's own session handling. Nothing is
+  // lost by dropping it: the request side already strips `cookie`, so no
+  // QuestDB cookie could ever have completed a round trip anyway.
+  delete out["set-cookie"];
+  return out;
 }
 
 export function createConsoleProxy(deps: ConsoleProxyDeps) {

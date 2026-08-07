@@ -195,6 +195,38 @@ describe("console proxy header hygiene", () => {
     assert.doesNotMatch(r.csp ?? "", /connect-src/);
   });
 
+  it("does not let QuestDB set cookies on the Signal K origin", async () => {
+    // The console shares Signal K's origin, so a proxied Set-Cookie would be
+    // applied to it — a `Path=/` cookie from QuestDB could collide with Signal
+    // K's own session handling. The request side already strips `cookie`, so
+    // no QuestDB cookie could complete a round trip regardless.
+    const cookieUpstream = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "set-cookie": "questdb_session=abc; Path=/",
+        "content-type": "text/plain",
+      });
+      res.end("ok");
+    });
+    await new Promise<void>((r) => cookieUpstream.listen(0, "127.0.0.1", r));
+    const upPort = (cookieUpstream.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`);
+      assert.equal(res.headers.get("set-cookie"), null);
+    } finally {
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => cookieUpstream.close(() => r()));
+    }
+  });
+
   it("marks responses nosniff", async () => {
     const r = await throughProxy("/");
     assert.equal(r.nosniff, "nosniff");
