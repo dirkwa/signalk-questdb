@@ -1,0 +1,91 @@
+<!doctype html>
+<!--
+  Embeddable webapp shim for QuestDB's own web console.
+
+  This page is served statically at /signalk-questdb/ and is NOT itself
+  admin-gated — Signal K mounts webapp `public/` directories outside the
+  authenticated /plugins path. That is fine, and deliberate: this file contains
+  no data and no credentials. Everything of value sits behind the iframe src,
+  /plugins/signalk-questdb/console/, which IS admin-only because plugin routes
+  default to admin in signalk-server.
+
+  So a non-admin who loads this page gets the chrome and an auth error inside
+  the frame, never console access.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuestDB Console</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #21222c;
+      }
+      /* The console owns the whole viewport; Signal K's own nav panel sits
+         outside this document, so nothing here needs to reserve space for it. */
+      iframe {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }
+      #fallback {
+        display: none;
+        box-sizing: border-box;
+        padding: 2rem;
+        max-width: 40rem;
+        margin: 0 auto;
+        color: #e6e6e6;
+        font:
+          14px/1.5 system-ui,
+          sans-serif;
+      }
+      #fallback code {
+        background: #2f303b;
+        padding: 0.1em 0.35em;
+        border-radius: 3px;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe
+      id="console"
+      src="/plugins/signalk-questdb/console/"
+      title="QuestDB Console"
+    ></iframe>
+
+    <div id="fallback">
+      <h2>QuestDB console unavailable</h2>
+      <p>
+        The console could not be loaded. The usual causes are that the QuestDB
+        container is not running, or that the
+        <strong>QuestDB console webapp</strong> option is switched off in the
+        plugin configuration.
+      </p>
+      <p>
+        You can also reach QuestDB directly on its HTTP port (default
+        <code>9000</code>) if it is published on this host.
+      </p>
+    </div>
+
+    <script>
+      // A failed proxy returns an error status rather than failing to load, so
+      // `onerror` never fires. Probe the endpoint instead and swap in a
+      // readable explanation rather than leaving a bare 502 in the frame.
+      fetch("/plugins/signalk-questdb/console/", { method: "HEAD" })
+        .then((res) => {
+          if (res.ok) return;
+          document.getElementById("console").style.display = "none";
+          document.getElementById("fallback").style.display = "block";
+        })
+        .catch(() => {
+          document.getElementById("console").style.display = "none";
+          document.getElementById("fallback").style.display = "block";
+        });
+    </script>
+  </body>
+</html>

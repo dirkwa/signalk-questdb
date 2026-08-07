@@ -6,6 +6,7 @@
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-plugin-configurator",
+    "signalk-embeddable-webapp",
     "signalk-category-database"
   ],
   "signalk": {

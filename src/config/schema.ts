@@ -108,6 +108,13 @@ export const ConfigSchema = Type.Object({
       "Only replay values recorded within this many minutes. Matches Freeboard's default AIS expiry (9 minutes), so a restored target is one that would still have been on the chart. Raising this puts progressively staler positions on the chart.",
   }),
 
+  enableConsole: Type.Boolean({
+    default: true,
+    title: "QuestDB console webapp",
+    description:
+      "Serve QuestDB's own web console inside the Signal K admin UI (admin only). The console is a full SQL client — unlike the read-only query endpoint it can modify and delete recorded data. Turn this off to remove the route entirely.",
+  }),
+
   retentionDays: Type.Number({
     default: 0,
     title: "Retention (days, 0 = keep forever)",
@@ -177,6 +184,10 @@ export function normalizeConfig(config: Config): Config {
       config.restoreMaxAgeMinutes && config.restoreMaxAgeMinutes > 0
         ? config.restoreMaxAgeMinutes
         : 9,
+    // On unless explicitly disabled, matching the recording toggles rather
+    // than restoreOnStart: the console only ever does what an authenticated
+    // admin types, so a missing key should not hide the tool.
+    enableConsole: config.enableConsole !== false,
     // Missing resource limits get the schema defaults. Config-panel saves
     // used to drop these keys entirely (issue #98), which ran QuestDB with
     // NO memory cap instead of the promised 768m — this backfill repairs

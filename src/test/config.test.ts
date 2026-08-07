@@ -128,6 +128,28 @@ describe("normalizeConfig startup restore", () => {
   });
 });
 
+describe("normalizeConfig console webapp", () => {
+  it("defaults a missing console toggle to ON", () => {
+    // Unlike restoreOnStart, the console is on by default: it only ever does
+    // what an authenticated admin types, so a missing key must not hide the
+    // tool from someone upgrading.
+    const legacy = { managedContainer: true } as unknown as Config;
+    assert.equal(normalizeConfig(legacy).enableConsole, true);
+  });
+
+  it("preserves an explicit opt-out", () => {
+    // The schema default and this fallback must agree — recordOthers once
+    // drifted from its documented default exactly this way.
+    const config = { enableConsole: false } as unknown as Config;
+    assert.equal(normalizeConfig(config).enableConsole, false);
+  });
+
+  it("treats only an explicit false as off", () => {
+    const config = { enableConsole: true } as unknown as Config;
+    assert.equal(normalizeConfig(config).enableConsole, true);
+  });
+});
+
 describe("normalizeConfig resource limits", () => {
   it("backfills limits dropped by pre-fix panel saves (issue #98)", () => {
     // The panel used to replace the config wholesale, stripping the resource
