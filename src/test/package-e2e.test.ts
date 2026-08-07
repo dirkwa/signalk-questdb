@@ -21,7 +21,14 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import {
+  readFileSync,
+  existsSync,
+  readdirSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -105,11 +112,29 @@ const reachableChunks = (): string[] => {
 let manifestCache: string[] | null = null;
 const publishedFiles = (): string[] => {
   if (manifestCache) return manifestCache;
-  const out = execFileSync("npm", ["pack", "--dry-run", "--json"], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
+  // `--cache` into a temp dir, and `--offline` so nothing is fetched.
+  //
+  // npm writes to its cache even for a dry-run pack. The Signal K plugin
+  // registry scores plugins by running `npm test` inside
+  // `firejail --net=none --read-only=/home`, so the default cache under
+  // $HOME fails with EROFS and every assertion here errored — costing the
+  // plugin 30 points with a `tests-failing` badge while the suite passed
+  // everywhere else. Keep this sandbox-safe.
+  const cacheDir = mkdtempSync(path.join(tmpdir(), "sk-questdb-pack-"));
+  let out: string;
+  try {
+    out = execFileSync(
+      "npm",
+      ["pack", "--dry-run", "--json", "--offline", "--cache", cacheDir],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+  } finally {
+    rmSync(cacheDir, { recursive: true, force: true });
+  }
   // npm has shipped both shapes for `pack --json`: an array of results, and
   // an object keyed by package name (npm 12 under a lifecycle script). Take
   // whichever came back rather than pinning the test to one npm version.
