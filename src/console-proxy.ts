@@ -222,16 +222,32 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
         // handled identically, and only the status tells us a body is absent
         // by definition.
         const status = proxied.statusCode;
-        const bodyless =
-          req.method === "HEAD" ||
-          status === 204 ||
-          status === 304 ||
-          (status !== undefined && status >= 300 && status < 400);
 
-        if (bodyless) {
-          // 204/304 must not carry content-length at all (RFC 9110 §6.4.1);
-          // for the rest, an explicit 0 is what keeps Node from chunking.
-          if (status !== 204 && status !== 304) {
+        // 204 and 304 carry no body by protocol, whatever the origin sends.
+        // Node already frames these correctly, so they only need the upstream
+        // drained.
+        const neverHasBody = status === 204 || status === 304;
+
+        // A 3xx MAY carry a body (RFC 9110 §15.4) and browsers render it, so
+        // this cannot simply assume every redirect is empty — doing so dropped
+        // the body and overwrote a correct content-length with 0.
+        //
+        // `content-length` is the reliable signal. `transfer-encoding` is not:
+        // QuestDB omits both (the case Node then has to guess about), while
+        // Node's own http server answers an empty `res.end()` with `chunked`.
+        // Both are genuinely bodyless and must be treated alike, so key on the
+        // absence of a declared length and let the drain below cover the rest.
+        const redirectWithoutBody =
+          status !== undefined &&
+          status >= 300 &&
+          status < 400 &&
+          proxied.headers["content-length"] === undefined;
+
+        if (req.method === "HEAD" || neverHasBody || redirectWithoutBody) {
+          if (!neverHasBody) {
+            // Explicit 0 is what stops Node falling back to chunked framing
+            // for a body that will never arrive. 204/304 must not carry it at
+            // all (RFC 9110 §6.4.1).
             headers["content-length"] = "0";
           }
           res.writeHead(status ?? 502, headers);
@@ -243,7 +259,22 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
           return;
         }
 
-        res.writeHead(proxied.statusCode ?? 502, headers);
+        res.writeHead(status ?? 502, headers);
+
+        // If the upstream dies mid-body, `pipe` alone never ends `res` — the
+        // browser sits on a response that will never complete. Node signals
+        // truncation to a direct client by aborting the socket; destroying our
+        // response does the same for ours, so a truncated console query fails
+        // visibly instead of hanging the tab.
+        proxied.on("aborted", () => {
+          deps.debug("console proxy: upstream aborted mid-response");
+          res.destroy();
+        });
+        proxied.on("error", (err) => {
+          deps.debug(`console proxy: upstream stream error: ${err.message}`);
+          res.destroy();
+        });
+
         proxied.pipe(res);
       },
     );
