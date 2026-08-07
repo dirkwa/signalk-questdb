@@ -644,3 +644,63 @@ describe("history-v1 playback vessel-name injection", () => {
     }
   });
 });
+
+describe("history-v1 streamHistory does not outlive its process", () => {
+  // The regression this pins down is not a wrong VALUE, it is a process that
+  // will not exit. Stopping a playback set a `stopped` flag but left the
+  // already-scheduled inter-chunk timer armed for CHUNK_SECONDS/playbackRate
+  // (60s at rate 1), so node stayed alive until it fired. That made this file
+  // take 60s to run assertions completing in milliseconds, and the plugin
+  // registry — which runs `npm test` under `timeout 60s` — scored the whole
+  // suite as failing.
+  //
+  // Asserting on timer handles does not work: node does not expose Timeouts
+  // via process._getActiveHandles(). So assert the observable property
+  // instead — spawn a real process that starts a playback, and require it to
+  // exit on its own well inside the 60s the orphaned timer would have cost.
+  it("lets node exit promptly after a playback is started", async () => {
+    const { spawn } = await import("node:child_process");
+    const script = `
+      const { createHistoryProviderV1 } = require("./dist/history-v1.js");
+      const dataset = [["2024-01-01T00:00:01.000000Z","navigation.speedOverGround","self","1","number"]];
+      const client = {
+        exec: async (sql) => sql.includes("LATEST ON")
+          ? { columns: [], dataset: [], count: 0, timestamp: 0 }
+          : { columns: [], dataset, count: dataset.length, timestamp: 0 },
+        toObjects: (r) => r.dataset.map((row) => ({
+          ts: row[0], path: row[1], context: row[2], valuetext: row[3], kind: row[4],
+        })),
+      };
+      const provider = createHistoryProviderV1(client, "vessels.self", () => {});
+      provider.streamHistory(
+        { write: () => {}, on: () => {} },
+        { startTime: new Date("2024-01-01T00:00:00Z"), playbackRate: 1 },
+        () => {},
+      );
+      // Deliberately do NOT call stop(): an unref'd timer must not be enough
+      // to keep the process alive on its own.
+    `;
+
+    const started = Date.now();
+    const exitCode = await new Promise<number | null>((resolve) => {
+      const child = spawn(process.execPath, ["-e", script], {
+        stdio: "ignore",
+      });
+      const kill = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve(null);
+      }, 15000);
+      child.on("exit", (code) => {
+        clearTimeout(kill);
+        resolve(code);
+      });
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(exitCode, 0, "the playback process must exit on its own");
+    assert.ok(
+      elapsed < 10000,
+      `expected a prompt exit, took ${elapsed}ms (an orphaned 60s timer would hang here)`,
+    );
+  });
+});
