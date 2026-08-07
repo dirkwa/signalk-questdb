@@ -157,10 +157,22 @@ describe("console proxy header hygiene", () => {
       await new Promise<void>((resolve) => {
         const r = http.request(
           {
+            // Explicit host. `http.request` defaults to `localhost`, which
+            // resolves differently inside the plugin registry's firejail
+            // sandbox and failed with ECONNREFUSED — while `fetch`, used by
+            // every other test here, was unaffected. The server listens on
+            // 127.0.0.1, so name it.
+            host: "127.0.0.1",
             port,
             path: "/",
+            // `close`, not `keep-alive`: the header still nominates
+            // x-hop-secret (which is what this test is about), but the socket
+            // is not held open afterwards. With keep-alive the agent keeps it
+            // alive, server.close() waits for it, and the test hangs — which
+            // it did, but only under the registry's sandbox where the timing
+            // differed enough to expose it.
             headers: {
-              connection: "keep-alive, x-hop-secret",
+              connection: "close, x-hop-secret",
               "x-hop-secret": "must-not-travel",
               "x-normal": "must-travel",
             },
@@ -173,6 +185,8 @@ describe("console proxy header hygiene", () => {
         r.end();
       });
     } finally {
+      // closeAllConnections() so a lingering socket cannot stall teardown.
+      front.closeAllConnections?.();
       await new Promise<void>((r) => front.close(() => r()));
     }
     assert.equal(seen[0].headers["x-hop-secret"], undefined);
