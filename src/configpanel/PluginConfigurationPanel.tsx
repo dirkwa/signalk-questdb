@@ -6,7 +6,6 @@ import type { Config } from "../config/schema.js";
 import type {
   ApiError,
   DbStatus,
-  MigrationDetectResponse,
   MigrationSource,
   QuestdbVersion,
   ResumeWalResponse,
@@ -17,6 +16,7 @@ import type {
 } from "../api-contract.js";
 import type { SkipPlan } from "../wal-monitor.js";
 import { S } from "./styles.js";
+import { toMigrationSources, toVersionList } from "./responses.js";
 
 type FilterMode = Config["pathFilter"]["mode"];
 type Compression = Config["compression"];
@@ -211,8 +211,10 @@ export default function PluginConfigurationPanel({
     try {
       const res = await fetch("/plugins/signalk-questdb/api/versions");
       if (res.ok) {
-        const data = (await res.json()) as QuestdbVersion[];
-        setVersions(data);
+        // `.catch(() => null)` for the same reason as the migration probe:
+        // a 200 that is not JSON should leave the dropdown empty, not
+        // depend on the bare catch below to swallow a parse error.
+        setVersions(toVersionList(await res.json().catch(() => null)));
       }
     } catch {
       // offline or error
@@ -463,9 +465,13 @@ export default function PluginConfigurationPanel({
         `/plugins/signalk-questdb/api/migration/detect${params}`,
       );
       if (res.ok) {
-        const data = (await res.json()) as MigrationDetectResponse;
-        setMigrationSources(data.sources);
-        if (data.sources.length === 0) {
+        // A 200 carrying HTML (captive portal, auth redirect) rejects in
+        // json() before any shape check runs, and the catch below would
+        // report the parse error as "Detection failed" rather than the
+        // honest "nothing detected".
+        const sources = toMigrationSources(await res.json().catch(() => null));
+        setMigrationSources(sources);
+        if (sources.length === 0) {
           setActionStatus(
             migrationUrl
               ? `No InfluxDB found at ${migrationUrl}.`
