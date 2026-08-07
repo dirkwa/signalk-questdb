@@ -229,25 +229,33 @@ export function createConsoleProxy(deps: ConsoleProxyDeps) {
         const neverHasBody = status === 204 || status === 304;
 
         // A 3xx MAY carry a body (RFC 9110 §15.4) and browsers render it, so
-        // this cannot simply assume every redirect is empty — doing so dropped
-        // the body and overwrote a correct content-length with 0.
+        // this cannot assume every redirect is empty — an earlier version did,
+        // and silently dropped the body.
         //
-        // `content-length` is the reliable signal. `transfer-encoding` is not:
-        // QuestDB omits both (the case Node then has to guess about), while
-        // Node's own http server answers an empty `res.end()` with `chunked`.
-        // Both are genuinely bodyless and must be treated alike, so key on the
-        // absence of a declared length and let the drain below cover the rest.
+        // Bodyless means the upstream declared NEITHER framing header. Testing
+        // content-length alone is not enough: a redirect body sent with
+        // chunked encoding carries no length, and was also being dropped.
+        const declaresBody =
+          proxied.headers["content-length"] !== undefined ||
+          proxied.headers["transfer-encoding"] !== undefined;
         const redirectWithoutBody =
           status !== undefined &&
           status >= 300 &&
           status < 400 &&
-          proxied.headers["content-length"] === undefined;
+          !declaresBody;
 
         if (req.method === "HEAD" || neverHasBody || redirectWithoutBody) {
-          if (!neverHasBody) {
-            // Explicit 0 is what stops Node falling back to chunked framing
-            // for a body that will never arrive. 204/304 must not carry it at
-            // all (RFC 9110 §6.4.1).
+          // Synthesize `content-length: 0` only when the upstream declared no
+          // framing at all — that is the case where Node would otherwise guess
+          // and fall back to chunked for a body that never arrives.
+          //
+          // Do NOT synthesize it when the upstream stated a length. A HEAD
+          // response must carry the same headers a GET would (RFC 9110
+          // §9.3.2), so overwriting a real `content-length: 12345` with 0
+          // misreports the resource's size to the client.
+          //
+          // 204/304 must not carry content-length at all (RFC 9110 §6.4.1).
+          if (!neverHasBody && !declaresBody) {
             headers["content-length"] = "0";
           }
           res.writeHead(status ?? 502, headers);

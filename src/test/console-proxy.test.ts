@@ -301,10 +301,18 @@ describe("console proxy redirect rewriting", () => {
     // how a working console still reported "console unavailable" even after
     // the Location rewrite was correct. Rewriting Location was necessary but
     // not sufficient; this is the other half.
+    // Exactly QuestDB's shape: no content-length, no transfer-encoding, no
+    // body. `res.writeHead(...); res.end()` will NOT do — Node adds
+    // `chunked` for an empty body, which the real origin does not send, and a
+    // stand-in that declares framing is not the case under test. Write the
+    // raw response so the bytes match what QuestDB actually emits.
     const up = http.createServer((_req, res) => {
-      // Exactly QuestDB's shape: no length, no encoding, no body.
-      res.writeHead(301, { location: "/index.html" });
-      res.end();
+      res.socket?.end(
+        "HTTP/1.1 301 Moved Permanently\r\n" +
+          "Location: /index.html\r\n" +
+          "Connection: close\r\n" +
+          "\r\n",
+      );
     });
     await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
     const upPort = (up.address() as AddressInfo).port;
@@ -447,6 +455,46 @@ describe("console proxy redirect rewriting", () => {
     }
   });
 
+  it("preserves a redirect body sent with chunked encoding", async () => {
+    // Second self-audit catch. Keying "bodyless" on the absence of
+    // content-length alone still dropped a redirect body streamed with
+    // chunked encoding, which carries no length. Both framing headers have to
+    // be absent before a 3xx can be treated as empty.
+    const body = "<html>Moved chunked</html>";
+    const up = http.createServer((_req, res) => {
+      // No content-length: Node frames this as chunked.
+      res.writeHead(302, { location: "/x", "content-type": "text/html" });
+      res.end(body);
+    });
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        redirect: "manual",
+        headers: { connection: "close" },
+      });
+      assert.equal(
+        await res.text(),
+        body,
+        "a chunked redirect body must survive",
+      );
+    } finally {
+      front.closeAllConnections?.();
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
+  });
+
   it("keeps a root-relative redirect inside the mount", async () => {
     assert.equal(await locationThrough("/index.html"), `${MOUNT}/index.html`);
   });
@@ -533,6 +581,45 @@ describe("console proxy upstream failure mid-response", () => {
         "ended",
         "a truncated response must not look like a clean end",
       );
+    } finally {
+      front.closeAllConnections?.();
+      await new Promise<void>((r) => front.close(() => r()));
+      await new Promise<void>((r) => up.close(() => r()));
+    }
+  });
+});
+
+describe("console proxy HEAD content-length", () => {
+  it("reports the resource's real length, not zero", async () => {
+    // Third self-audit catch. A HEAD response must carry the headers a GET
+    // would return (RFC 9110 §9.3.2), so overwriting a stated
+    // `content-length: 12345` with 0 misreports the resource's size — a
+    // client sizing a download from HEAD would read it as empty.
+    const up = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/plain",
+        "content-length": "12345",
+      });
+      res.end();
+    });
+    await new Promise<void>((r) => up.listen(0, "127.0.0.1", r));
+    const upPort = (up.address() as AddressInfo).port;
+
+    const proxy = createConsoleProxy({
+      baseUrl: () => `http://127.0.0.1:${upPort}`,
+      debug: () => {},
+      mountPath: MOUNT,
+    });
+    const front = http.createServer((req, res) => proxy(req, res));
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", r));
+    const { port } = front.address() as AddressInfo;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        method: "HEAD",
+        headers: { connection: "close" },
+      });
+      assert.equal(res.headers.get("content-length"), "12345");
     } finally {
       front.closeAllConnections?.();
       await new Promise<void>((r) => front.close(() => r()));
