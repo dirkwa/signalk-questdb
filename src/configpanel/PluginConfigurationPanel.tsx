@@ -52,9 +52,15 @@ function CollapsibleSection({
   title: string;
   /**
    * Initial state only \u2014 seeded once on mount, exactly like the config-derived
-   * state below. Deliberately NOT kept in sync with an effect: a section that
-   * opens because it has content would then snap shut the moment the user
-   * cleared the field, fighting them mid-edit.
+   * state in the panel below. Deliberately NOT kept in sync with an effect: a
+   * section that opens because it has content would then snap shut the moment
+   * the user cleared the field, fighting them mid-edit.
+   *
+   * This holds only because the host has the configuration in hand before the
+   * panel mounts: signalk-server seeds it via `useState(plugin.data.configuration)`
+   * and passes it straight down, so there is no render where it is absent and
+   * then arrives. A caller deriving this from data fetched inside the panel
+   * would seed `false` forever and silently lose the behaviour.
    */
   defaultOpen?: boolean;
   children: React.ReactNode;
