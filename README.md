@@ -34,7 +34,7 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 - **Image Version** -- dropdown with latest, pre-releases, and last 3 stable releases
 - **Connection** -- managed container toggle, host/ports, PostgreSQL port for Grafana
 - **Recording** -- record self, record AIS targets, startup restore, console webapp, retention days
-- **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns (e.g. exclude `notifications.*`); empty by default, so everything is recorded
+- **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns
 - **Compression** (collapsible) -- LZ4/ZSTD codec selection for on-disk storage
 - **InfluxDB Migration** (collapsible) -- auto-detect with manual URL for remote instances
 - **Data Export** (collapsible) -- date range picker, Parquet/CSV format, download button
