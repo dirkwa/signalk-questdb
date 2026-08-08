@@ -46,39 +46,36 @@ function toCompression(value: string): Compression {
 
 function CollapsibleSection({
   title,
+  defaultOpen = false,
   children,
 }: {
   title: string;
+  /**
+   * Initial state only \u2014 seeded once on mount, exactly like the config-derived
+   * state below. Deliberately NOT kept in sync with an effect: a section that
+   * opens because it has content would then snap shut the moment the user
+   * cleared the field, fighting them mid-edit.
+   */
+  defaultOpen?: boolean;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   return (
     <div>
       {/* A real <button> so keyboard users can toggle with Enter/Space and
-          screen readers announce expanded state; the style resets the default
-          button chrome so it still reads as a section title. */}
+          screen readers announce expanded state. sectionToggle resets the
+          default button chrome but keeps a darker colour than a plain heading,
+          so it reads as a control \u2014 at sectionTitle's grey it did not, and the
+          settings inside looked absent rather than collapsed (issue #123). */}
       <button
         type="button"
         aria-expanded={open}
-        style={{
-          ...S.sectionTitle,
-          cursor: "pointer",
-          userSelect: "none",
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          width: "100%",
-          textAlign: "left",
-          background: "none",
-          border: "none",
-          padding: 0,
-        }}
+        style={{ ...S.sectionTitle, ...S.sectionToggle }}
         onClick={() => setOpen(!open)}
       >
         <span
           style={{
-            fontSize: 10,
-            transition: "transform 0.15s",
+            ...S.sectionMarker,
             transform: open ? "rotate(90deg)" : "rotate(0deg)",
           }}
         >
@@ -1267,7 +1264,14 @@ export default function PluginConfigurationPanel({
         <span style={S.hint}>0 = keep forever</span>
       </div>
 
-      <CollapsibleSection title="Path filtering">
+      {/* Open on mount when patterns are already configured, so a user who has
+          set filtering sees it rather than a collapsed header. Keyed on the
+          paths, not the mode: mode defaults to "exclude" and is never empty,
+          so keying on it would open this for everyone and say nothing. */}
+      <CollapsibleSection
+        title="Path filtering"
+        defaultOpen={filterPaths.trim() !== ""}
+      >
         <div style={S.fieldRow}>
           <span style={S.label}>Filter mode</span>
           <select
@@ -1287,19 +1291,27 @@ export default function PluginConfigurationPanel({
         </div>
         <div style={{ marginBottom: 10 }}>
           <div style={{ ...S.label, width: "auto", marginBottom: 6 }}>
-            Path patterns (one per line, glob supported)
+            Path patterns (one per line, glob supported) — optional
           </div>
+          {/* The examples match the schema's own description rather than
+              inventing copy. navigation.position used to lead here, and as
+              grey placeholder text inside an empty box it read as a value:
+              a user concluded their position was excluded by default when
+              nothing is filtered at all (issue #123). */}
           <textarea
             style={S.textarea}
             value={filterPaths}
             onChange={(e) => setFilterPaths(e.target.value)}
-            placeholder={"navigation.position\nnavigation.*\nnotifications.*"}
+            placeholder={"notifications.*\nenvironment.wind.*"}
           />
-          <div style={S.hint}>
+          <div style={S.fieldHelp}>
+            Empty = record everything (the default). Nothing is filtered out
+            unless you list a pattern here.
+          </div>
+          <div style={{ ...S.hint, marginLeft: 0 }}>
             {filterMode === "exclude"
               ? "These paths are NOT recorded; everything else is."
-              : "ONLY these paths are recorded; everything else is dropped."}{" "}
-            Leave empty to record everything.
+              : "ONLY these paths are recorded; everything else is dropped."}
           </div>
         </div>
       </CollapsibleSection>

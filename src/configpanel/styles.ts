@@ -19,6 +19,28 @@ export const S = {
     marginBottom: 10,
     marginTop: 24,
   },
+  // Chrome for a CollapsibleSection's header button. Spread OVER sectionTitle,
+  // so the `color` here deliberately overrides that block's `#888`: a
+  // collapsed section hides real settings, and at #888 the header read as a
+  // muted caption rather than something to click — a user reported the path
+  // filter as uneditable when it was only collapsed (issue #123). #555 is the
+  // same colour as `label`, i.e. the panel's "this is an actual control" tone.
+  sectionToggle: {
+    color: "#555",
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    width: "100%",
+    textAlign: "left",
+    background: "none",
+    border: "none",
+    padding: 0,
+    cursor: "pointer",
+    userSelect: "none",
+  },
+  // The ▶ disclosure triangle. `transform` stays at the call site because it
+  // is derived from open/closed state.
+  sectionMarker: { fontSize: 11, transition: "transform 0.15s" },
   btn: {
     display: "inline-flex",
     alignItems: "center",
@@ -146,6 +168,11 @@ export const S = {
   },
   checkbox: { width: 16, height: 16, accentColor: "#3b82f6" },
   hint: { fontSize: 11, color: "#aaa", marginLeft: 8 },
+  // Helper text that has to be READ, not merely available — darker and larger
+  // than `hint`. A `hint` sits below a field the user is already looking at;
+  // this one has to out-argue a textarea's own grey placeholder, and at
+  // hint's #aaa/11px it lost that argument (issue #123).
+  fieldHelp: { fontSize: 12, color: "#666", marginTop: 6, lineHeight: 1.5 },
   textarea: {
     padding: "6px 10px",
     borderRadius: 6,
