@@ -35,23 +35,36 @@ const render = (configuration: Partial<Config>) =>
   );
 
 /**
- * The rendered markup for one section, from its header button to the start of
- * the next section. Scoping assertions this way keeps a test about Path
- * filtering from passing because some OTHER section happened to be open.
+ * The header button for one section, isolated from every other button on the
+ * page. Scoping this way keeps a test about Path filtering from passing
+ * because some OTHER section happened to be in the asserted state.
+ *
+ * Matched by walking each `<button …>` tag and keeping the one whose text is
+ * this title, rather than searching backwards from the title with
+ * `lastIndexOf`. The panel renders non-section buttons too (a refresh control
+ * and Save), and today they happen to sit outside the section block — so
+ * searching backwards works by coincidence of layout. Add a button inside a
+ * section body and that approach would silently select the wrong element and
+ * assert against its state. This cannot.
  */
-const sectionMarkup = (html: string, title: string): string => {
-  const at = html.indexOf(`>${title}</button>`);
-  assert.notEqual(at, -1, `section "${title}" not rendered at all`);
-  // Back up to the opening <button> so aria-expanded is inside the slice.
-  const start = html.lastIndexOf("<button", at);
-  const next = html.indexOf("<button", at);
-  return html.slice(start, next === -1 ? undefined : next);
+const sectionHeader = (html: string, title: string): string => {
+  for (const match of html.matchAll(/<button[^>]*>/g)) {
+    const tag = match[0];
+    const rest = html.slice(match.index + tag.length);
+    // The header renders the marker span, then the bare title, then closes.
+    if (rest.startsWith(`<span`) && rest.includes(`>${title}</button>`)) {
+      const end = rest.indexOf("</button>");
+      // Guard against a later section's title matching through this one.
+      if (rest.slice(0, end).includes(title)) return tag + rest.slice(0, end);
+    }
+  }
+  assert.fail(`no section header button rendered for "${title}"`);
 };
 
 describe("Path filtering section (issue #123)", () => {
   it("starts open when patterns are already configured", () => {
     const html = render(configWith(["notifications.*"]));
-    const section = sectionMarkup(html, "Path filtering");
+    const section = sectionHeader(html, "Path filtering");
 
     assert.match(
       section,
@@ -68,7 +81,7 @@ describe("Path filtering section (issue #123)", () => {
 
   it("starts collapsed when no patterns are configured", () => {
     const html = render(configWith([]));
-    const section = sectionMarkup(html, "Path filtering");
+    const section = sectionHeader(html, "Path filtering");
 
     assert.match(
       section,
@@ -84,7 +97,7 @@ describe("Path filtering section (issue #123)", () => {
     const html = render(configWith(["   ", ""]));
 
     assert.match(
-      sectionMarkup(html, "Path filtering"),
+      sectionHeader(html, "Path filtering"),
       /aria-expanded="false"/,
     );
   });
@@ -96,7 +109,7 @@ describe("Path filtering section (issue #123)", () => {
     const html = render({ pathFilter: { mode: "exclude", paths: [] } });
 
     assert.match(
-      sectionMarkup(html, "Path filtering"),
+      sectionHeader(html, "Path filtering"),
       /aria-expanded="false"/,
     );
   });
@@ -107,7 +120,7 @@ describe("Path filtering section (issue #123)", () => {
     const html = render({});
 
     assert.match(
-      sectionMarkup(html, "Path filtering"),
+      sectionHeader(html, "Path filtering"),
       /aria-expanded="false"/,
     );
   });
@@ -120,7 +133,7 @@ describe("Path filtering section (issue #123)", () => {
     } as unknown as Partial<Config>);
 
     assert.match(
-      sectionMarkup(html, "Path filtering"),
+      sectionHeader(html, "Path filtering"),
       /aria-expanded="false"/,
     );
   });
@@ -144,7 +157,7 @@ describe("collapsible section headers are controls, not captions", () => {
     const html = render(configWith([]));
 
     for (const title of SECTIONS) {
-      const section = sectionMarkup(html, title);
+      const section = sectionHeader(html, title);
       assert.match(
         section,
         /<button/,
@@ -173,7 +186,7 @@ describe("collapsible section headers are controls, not captions", () => {
     for (const title of SECTIONS) {
       const expected = title === "Path filtering" ? "true" : "false";
       assert.match(
-        sectionMarkup(html, title),
+        sectionHeader(html, title),
         new RegExp(`aria-expanded="${expected}"`),
         `"${title}" should render aria-expanded="${expected}"`,
       );
