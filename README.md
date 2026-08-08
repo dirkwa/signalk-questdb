@@ -34,7 +34,7 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 - **Image Version** -- dropdown with latest, pre-releases, and last 3 stable releases
 - **Connection** -- managed container toggle, host/ports, PostgreSQL port for Grafana
 - **Recording** -- record self, record AIS targets, startup restore, console webapp, retention days
-- **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns (e.g. exclude `navigation.position`)
+- **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns (e.g. exclude `notifications.*`); empty by default, so everything is recorded
 - **Compression** (collapsible) -- LZ4/ZSTD codec selection for on-disk storage
 - **InfluxDB Migration** (collapsible) -- auto-detect with manual URL for remote instances
 - **Data Export** (collapsible) -- date range picker, Parquet/CSV format, download button
@@ -133,7 +133,7 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 | QuestDB console webapp     | `true`       | Serve QuestDB's console in the Signal K admin UI, admin only (see Console webapp)                     |
 | Retention (days)           | `0`          | Auto-delete old partitions (0 = keep forever)                                                         |
 | Path filter mode           | `exclude`    | `exclude` matching paths, or `include` only matching paths                                            |
-| Path filter paths          | _(empty)_    | Glob patterns, one per line (e.g. `navigation.position`); empty = record everything                   |
+| Path filter paths          | _(empty)_    | Glob patterns, one per line (e.g. `notifications.*`); empty = record everything, which is the default |
 | Compression codec          | `lz4`        | On-disk WAL compression: `none`, `lz4`, or `zstd`                                                     |
 | Compression level          | `3`          | ZSTD level 1-22 (only when codec is zstd)                                                             |
 | Container network          | `sk-network` | Shared network for QuestDB (only applied when binding to 0.0.0.0)                                     |

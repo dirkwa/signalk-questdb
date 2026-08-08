@@ -21,5 +21,10 @@
     "sourceMap": true
   },
   "include": ["src"],
-  "exclude": ["node_modules", "dist", "src/configpanel"]
+  // src/test/panel is excluded for the same reason as src/configpanel: it
+  // renders the panel, so it is JSX against DOM types. It has its own build
+  // (src/test/panel/tsconfig.json → dist-panel-test/, run by `test:panel`).
+  // Letting it in here would force `jsx` and a DOM lib into the Node compile,
+  // which is precisely what keeps server code from referencing `document`.
+  "exclude": ["node_modules", "dist", "src/configpanel", "src/test/panel"]
 }

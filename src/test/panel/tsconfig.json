@@ -1,0 +1,39 @@
+{
+  // The config panel is deliberately excluded from the root tsconfig (DOM and
+  // JSX types must never reach the Node compile) and its own tsconfig is
+  // noEmit, so nothing in src/configpanel/ ever lands in dist/. That leaves
+  // the panel's behaviour untestable by `node --test dist/test/**`.
+  //
+  // This config exists solely to emit the panel plus its behavioural test into
+  // dist-panel-test/, which the `test:panel` script then runs. It is a third,
+  // narrow build target rather than a loosening of either existing one: the
+  // root tsconfig stays DOM-free, and the panel's own tsconfig stays noEmit.
+  "compilerOptions": {
+    "target": "ES2022",
+
+    // Emitted ESM run directly by node --test, so relative specifiers must
+    // carry .js exactly as the runtime build requires.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+
+    // Not "react": this output is executed by Node, never bundled by Babel,
+    // so the automatic runtime is what makes JSX work without a React import
+    // in scope. The classic-runtime constraint documented in
+    // src/configpanel/tsconfig.json governs the SHIPPED bundle built by Vite;
+    // it does not apply here, and the panel source is compatible with both
+    // (it imports React explicitly).
+    "jsx": "react-jsx",
+
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+
+    "outDir": "../../../dist-panel-test",
+    "rootDir": "../../..",
+
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["./**/*.tsx", "./**/*.ts", "../../configpanel/**/*"]
+}
