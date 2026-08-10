@@ -9,6 +9,7 @@
 // The panel is a browser bundle, so this file must stay type-only — no
 // imports that pull runtime code (fs, typebox) into webpack's graph.
 
+import type { UlimitClamp } from "signalk-container-helper";
 import type { MaxMapCountStatus } from "./host-limits.js";
 import type { SkipPlan, SuspendedTable } from "./wal-monitor.js";
 
@@ -24,16 +25,15 @@ export interface ApiError {
 }
 
 /**
- * Mirror of signalk-container's `UlimitClamp` event, redeclared (not
- * imported) for the same reason index.ts redeclares it: signalk-container is
- * an optional peer reached through globalThis, so there is no type to import.
+ * signalk-container's `UlimitClamp` event, re-exported under the name the
+ * API responses use.
+ *
+ * `import type` is load-bearing: this file is shared with the browser panel,
+ * and the helper's main entry carries ~19KB of Node-side runtime code. A
+ * value import would drag all of it into the federated bundle. The type-only
+ * form is erased at compile time, so nothing ships.
  */
-export interface UlimitClampStatus {
-  ulimit: string;
-  requested: number;
-  granted: number;
-  reason: string;
-}
+export type UlimitClampStatus = UlimitClamp;
 
 export type SuspendedTableStatus = SuspendedTable & {
   /** WAL monitor's verdict for the current stall point: "pending" | "failed". */
