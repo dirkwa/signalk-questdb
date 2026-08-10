@@ -106,7 +106,14 @@ const IDENTITY_PATHS = [
   "design.length",
   "design.length.overall",
   "design.beam",
-  "mmsi",
+  // No "mmsi": for another vessel the MMSI IS the context
+  // (`vessels.urn:mrn:imo:mmsi:244813000`), built by the decoder from the AIS
+  // userId — neither n2k-signalk nor nmea0183-signalk ever emits it as a
+  // path, and this database has never held a single row under one. For self
+  // it is server configuration written once via setSelfValue, not a delta, and
+  // signalk-server's staticDataFilter strips incoming attempts to set it. So
+  // the entry only ever widened the SQL `IN` list for a path that cannot
+  // exist.
   "name",
 ] as const;
 

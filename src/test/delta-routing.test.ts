@@ -199,6 +199,20 @@ describe("flattenObjectValue (issue #128)", () => {
     }
   });
 
+  it("yields nothing for an empty parent path", () => {
+    // Would otherwise build ".name" — a leading-dot path matching no Signal K
+    // path and no filter pattern. Empty-path deltas are AIS static reports,
+    // handled by extractVesselName; this function must not depend on the
+    // caller guarding that.
+    const { leaves, skipped } = flattenObjectValue("", {
+      name: "SEA BREEZE",
+      mmsi: "244813000",
+    });
+
+    assert.deepStrictEqual(leaves, []);
+    assert.deepStrictEqual(skipped, []);
+  });
+
   it("records the anchor position's coordinates under its own path", () => {
     // The case that must NOT reach signalk_position: the leaves are recorded
     // where they cannot be confused with the vessel track.

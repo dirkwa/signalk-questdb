@@ -146,6 +146,12 @@ export function flattenObjectValue(
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return { leaves, skipped };
   }
+  // An empty parent would build ".name" — a leading-dot path that matches no
+  // Signal K path and no filter pattern. The recorder already returns before
+  // reaching here for path "" (that shape is the AIS static report, handled
+  // by extractVesselName), so this is belt-and-braces: the function must not
+  // depend on a caller's guard to avoid emitting a malformed path.
+  if (path === "") return { leaves, skipped };
   for (const [key, leaf] of Object.entries(value as Record<string, unknown>)) {
     const leafPath = `${path}.${key}`;
     if (typeof leaf === "number") {
