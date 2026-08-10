@@ -455,15 +455,20 @@ export default (app: App) => {
       };
       // ensureNetwork is feature-detected: the helper types every
       // version-gated member as optional so a plugin degrades on an older
-      // signalk-container instead of throwing. The previous hand-written
+      // signalk-container rather than throwing. The previous hand-written
       // mirror declared it required, which hid the need for this guard —
-      // and the connectToNetwork call further down was already guarding,
-      // so the two disagreed about the same API.
-      if (
-        config.networkName &&
-        typeof containers.ensureNetwork === "function"
-      ) {
-        await containers.ensureNetwork(config.networkName);
+      // and the connectToNetwork call further down was already guarding, so
+      // the two disagreed about the same API.
+      //
+      // networkMode is set REGARDLESS. Creating the network is the optional
+      // step; joining it is what the companion Grafana depends on, and on a
+      // signalk-container without ensureNetwork the network the operator
+      // named almost certainly exists already. Gating the assignment on the
+      // probe would silently drop the container off that network.
+      if (config.networkName) {
+        if (typeof containers.ensureNetwork === "function") {
+          await containers.ensureNetwork(config.networkName);
+        }
         containerConfig.networkMode = config.networkName;
       }
       // A 0.0.0.0-published port is reached on 127.0.0.1 or via the host
@@ -493,13 +498,19 @@ export default (app: App) => {
     // endpoint from whatever address signalk-container reports.
     containerConfig.signalkAccessiblePorts = QUESTDB_ACCESSIBLE_PORTS;
     return async () => {
+      // The two are feature-detected SEPARATELY. Requiring both would skip
+      // attachment entirely on a signalk-container that has connectToNetwork
+      // but not ensureNetwork -- and there the network almost certainly
+      // already exists, so attaching still works. Creating it is the
+      // optional step; joining it is the one Grafana depends on.
       if (
         config.networkName &&
-        typeof containers.ensureNetwork === "function" &&
         typeof containers.connectToNetwork === "function"
       ) {
         try {
-          await containers.ensureNetwork(config.networkName);
+          if (typeof containers.ensureNetwork === "function") {
+            await containers.ensureNetwork(config.networkName);
+          }
           await containers.connectToNetwork(name, config.networkName);
         } catch (err) {
           // Non-fatal: SK->QuestDB does not depend on this network; only the
