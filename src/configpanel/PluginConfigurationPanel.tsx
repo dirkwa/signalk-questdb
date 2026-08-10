@@ -15,6 +15,8 @@ import type {
 } from "../api-contract.js";
 import type { SkipPlan } from "../wal-monitor.js";
 import {
+  ActionStatus,
+  Button,
   StatusCard,
   VersionSelect,
   useVersions,
@@ -40,6 +42,11 @@ function apiText(value: string | undefined, fallback: string): string {
 }
 
 const COMPRESSIONS = ["none", "lz4", "zstd"] as const;
+
+// The update row's buttons sit inline with status text, so they run smaller
+// than a form button. Not the helper's `small` (4px 10px / 11px) — that is a
+// shade tighter than what this row was built around.
+const UPDATE_BTN = { padding: "4px 12px", fontSize: 12 } as const;
 
 /** A <select> value is `string` to the type system; narrow it back. */
 function toCompression(value: string): Compression {
@@ -681,17 +688,15 @@ export default function PluginConfigurationPanel({
                   </div>
                 ))}
               <div style={{ marginTop: 10 }}>
-                <button
-                  style={{
-                    ...S.btn,
-                    ...S.btnPrimary,
-                    ...(resuming || skipping ? S.btnDisabled : {}),
-                  }}
-                  disabled={resuming || skipping}
+                <Button
+                  variant="primary"
+                  busy={resuming}
+                  busyLabel="Resuming..."
+                  disabled={skipping}
                   onClick={handleResumeWal}
                 >
-                  {resuming ? "Resuming..." : "Resume recording"}
-                </button>
+                  Resume recording
+                </Button>
               </div>
               {suspendedTables
                 .filter((t) => t.autoResume === "failed")
@@ -750,21 +755,15 @@ export default function PluginConfigurationPanel({
                           )} txns) is replayed without loss`}
                       .
                       <div style={{ marginTop: 8 }}>
-                        <button
-                          style={{
-                            ...S.btn,
-                            ...S.btnDanger,
-                            ...(skipping || resuming || walDiagStale
-                              ? S.btnDisabled
-                              : {}),
-                          }}
-                          disabled={skipping || resuming || walDiagStale}
+                        <Button
+                          variant="danger"
+                          busy={skipping}
+                          busyLabel="Skipping..."
+                          disabled={resuming || walDiagStale}
                           onClick={() => handleSkipWal(t.name, plan)}
                         >
-                          {skipping
-                            ? "Skipping..."
-                            : "Skip unreadable segment (loses data)"}
-                        </button>
+                          Skip unreadable segment (loses data)
+                        </Button>
                         {walDiagStale && (
                           <div style={{ marginTop: 6, fontSize: 12 }}>
                             The diagnosis could not be refreshed — the numbers
@@ -915,40 +914,30 @@ export default function PluginConfigurationPanel({
                   v{updateInfo.currentVersion} &rarr;{" "}
                   <strong>v{updateInfo.latestVersion}</strong> available
                 </span>
-                <button
-                  style={{
-                    ...S.btn,
-                    ...S.btnPrimary,
-                    padding: "4px 12px",
-                    fontSize: 12,
-                    ...(updating ? S.btnDisabled : {}),
-                  }}
+                <Button
+                  variant="primary"
+                  busy={updating}
+                  busyLabel="Updating..."
                   onClick={applyUpdate}
-                  disabled={updating}
+                  style={UPDATE_BTN}
                 >
-                  {updating ? "Updating..." : "Update QuestDB"}
-                </button>
+                  Update QuestDB
+                </Button>
               </>
             ) : updateInfo && !updateInfo.updateAvailable ? (
               <span style={{ fontSize: 12, color: "#888" }}>
                 v{updateInfo.currentVersion} (up to date)
               </span>
             ) : (
-              <button
-                style={{
-                  ...S.btn,
-                  padding: "4px 12px",
-                  fontSize: 12,
-                  background: "#f1f5f9",
-                  color: "#475569",
-                  border: "1px solid #e2e8f0",
-                  ...(checkingUpdate ? S.btnDisabled : {}),
-                }}
+              <Button
+                variant="secondary"
+                busy={checkingUpdate}
+                busyLabel="Checking..."
                 onClick={checkForUpdate}
-                disabled={checkingUpdate}
+                style={UPDATE_BTN}
               >
-                {checkingUpdate ? "Checking..." : "Check for updates"}
-              </button>
+                Check for updates
+              </Button>
             )}
           </div>
         </>
@@ -1332,17 +1321,14 @@ export default function PluginConfigurationPanel({
             marginBottom: 10,
           }}
         >
-          <button
-            style={{
-              ...S.btn,
-              ...S.btnPrimary,
-              ...(migrationDetecting ? S.btnDisabled : {}),
-            }}
+          <Button
+            variant="primary"
+            busy={migrationDetecting}
+            busyLabel="Detecting..."
             onClick={detectMigration}
-            disabled={migrationDetecting}
           >
-            {migrationDetecting ? "Detecting..." : "Detect InfluxDB"}
-          </button>
+            Detect InfluxDB
+          </Button>
           <span style={S.hint}>
             Checks localhost:8086 for InfluxDB 1.x and 2.x
           </span>
@@ -1435,17 +1421,14 @@ export default function PluginConfigurationPanel({
           </select>
         </div>
 
-        <button
-          style={{
-            ...S.btn,
-            ...S.btnPrimary,
-            ...(exporting ? S.btnDisabled : {}),
-          }}
+        <Button
+          variant="primary"
+          busy={exporting}
+          busyLabel="Exporting..."
           onClick={doExport}
-          disabled={exporting}
         >
-          {exporting ? "Exporting..." : "Export Data"}
-        </button>
+          Export Data
+        </Button>
       </CollapsibleSection>
 
       {cfg.managedContainer !== false && (
@@ -1455,38 +1438,29 @@ export default function PluginConfigurationPanel({
             data. Use this to fully reset QuestDB — Signal K's plugin-uninstall
             cannot delete this data on rootless Podman. This cannot be undone.
           </div>
-          <button
-            style={{
-              ...S.btn,
-              ...S.btnDanger,
-              ...(purging ? S.btnDisabled : {}),
-            }}
+          <Button
+            variant="danger"
+            busy={purging}
+            busyLabel="Removing..."
             onClick={purgeData}
-            disabled={purging}
           >
-            {purging ? "Removing..." : "Remove container & all data"}
-          </button>
+            Remove container &amp; all data
+          </Button>
         </CollapsibleSection>
       )}
 
       {/* Status */}
-      {actionStatus && (
-        <div
-          style={{
-            ...S.status,
-            color: statusError ? "#ef4444" : "#10b981",
-            marginTop: 16,
-          }}
-        >
-          {actionStatus}
-        </div>
-      )}
+      <ActionStatus
+        message={actionStatus}
+        error={statusError}
+        style={{ marginTop: 16 }}
+      />
 
       {/* Save */}
       <div style={{ marginTop: 24 }}>
-        <button style={{ ...S.btn, ...S.btnSave }} onClick={doSave}>
+        <Button style={S.btnSave} onClick={doSave}>
           Save Configuration
-        </button>
+        </Button>
       </div>
     </div>
   );
