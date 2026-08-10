@@ -9,6 +9,9 @@ import { panelStyles } from "signalk-container-helper/ui";
 // to the shared look reaches every panel at once instead of drifting per
 // plugin.
 //
+// sectionToggle/sectionMarker are gone: the helper carries them as of 0.4.1,
+// so the #123 affordance fix now lives in one place for every panel.
+//
 // btnDanger deliberately takes the HELPER's version rather than this panel's
 // former larger padding/fontSize. Converging on the shared sizing is the point
 // of adopting panelStyles, and both call sites — skipping a WAL segment and
@@ -16,28 +19,6 @@ import { panelStyles } from "signalk-container-helper/ui";
 export const S = {
   ...panelStyles,
 
-  // Chrome for a CollapsibleSection's header button. Spread OVER sectionTitle,
-  // so the `color` here deliberately overrides that block's `#888`: a
-  // collapsed section hides real settings, and at #888 the header read as a
-  // muted caption rather than something to click — a user reported the path
-  // filter as uneditable when it was only collapsed (issue #123). #555 is the
-  // same colour as `label`, i.e. the panel's "this is an actual control" tone.
-  sectionToggle: {
-    color: "#555",
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    width: "100%",
-    textAlign: "left",
-    background: "none",
-    border: "none",
-    padding: 0,
-    cursor: "pointer",
-    userSelect: "none",
-  },
-  // The ▶ disclosure triangle. `transform` stays at the call site because it
-  // is derived from open/closed state.
-  sectionMarker: { fontSize: 11, transition: "transform 0.15s" },
   btnSave: { background: "#3b82f6", color: "#fff" },
   warnBannerCode: {
     display: "block",

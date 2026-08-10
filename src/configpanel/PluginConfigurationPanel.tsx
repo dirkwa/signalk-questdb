@@ -17,10 +17,12 @@ import type { SkipPlan } from "../wal-monitor.js";
 import {
   ActionStatus,
   Button,
-  useStatusPoll,
+  CollapsibleSection,
+  formatNumber,
   StatusCard,
-  VersionSelect,
+  useStatusPoll,
   useVersions,
+  VersionSelect,
 } from "signalk-container-helper/ui";
 import { S } from "./styles.js";
 import { toMigrationSources } from "./responses.js";
@@ -54,63 +56,6 @@ function toCompression(value: string): Compression {
   return (COMPRESSIONS as readonly string[]).includes(value)
     ? (value as Compression)
     : "lz4";
-}
-
-function CollapsibleSection({
-  title,
-  defaultOpen = false,
-  children,
-}: {
-  title: string;
-  /**
-   * Initial state only \u2014 seeded once on mount, exactly like the config-derived
-   * state in the panel below. Deliberately NOT kept in sync with an effect: a
-   * section that opens because it has content would then snap shut the moment
-   * the user cleared the field, fighting them mid-edit.
-   *
-   * This holds only because the host has the configuration in hand before the
-   * panel mounts: signalk-server seeds it via `useState(plugin.data.configuration)`
-   * and passes it straight down, so there is no render where it is absent and
-   * then arrives. A caller deriving this from data fetched inside the panel
-   * would seed `false` forever and silently lose the behaviour.
-   */
-  defaultOpen?: boolean;
-  children: React.ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <div>
-      {/* A real <button> so keyboard users can toggle with Enter/Space and
-          screen readers announce expanded state. sectionToggle resets the
-          default button chrome but keeps a darker colour than a plain heading,
-          so it reads as a control \u2014 at sectionTitle's grey it did not, and the
-          settings inside looked absent rather than collapsed (issue #123). */}
-      <button
-        type="button"
-        aria-expanded={open}
-        style={{ ...S.sectionTitle, ...S.sectionToggle }}
-        onClick={() => setOpen(!open)}
-      >
-        <span
-          style={{
-            ...S.sectionMarker,
-            transform: open ? "rotate(90deg)" : "rotate(0deg)",
-          }}
-        >
-          {"\u25b6"}
-        </span>
-        {title}
-      </button>
-      {open && <div style={{ marginBottom: 16 }}>{children}</div>}
-    </div>
-  );
-}
-
-function formatNumber(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
-  return String(n);
 }
 
 interface PluginConfigurationPanelProps {
