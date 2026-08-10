@@ -7,7 +7,6 @@ import type {
   ApiError,
   DbStatus,
   MigrationSource,
-  QuestdbVersion,
   ResumeWalResponse,
   SkipWalResponse,
   UpdateApplyResponse,
@@ -15,9 +14,13 @@ import type {
   WalDiagnosis,
 } from "../api-contract.js";
 import type { SkipPlan } from "../wal-monitor.js";
-import { VersionSelect } from "signalk-container-helper/ui";
+import {
+  StatusCard,
+  VersionSelect,
+  useVersions,
+} from "signalk-container-helper/ui";
 import { S } from "./styles.js";
-import { toMigrationSources, toVersionList } from "./responses.js";
+import { toMigrationSources } from "./responses.js";
 
 type FilterMode = Config["pathFilter"]["mode"];
 type Compression = Config["compression"];
@@ -186,8 +189,15 @@ export default function PluginConfigurationPanel({
     cfg.exposeToContainers || false,
   );
 
-  const [versions, setVersions] = useState<QuestdbVersion[]>([]);
-  const [versionsLoading, setVersionsLoading] = useState(false);
+  // useVersions keeps the last good list when a fetch fails. The local
+  // version wiped it: a 200 carrying non-JSON set `versions` to [], and an
+  // empty dropdown is what lets a Save silently change the running image.
+  const {
+    versions,
+    versionsError,
+    loading: versionsLoading,
+    refresh: fetchVersions,
+  } = useVersions("/plugins/signalk-questdb/api/versions");
   const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const [migrationSources, setMigrationSources] = useState<
@@ -214,22 +224,6 @@ export default function PluginConfigurationPanel({
   // overwriting fresher data.
   const walDiagGen = useRef(0);
   const [skipping, setSkipping] = useState(false);
-
-  const fetchVersions = useCallback(async () => {
-    setVersionsLoading(true);
-    try {
-      const res = await fetch("/plugins/signalk-questdb/api/versions");
-      if (res.ok) {
-        // `.catch(() => null)` for the same reason as the migration probe:
-        // a 200 that is not JSON should leave the dropdown empty, not
-        // depend on the bare catch below to swallow a parse error.
-        setVersions(toVersionList(await res.json().catch(() => null)));
-      }
-    } catch {
-      // offline or error
-    }
-    setVersionsLoading(false);
-  }, []);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -496,12 +490,12 @@ export default function PluginConfigurationPanel({
     setMigrationDetecting(false);
   };
 
+  // useVersions fetches on mount itself; only the status poll is ours.
   useEffect(() => {
-    fetchVersions();
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
+    void fetchStatus();
+    const interval = setInterval(() => void fetchStatus(), 5000);
     return () => clearInterval(interval);
-  }, [fetchVersions, fetchStatus]);
+  }, [fetchStatus]);
 
   const [exportFrom, setExportFrom] = useState("");
   const [exportTo, setExportTo] = useState("");
@@ -862,27 +856,20 @@ export default function PluginConfigurationPanel({
               .
             </div>
           )}
-          <div style={S.card}>
-            <div
-              style={{ ...S.cardIcon, background: "#7c3aed", color: "#fff" }}
-            >
-              Q
-            </div>
-            <div style={S.cardInfo}>
-              <div style={S.cardTitle}>QuestDB</div>
-              <div style={S.cardMeta}>
+          <StatusCard
+            icon="Q"
+            iconBackground="#7c3aed"
+            iconColor="#fff"
+            title="QuestDB"
+            meta={
+              <>
                 {dbStatus?.endpoint || `${questdbHost}:${questdbHttpPort}`}{" "}
                 &middot; {walSuspended ? "WAL suspended" : "Recording"}
-              </div>
-            </div>
-            <div
-              style={{
-                ...S.stateIndicator,
-                background: walSuspended ? "#ef4444" : "#10b981",
-              }}
-              title={walSuspended ? "WAL suspended" : "Running"}
-            />
-          </div>
+              </>
+            }
+            state={walSuspended ? "error" : "ok"}
+            stateTitle={walSuspended ? "WAL suspended" : "Running"}
+          />
 
           <div style={S.statsGrid}>
             <div style={S.statCard}>
@@ -966,23 +953,22 @@ export default function PluginConfigurationPanel({
           </div>
         </>
       ) : (
-        <div style={S.card}>
-          <div
-            style={{ ...S.cardIcon, background: "#fef2f2", color: "#ef4444" }}
-          >
-            Q
-          </div>
-          <div style={S.cardInfo}>
-            <div style={S.cardTitle}>QuestDB</div>
-            <div style={S.cardMeta}>
+        // No explicit icon colours: the error state supplies the shared
+        // muted-red treatment, which is where the local #fef2f2/#ef4444 pair
+        // came from in the first place.
+        <StatusCard
+          icon="Q"
+          title="QuestDB"
+          meta={
+            <>
               {dbStatus?.status === "unhealthy"
                 ? "Not responding"
                 : "Not running"}
               {managedContainer ? " — enable plugin to start container" : ""}
-            </div>
-          </div>
-          <div style={{ ...S.stateIndicator, background: "#ef4444" }} />
-        </div>
+            </>
+          }
+          state="error"
+        />
       )}
 
       {/* Image Version */}
@@ -1002,7 +988,8 @@ export default function PluginConfigurationPanel({
           onChange={setQuestdbVersion}
           versions={versions}
           loading={versionsLoading}
-          onRefresh={fetchVersions}
+          onRefresh={() => void fetchVersions()}
+          error={versionsError}
           stableCount={3}
           preCount={2}
         />
