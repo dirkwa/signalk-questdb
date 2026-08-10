@@ -1167,7 +1167,14 @@ export default function PluginConfigurationPanel({
       {/* Open on mount when patterns are already configured, so a user who has
           set filtering sees it rather than a collapsed header. Keyed on the
           paths, not the mode: mode defaults to "exclude" and is never empty,
-          so keying on it would open this for everyone and say nothing. */}
+          so keying on it would open this for everyone and say nothing.
+
+          defaultOpen is read ONCE, on mount. That works here only because the
+          host has the configuration in hand before the panel renders —
+          signalk-server seeds it via useState(plugin.data.configuration) and
+          passes it straight down, so there is no render where it is absent
+          and then arrives. Deriving this from anything the panel fetches
+          itself would seed false forever and lose the behaviour silently. */}
       <CollapsibleSection
         title="Path filtering"
         defaultOpen={filterPaths.trim() !== ""}
@@ -1393,9 +1400,7 @@ export default function PluginConfigurationPanel({
 
       {/* Save */}
       <div style={{ marginTop: 24 }}>
-        <Button style={S.btnSave} onClick={doSave}>
-          Save Configuration
-        </Button>
+        <Button onClick={doSave}>Save Configuration</Button>
       </div>
     </div>
   );

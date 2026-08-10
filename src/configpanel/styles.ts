@@ -19,7 +19,6 @@ import { panelStyles } from "signalk-container-helper/ui";
 export const S = {
   ...panelStyles,
 
-  btnSave: { background: "#3b82f6", color: "#fff" },
   warnBannerCode: {
     display: "block",
     marginTop: 8,
