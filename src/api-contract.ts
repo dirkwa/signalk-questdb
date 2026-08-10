@@ -66,6 +66,27 @@ export interface DbStatus extends ApiError {
    * display name gets an empty statusMessage and the count would be invisible.
    */
   restore?: RestoreStatus | null;
+  /**
+   * Paths seen carrying a value no table can hold — arrays, or objects nested
+   * deeper than the one level that gets flattened. Absent when nothing has
+   * been dropped. Surfaced because the previous behaviour was to drop them
+   * silently, which is how attitude went unrecorded unnoticed (issue #128).
+   */
+  unstorable?: UnstorableStatus | null;
+}
+
+/** Values encountered that cannot be represented in any table. */
+export interface UnstorableStatus {
+  /**
+   * Distinct paths dropped since the plugin started. A LOWER BOUND when
+   * `truncated` is set: tracking is capped, because Signal K paths embed
+   * instance and vessel identifiers and so are not a bounded vocabulary.
+   */
+  paths: number;
+  /** True once the cap was hit and further distinct paths stopped being kept. */
+  truncated: boolean;
+  /** A sample of those paths, for identifying them without reading logs. */
+  examples: string[];
 }
 
 /** Startup-restore outcome, shown on the config panel. */
