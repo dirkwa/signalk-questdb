@@ -15,6 +15,7 @@ import type {
   WalDiagnosis,
 } from "../api-contract.js";
 import type { SkipPlan } from "../wal-monitor.js";
+import { VersionSelect } from "signalk-container-helper/ui";
 import { S } from "./styles.js";
 import { toMigrationSources, toVersionList } from "./responses.js";
 
@@ -615,10 +616,6 @@ export default function PluginConfigurationPanel({
   const maxMapCount =
     (dbStatus?.hostMaxMapCount?.tooLow && dbStatus.hostMaxMapCount) || null;
 
-  // Build version options: latest first, then pre-releases, then stable
-  const stableVersions = versions.filter((v) => !v.prerelease).slice(0, 3);
-  const preVersions = versions.filter((v) => v.prerelease).slice(0, 2);
-
   return (
     <div style={S.root}>
       {/* QuestDB Status */}
@@ -993,36 +990,22 @@ export default function PluginConfigurationPanel({
 
       <div style={S.fieldRow}>
         <span style={S.label}>QuestDB version</span>
-        <select
-          style={S.select}
+        {/* The hand-rolled <select> had no option for a value outside the
+            listed releases. A pinned tag that aged out of the top 3 — or any
+            tag at all when GitHub rate-limited the listing and `versions` came
+            back empty — rendered the box blank on "latest", and doSave writes
+            questdbVersion unconditionally, so the next Save silently changed
+            the running image. VersionSelect injects a synthetic
+            "<tag> (running)" option instead. */}
+        <VersionSelect
           value={questdbVersion}
-          onChange={(e) => setQuestdbVersion(e.target.value)}
-        >
-          <option value="latest">latest (recommended)</option>
-          {preVersions.map((v) => (
-            <option key={v.tag} value={v.tag}>
-              {v.tag} (pre-release)
-            </option>
-          ))}
-          {stableVersions.map((v, i) => (
-            <option key={v.tag} value={v.tag}>
-              {v.tag}
-              {i === 0 ? " (current stable)" : ""}
-            </option>
-          ))}
-        </select>
-        {versionsLoading && <span style={S.hint}>loading releases...</span>}
-        <button
-          style={{
-            ...S.btn,
-            ...S.btnPrimary,
-            padding: "4px 10px",
-            fontSize: 11,
-          }}
-          onClick={fetchVersions}
-        >
-          ↻
-        </button>
+          onChange={setQuestdbVersion}
+          versions={versions}
+          loading={versionsLoading}
+          onRefresh={fetchVersions}
+          stableCount={3}
+          preCount={2}
+        />
       </div>
 
       {/* Connection Settings */}
