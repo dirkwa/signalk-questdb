@@ -1,4 +1,5 @@
 import { IRouter } from "express";
+import { waitForContainerManager } from "signalk-container-helper";
 import type {
   ContainerConfig,
   ContainerManagerApi,
@@ -274,6 +275,14 @@ export default (app: App) => {
   // without creating resources, so an aborted start can't resurrect a
   // just-purged container.
   let startAbort: AbortController | null = null;
+
+  // How long a start waits for signalk-container to publish its API and for
+  // runtime detection to settle. Generous because both are one-off startup
+  // costs on a cold boot — signalk-container may still be pulling its own
+  // image — and the alternative to waiting is a spurious "plugin required"
+  // error on a system that has it. A purge aborts the wait, so a wedged start
+  // does not hold the lock for this long.
+  const CONTAINER_MANAGER_TIMEOUT_MS = 120000;
 
   // How long purge waits to acquire the lifecycle lock before proceeding
   // anyway. After this it forces its teardown through even if a hung start
@@ -782,8 +791,27 @@ export default (app: App) => {
     };
 
     if (config.managedContainer !== false) {
-      const containers = (globalThis as any).__signalk_containerManager as
-        ContainerManagerApi | undefined;
+      // Two phases in one call: poll for the manager global, then wait for
+      // runtime detection to settle. The previous code read the global ONCE,
+      // synchronously — which worked only because plugins start in
+      // alphabetical order and "signalk-questdb" sorts after
+      // "signalk-container". Any rename, or a slower container start, and the
+      // plugin reported "signalk-container required" on a system that has it.
+      //
+      // The signal is threaded through so a purge preempting a start stops
+      // the poll immediately rather than waiting out the full budget.
+      app.setPluginStatus("Waiting for signalk-container plugin...");
+      const { manager: containers, runtime } = await waitForContainerManager({
+        timeoutMs: CONTAINER_MANAGER_TIMEOUT_MS,
+        signal,
+        onWaiting: (phase) => {
+          if (phase === "runtime")
+            app.setPluginStatus("Waiting for container runtime detection...");
+        },
+      });
+      // Purge may have preempted us while the wait was pending; bail before
+      // touching the runtime so we don't recreate what purge is removing.
+      if (signal.aborted) return;
 
       if (!containers) {
         app.debug("containerManager not found");
@@ -793,13 +821,7 @@ export default (app: App) => {
         return;
       }
 
-      app.setPluginStatus("Waiting for container runtime detection...");
-      await containers.whenReady();
-      // Purge may have preempted us while whenReady() was pending; bail before
-      // touching the runtime so we don't recreate what purge is removing.
-      if (signal.aborted) return;
-
-      if (!containers.getRuntime()) {
+      if (!runtime) {
         app.debug("container runtime not detected");
         publishError(
           "No container runtime detected. Check signalk-container plugin.",
