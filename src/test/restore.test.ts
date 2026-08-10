@@ -479,6 +479,67 @@ describe("restore: query shape", () => {
     assert.ok(!captured[1].sql.includes("CAST(value_kind AS STRING)"));
   });
 
+  it("still restores a NAME through the value_kind fallback", async () => {
+    // The fallback query cannot read value_kind, so it used to report NULL —
+    // which failed the `kind === "identity"` gate and replayed every vessel
+    // name as a literal `name` path instead of the empty-path object
+    // Freeboard reads. On an unmigrated table that left targets unnamed for
+    // the same visible reason as #127.
+    let calls = 0;
+    const deltas: RestoredDelta[] = [];
+    const dataset: Row[] = [
+      position(AIS, 60_000),
+      [ago(6 * 3_600_000), "name", AIS, "SEA BREEZE", null] as Row,
+    ];
+
+    await restoreFromHistory(
+      {
+        queryClient: {
+          exec: async (sql: string) => {
+            if (++calls === 1) throw new Error("Invalid column: value_kind");
+            assert.ok(
+              sql.includes("THEN 'identity'"),
+              "fallback must synthesize the identity kind for the name path",
+            );
+            return {
+              columns: [],
+              dataset,
+              count: dataset.length,
+              timestamp: 0,
+            };
+          },
+          toObjects: (r: { dataset: unknown[][] }) =>
+            r.dataset.map((row) => ({
+              ts: row[0],
+              path: row[1],
+              context: row[2],
+              valuetext: row[3],
+              // What the CASE expression yields for a `name` row.
+              kind: row[1] === "name" ? "identity" : row[4],
+            })),
+        } as unknown as RestoreDeps["queryClient"],
+        handleMessage: (d) => deltas.push(d as RestoredDelta),
+        selfContext: SELF,
+        debug: () => {},
+      },
+      {
+        maxAgeMs: 9 * 60_000,
+        restoreSelf: true,
+        restoreOthers: true,
+        now: () => NOW,
+      },
+    );
+
+    assert.equal(calls, 2, "the fallback query must have run");
+    assert.equal(deltas.length, 1);
+    const named = allValues(deltas[0]).find((v) => v.path === "");
+    assert.deepEqual(
+      named?.value,
+      { name: "SEA BREEZE" },
+      "the name must replay as an empty-path object, not a `name` path",
+    );
+  });
+
   it("propagates a non-schema query error instead of masking it", async () => {
     await assert.rejects(
       restoreFromHistory(

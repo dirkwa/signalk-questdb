@@ -169,7 +169,17 @@ function snapshotSQL(
 ): string {
   const motion = sqlList(MOTION_PATHS);
   const identity = sqlList(IDENTITY_PATHS);
-  const kind = withKind ? `CAST(value_kind AS STRING)` : `CAST(NULL AS STRING)`;
+  // Without the column, synthesize "identity" for the synthetic `name` path
+  // rather than NULL. NULL failed the `kind === "identity"` gate below, so on
+  // a table predating value_kind every vessel name replayed as a literal
+  // `name` path instead of the empty-path object Freeboard reads — restoring
+  // targets that were, again, unnamed. The substitution is sound because that
+  // path is only ever written by the identity writer; a data path genuinely
+  // called "name" would be a different (non-synthetic) row, and on an
+  // unmigrated table there is no way to tell them apart anyway.
+  const kind = withKind
+    ? `CAST(value_kind AS STRING)`
+    : `CASE WHEN path = 'name' THEN 'identity' ELSE CAST(NULL AS STRING) END`;
 
   // Each window is applied to its own path set, and the two are unioned. The
   // alternative — one `ts >= earliest` scan with a CASE per row — would drag
