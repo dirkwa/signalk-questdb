@@ -83,7 +83,15 @@ export function extractVesselName(path: string, value: unknown): string | null {
 }
 
 export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
-  if (typeof value === "number") return "number";
+  // NaN and ±Infinity have no ILP representation. QuestDB does NOT reject
+  // them — verified against a live instance, `value=NaN` is accepted and
+  // stored — so an unguarded sensor fault silently poisons the numeric
+  // column, and every aggregate over that path afterwards. A source
+  // reporting a non-finite number is reporting "no reading", which is what
+  // recording nothing means. flattenObjectValue already applied this to
+  // leaves; the top-level path has to agree.
+  if (typeof value === "number")
+    return Number.isFinite(value) ? "number" : null;
   if (typeof value === "string") return "string";
   // Booleans are everywhere in Signal K — switch and relay states, pump and
   // valve states, autopilot flags — and used to fall through to null, so a

@@ -99,6 +99,24 @@ describe("routeDeltaValue", () => {
     }
   });
 
+  it("refuses non-finite top-level numbers", () => {
+    // QuestDB does NOT reject these — verified live, `value=NaN` is accepted
+    // and stored — so recording one poisons the column and every aggregate
+    // over that path. A source reporting NaN is reporting "no reading".
+    for (const value of [NaN, Infinity, -Infinity]) {
+      assert.strictEqual(
+        routeDeltaValue("environment.depth.belowKeel", value),
+        null,
+        String(value),
+      );
+    }
+    assert.strictEqual(
+      routeDeltaValue("environment.depth.belowKeel", 4.2),
+      "number",
+      "finite numbers are unaffected",
+    );
+  });
+
   it("does not flatten arrays", () => {
     // Array indices are not stable identities, so `foo.0` would mean a
     // different thing from one delta to the next.
