@@ -88,9 +88,12 @@ describe("routeDeltaValue", () => {
       { latitude: "52.5", longitude: 13.4 },
       { latitude: 52.5, longitude: Infinity },
     ]) {
-      assert.notStrictEqual(
+      // Asserts "flatten", not merely "not position": the weaker form would
+      // also pass if these regressed to being dropped entirely, which is the
+      // bug this whole change exists to fix.
+      assert.strictEqual(
         routeDeltaValue("navigation.position", value),
-        "position",
+        "flatten",
         JSON.stringify(value),
       );
     }

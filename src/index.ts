@@ -1169,6 +1169,16 @@ export default (app: App) => {
       // effective sampling rate.
       const route = routeDeltaValue(path, value);
 
+      // Recorded BEFORE the gates. A value nothing can store is worth
+      // reporting whether or not the user also filters or throttles that
+      // path — and gating it first would hide exactly the case this exists to
+      // surface, since a throttled array would return here and never be
+      // counted.
+      if (route === null) {
+        noteUnstorable(path);
+        return;
+      }
+
       if (route !== "flatten") {
         if (!shouldRecord(path, config.pathFilter.mode)) return;
         // Throttled per path AND context: the sampling rate bounds each
@@ -1251,9 +1261,6 @@ export default (app: App) => {
             writer.writeString(leaf.path, ctx, leaf.value);
           }
         }
-      } else {
-        // Arrays, and anything else with no representation.
-        noteUnstorable(path);
       }
     });
     unsubscribes.push(unsub);
