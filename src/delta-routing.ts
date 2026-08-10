@@ -4,9 +4,21 @@
 // navigation.position exclusively. Other lat/lon-object paths — e.g.
 // navigation.anchor.position, which anchor plugins re-emit on every fix
 // while watching — would interleave with the real track and make history
-// reads zig-zag between boat and anchor. Those (and all other objects)
-// return null: not recorded.
-export type DeltaRoute = "number" | "string" | "boolean" | "position" | null;
+// reads zig-zag between boat and anchor.
+//
+// Objects that are not navigation.position route to "flatten": each scalar
+// leaf is recorded as its own dotted path (issue #128). Before that,
+// every such object was dropped, silently — navigation.attitude
+// ({roll, pitch, yaw}) was never stored at all, and nothing said so.
+export type DeltaRoute =
+  "number" | "string" | "boolean" | "position" | "flatten" | null;
+
+/** One scalar leaf pulled out of an object value, ready to record. */
+export interface FlattenedLeaf {
+  /** Parent path plus the key, e.g. `navigation.attitude.roll`. */
+  path: string;
+  value: number | string | boolean;
+}
 
 // Static vessel identity arrives as EMPTY-path object deltas —
 // `{path: "", value: {name: "..."}}` is how AIS static reports reach the
@@ -42,5 +54,54 @@ export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
     Number.isFinite((value as { longitude: unknown }).longitude)
   )
     return "position";
+  // Any other non-null, non-array object: record its scalar leaves
+  // individually. Arrays are excluded deliberately — their indices are not
+  // stable identities, so `foo.0` would silently mean a different thing from
+  // one delta to the next.
+  if (value !== null && typeof value === "object" && !Array.isArray(value))
+    return "flatten";
   return null;
+}
+
+/**
+ * Scalar leaves of an object value, as dotted paths.
+ *
+ *   navigation.attitude {roll: 0.02, yaw: 1.57}
+ *     -> navigation.attitude.roll  0.02
+ *     -> navigation.attitude.yaw   1.57
+ *
+ * **One level deep, deliberately.** That covers attitude and effectively every
+ * real Signal K object, while a recursive walk would happily write out whole
+ * nested payloads (notifications, resource documents) that nobody asked to
+ * record. A nested object is therefore skipped, not descended into — and
+ * reported, so it is not another silent drop.
+ *
+ * The leaves are ordinary scalar paths, which is what makes this cheap: no
+ * schema change, and dedup, retention, sampling, path filtering and both
+ * history APIs apply to them unchanged.
+ */
+export function flattenObjectValue(
+  path: string,
+  value: unknown,
+): { leaves: FlattenedLeaf[]; skipped: string[] } {
+  const leaves: FlattenedLeaf[] = [];
+  const skipped: string[] = [];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { leaves, skipped };
+  }
+  for (const [key, leaf] of Object.entries(value as Record<string, unknown>)) {
+    const leafPath = `${path}.${key}`;
+    if (typeof leaf === "number") {
+      // NaN and ±Infinity have no ILP representation and would poison the
+      // column; a sensor reporting them is reporting "no reading".
+      if (Number.isFinite(leaf)) leaves.push({ path: leafPath, value: leaf });
+      else skipped.push(leafPath);
+    } else if (typeof leaf === "string" || typeof leaf === "boolean") {
+      leaves.push({ path: leafPath, value: leaf });
+    } else {
+      // Nested object, array, null or undefined.
+      skipped.push(leafPath);
+    }
+  }
+  return { leaves, skipped };
 }

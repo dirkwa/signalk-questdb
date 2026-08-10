@@ -3,7 +3,11 @@ import { ILPWriter } from "./ilp-writer.js";
 import { QueryClient, isReadOnlySQL } from "./query-client.js";
 import type { QuestDBResult } from "./query-client.js";
 import { Config, ConfigSchema, normalizeConfig } from "./config/schema.js";
-import { extractVesselName, routeDeltaValue } from "./delta-routing.js";
+import {
+  extractVesselName,
+  flattenObjectValue,
+  routeDeltaValue,
+} from "./delta-routing.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
 import { startRetention } from "./retention.js";
@@ -650,6 +654,27 @@ export default (app: App) => {
   let pathFilterMatcher: PathMatcher | null = null;
   let rateMatcher: RateMatcher | null = null;
 
+  // Paths carrying a value with no representation in any table: arrays, and
+  // objects nested below the one level `flattenObjectValue` descends. These
+  // used to vanish without any trace at all — the whole reason
+  // navigation.attitude went unnoticed until a user asked (issue #128) — so
+  // record them and surface the count on /api/status.
+  //
+  // A Set keyed on the path, not a counter: the interesting fact is WHICH
+  // paths cannot be stored, and it also bounds memory on a stream where the
+  // same unstorable value arrives every second forever.
+  const unstorablePaths = new Set<string>();
+
+  function noteUnstorable(path: string): void {
+    if (unstorablePaths.has(path)) return;
+    unstorablePaths.add(path);
+    // Logged once per path, on first sight: this is a stream, and a warning
+    // per delta would bury every other line in the log.
+    app.debug(
+      `no table can hold the value at "${path}" (array, or nested deeper than one level) — not recorded`,
+    );
+  }
+
   // Takes only the mode: the patterns themselves live in pathFilterMatcher,
   // compiled from this same config at start. Accepting a `paths` array here
   // would imply it is consulted when it is not.
@@ -1142,18 +1167,29 @@ export default (app: App) => {
       if (isSelf && !config.recordSelf) return;
       if (!isSelf && !config.recordOthers) return;
 
-      if (!shouldRecord(path, config.pathFilter.mode)) return;
-      // Throttled per path AND context: the sampling rate bounds each
-      // vessel's stream, not the fleet's (issue #93). The stored context
-      // ("self" vs raw) is the key, matching what the rows carry.
-      if (
-        isThrottled(
-          path,
-          isSelf ? "self" : context,
-          config.defaultSamplingRate ?? 2000,
+      // Routed once, before the gates, because object values are gated on
+      // their leaf paths instead — see the "flatten" branch below. Applying
+      // the parent's gates to those would be wrong twice over: an
+      // include-filter listing only `navigation.attitude.roll` would drop the
+      // parent before any leaf was seen, and the parent would consume a
+      // throttle slot the leaves then have to wait out again, halving the
+      // effective sampling rate.
+      const route = routeDeltaValue(path, value);
+
+      if (route !== "flatten") {
+        if (!shouldRecord(path, config.pathFilter.mode)) return;
+        // Throttled per path AND context: the sampling rate bounds each
+        // vessel's stream, not the fleet's (issue #93). The stored context
+        // ("self" vs raw) is the key, matching what the rows carry.
+        if (
+          isThrottled(
+            path,
+            isSelf ? "self" : context,
+            config.defaultSamplingRate ?? 2000,
+          )
         )
-      )
-        return;
+          return;
+      }
 
       // Rows are stamped with the server receive time, deliberately NOT the
       // delta's own timestamp: a boat is a set of independent clocks (GPS
@@ -1169,7 +1205,6 @@ export default (app: App) => {
       // original stamps (baked at write() time), so replay-idempotency holds.
       const ctx = isSelf ? "self" : context;
 
-      const route = routeDeltaValue(path, value);
       if (route === "number") {
         writer.write(path, ctx, value as number);
       } else if (route === "string") {
@@ -1190,6 +1225,42 @@ export default (app: App) => {
           ctx,
           value as { latitude: number; longitude: number },
         );
+      } else if (route === "flatten") {
+        // Object values are recorded as their scalar leaves (issue #128).
+        const { leaves, skipped } = flattenObjectValue(path, value);
+        for (const leafPath of skipped) noteUnstorable(leafPath);
+        if (leaves.length === 0) {
+          // An object whose every leaf was unstorable stores nothing, so the
+          // parent path is dropped as surely as before — just visibly now.
+          noteUnstorable(path);
+          return;
+        }
+        for (const leaf of leaves) {
+          // Filtered and throttled on the LEAF path, not the parent: the
+          // leaves are what the history API exposes, so excluding
+          // `navigation.attitude.yaw` has to actually exclude it. Throttling
+          // per leaf also keeps one object's sampling budget from being
+          // consumed by whichever key happened to be written first.
+          if (!shouldRecord(leaf.path, config.pathFilter.mode)) continue;
+          if (isThrottled(leaf.path, ctx, config.defaultSamplingRate ?? 2000))
+            continue;
+          if (typeof leaf.value === "number") {
+            writer.write(leaf.path, ctx, leaf.value);
+          } else if (typeof leaf.value === "boolean") {
+            writer.writeString(
+              leaf.path,
+              ctx,
+              leaf.value ? "true" : "false",
+              undefined,
+              "boolean",
+            );
+          } else {
+            writer.writeString(leaf.path, ctx, leaf.value);
+          }
+        }
+      } else {
+        // Arrays, and anything else with no representation.
+        noteUnstorable(path);
       }
     });
     unsubscribes.push(unsub);
@@ -1421,6 +1492,9 @@ export default (app: App) => {
       // restore count from the previous run.
       restoreSummary = null;
       restoreStatus = null;
+      // Same reason: a path that is unstorable under this config may not be
+      // under the next, and the log line should fire again if it is.
+      unstorablePaths.clear();
       pluginErrorActive = false;
 
       for (const unsub of unsubscribes) {
@@ -1646,6 +1720,17 @@ export default (app: App) => {
               ? `${questdbEndpoints.http.host}:${questdbEndpoints.http.port}`
               : null,
             restore: restoreStatus,
+            // Omitted entirely when nothing was dropped, so the panel can
+            // treat presence as "there is something to report".
+            unstorable:
+              unstorablePaths.size > 0
+                ? {
+                    paths: unstorablePaths.size,
+                    // Bounded: an unstorable path per delta on a busy stream
+                    // would otherwise put an unbounded list in a status body.
+                    examples: [...unstorablePaths].slice(0, 5),
+                  }
+                : null,
           } satisfies DbStatus);
         } catch (err) {
           res.status(500).json({

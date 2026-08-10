@@ -66,6 +66,21 @@ export interface DbStatus extends ApiError {
    * display name gets an empty statusMessage and the count would be invisible.
    */
   restore?: RestoreStatus | null;
+  /**
+   * Paths seen carrying a value no table can hold — arrays, or objects nested
+   * deeper than the one level that gets flattened. Absent when nothing has
+   * been dropped. Surfaced because the previous behaviour was to drop them
+   * silently, which is how attitude went unrecorded unnoticed (issue #128).
+   */
+  unstorable?: UnstorableStatus | null;
+}
+
+/** Values encountered that cannot be represented in any table. */
+export interface UnstorableStatus {
+  /** Number of distinct paths dropped since the plugin started. */
+  paths: number;
+  /** A sample of those paths, for identifying them without the debug log. */
+  examples: string[];
 }
 
 /** Startup-restore outcome, shown on the config panel. */
