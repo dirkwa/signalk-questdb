@@ -17,6 +17,7 @@ import type { SkipPlan } from "../wal-monitor.js";
 import {
   ActionStatus,
   Button,
+  useStatusPoll,
   StatusCard,
   VersionSelect,
   useVersions,
@@ -205,8 +206,21 @@ export default function PluginConfigurationPanel({
     loading: versionsLoading,
     refresh: fetchVersions,
   } = useVersions("/plugins/signalk-questdb/api/versions");
-  const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
-  const [statusLoading, setStatusLoading] = useState(true);
+  // Self-scheduling rather than setInterval: a response slower than the
+  // period cannot stack overlapping requests, and a generation counter drops
+  // stale responses that land after newer ones. The panel already did this
+  // for WAL diagnosis but not for status.
+  const {
+    status: dbStatus,
+    loading: statusLoading,
+    refresh: fetchStatus,
+  } = useStatusPoll<DbStatus>("/plugins/signalk-questdb/api/status", {
+    // Parsed even on non-2xx: the unhealthy 503 carries fields the panel
+    // must still surface (hostMaxMapCount — mmap exhaustion is one of the
+    // ways QuestDB becomes unhealthy).
+    fallback: { status: "not_running" },
+    intervalMs: 5000,
+  });
   const [migrationSources, setMigrationSources] = useState<
     MigrationSource[] | null
   >(null);
@@ -231,23 +245,6 @@ export default function PluginConfigurationPanel({
   // overwriting fresher data.
   const walDiagGen = useRef(0);
   const [skipping, setSkipping] = useState(false);
-
-  const fetchStatus = useCallback(async () => {
-    try {
-      const res = await fetch("/plugins/signalk-questdb/api/status");
-      // Parse the body on non-2xx too: the unhealthy 503 carries fields the
-      // panel must still surface (hostMaxMapCount — mmap exhaustion is one
-      // of the ways QuestDB becomes unhealthy). Unparseable bodies fall
-      // through to the plain not_running shape.
-      const body = (await res.json().catch(() => null)) as DbStatus | null;
-      setDbStatus(
-        body && typeof body === "object" ? body : { status: "not_running" },
-      );
-    } catch {
-      setDbStatus({ status: "not_running" });
-    }
-    setStatusLoading(false);
-  }, []);
 
   const fetchWalDiagnosis = useCallback(async (signal?: AbortSignal) => {
     const gen = ++walDiagGen.current;
@@ -496,13 +493,6 @@ export default function PluginConfigurationPanel({
     }
     setMigrationDetecting(false);
   };
-
-  // useVersions fetches on mount itself; only the status poll is ours.
-  useEffect(() => {
-    void fetchStatus();
-    const interval = setInterval(() => void fetchStatus(), 5000);
-    return () => clearInterval(interval);
-  }, [fetchStatus]);
 
   const [exportFrom, setExportFrom] = useState("");
   const [exportTo, setExportTo] = useState("");
