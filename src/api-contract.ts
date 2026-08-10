@@ -77,9 +77,15 @@ export interface DbStatus extends ApiError {
 
 /** Values encountered that cannot be represented in any table. */
 export interface UnstorableStatus {
-  /** Number of distinct paths dropped since the plugin started. */
+  /**
+   * Distinct paths dropped since the plugin started. A LOWER BOUND when
+   * `truncated` is set: tracking is capped, because Signal K paths embed
+   * instance and vessel identifiers and so are not a bounded vocabulary.
+   */
   paths: number;
-  /** A sample of those paths, for identifying them without the debug log. */
+  /** True once the cap was hit and further distinct paths stopped being kept. */
+  truncated: boolean;
+  /** A sample of those paths, for identifying them without reading logs. */
   examples: string[];
 }
 

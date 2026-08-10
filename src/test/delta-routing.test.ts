@@ -4,6 +4,7 @@ import {
   extractVesselName,
   flattenObjectValue,
   routeDeltaValue,
+  UnstorableTracker,
 } from "../delta-routing.js";
 
 describe("routeDeltaValue", () => {
@@ -189,6 +190,72 @@ describe("flattenObjectValue (issue #128)", () => {
       { path: "navigation.anchor.position.latitude", value: 12.05 },
       { path: "navigation.anchor.position.longitude", value: -61.75 },
     ]);
+  });
+});
+
+describe("UnstorableTracker (issue #128)", () => {
+  it("records each distinct path once", () => {
+    const t = new UnstorableTracker();
+    t.note("a.b");
+    t.note("a.b");
+    t.note("c.d");
+
+    assert.strictEqual(t.size, 2);
+    assert.strictEqual(t.truncated, false);
+    assert.deepStrictEqual(t.examples(5), ["a.b", "c.d"]);
+  });
+
+  it("stops retaining paths at the cap and says it truncated", () => {
+    // Signal K paths are NOT a bounded vocabulary — they embed instance
+    // identifiers (`watermaker.0.*`) and notifications embed per-vessel ones,
+    // so an unstorable shape on a busy AIS stream would grow an uncapped set
+    // for the lifetime of the process.
+    const t = new UnstorableTracker(3);
+    for (let i = 0; i < 100; i++) t.note(`notifications.vessel${i}.alarm`);
+
+    assert.strictEqual(t.size, 3, "must not grow past the cap");
+    assert.strictEqual(t.truncated, true);
+  });
+
+  it("is not truncated while exactly at the cap", () => {
+    // Off-by-one guard: the cap is how many are RETAINED, so filling it
+    // exactly is not yet a truncation.
+    const t = new UnstorableTracker(3);
+    t.note("a");
+    t.note("b");
+    t.note("c");
+
+    assert.strictEqual(t.size, 3);
+    assert.strictEqual(t.truncated, false);
+
+    t.note("d");
+    assert.strictEqual(t.truncated, true);
+  });
+
+  it("keeps deduplicating known paths after the cap is reached", () => {
+    // The cap must not turn into a leak of repeated work: a path already
+    // tracked stays a no-op, and re-noting it does not set truncated.
+    const t = new UnstorableTracker(2);
+    t.note("a");
+    t.note("b");
+    t.note("a");
+
+    assert.strictEqual(t.size, 2);
+    assert.strictEqual(t.truncated, false, "a known path is not a new one");
+  });
+
+  it("resets fully on clear", () => {
+    // The plugin clears this on stop: a path unstorable under one config may
+    // not be under the next, so nothing may carry across a restart.
+    const t = new UnstorableTracker(1);
+    t.note("a");
+    t.note("b");
+    assert.strictEqual(t.truncated, true);
+
+    t.clear();
+    assert.strictEqual(t.size, 0);
+    assert.strictEqual(t.truncated, false);
+    assert.deepStrictEqual(t.examples(5), []);
   });
 });
 

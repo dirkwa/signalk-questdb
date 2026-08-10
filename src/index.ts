@@ -7,6 +7,7 @@ import {
   extractVesselName,
   flattenObjectValue,
   routeDeltaValue,
+  UnstorableTracker,
 } from "./delta-routing.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
@@ -660,20 +661,12 @@ export default (app: App) => {
   // navigation.attitude went unnoticed until a user asked (issue #128) — so
   // record them and surface the count on /api/status.
   //
-  // A Set keyed on the path, not a counter: the interesting fact is WHICH
-  // paths cannot be stored, and it also bounds memory on a stream where the
-  // same unstorable value arrives every second forever.
-  const unstorablePaths = new Set<string>();
-
-  function noteUnstorable(path: string): void {
-    if (unstorablePaths.has(path)) return;
-    unstorablePaths.add(path);
-    // Logged once per path, on first sight: this is a stream, and a warning
-    // per delta would bury every other line in the log.
-    app.debug(
-      `no table can hold the value at "${path}" (array, or nested deeper than one level) — not recorded`,
-    );
-  }
+  // See UnstorableTracker: capped, and deliberately silent on the per-delta
+  // path. The diagnostic surfaces on /api/status, which is where a user will
+  // actually see it — this whole class of loss went unnoticed precisely
+  // because it was only ever visible in a log nobody had enabled (issue #128).
+  const unstorable = new UnstorableTracker();
+  const noteUnstorable = (path: string) => unstorable.note(path);
 
   // Takes only the mode: the patterns themselves live in pathFilterMatcher,
   // compiled from this same config at start. Accepting a `paths` array here
@@ -1493,8 +1486,8 @@ export default (app: App) => {
       restoreSummary = null;
       restoreStatus = null;
       // Same reason: a path that is unstorable under this config may not be
-      // under the next, and the log line should fire again if it is.
-      unstorablePaths.clear();
+      // under the next, so the count must not carry across a restart.
+      unstorable.clear();
       pluginErrorActive = false;
 
       for (const unsub of unsubscribes) {
@@ -1723,12 +1716,13 @@ export default (app: App) => {
             // Omitted entirely when nothing was dropped, so the panel can
             // treat presence as "there is something to report".
             unstorable:
-              unstorablePaths.size > 0
+              unstorable.size > 0
                 ? {
-                    paths: unstorablePaths.size,
-                    // Bounded: an unstorable path per delta on a busy stream
-                    // would otherwise put an unbounded list in a status body.
-                    examples: [...unstorablePaths].slice(0, 5),
+                    paths: unstorable.size,
+                    truncated: unstorable.truncated,
+                    // A handful is enough to identify the shape; the tracked
+                    // set is capped but still larger than a status body wants.
+                    examples: unstorable.examples(5),
                   }
                 : null,
           } satisfies DbStatus);

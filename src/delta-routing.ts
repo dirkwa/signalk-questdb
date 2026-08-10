@@ -20,6 +20,55 @@ export interface FlattenedLeaf {
   value: number | string | boolean;
 }
 
+/**
+ * Remembers which paths carried a value no table can hold, so the drop can be
+ * reported instead of happening in silence — the underlying bug behind #128.
+ *
+ * Capped, because the path vocabulary is NOT bounded: paths embed instance
+ * identifiers (`watermaker.0.*`) and notifications embed per-vessel ones, so
+ * an unstorable shape on a busy AIS stream would grow an uncapped set for the
+ * lifetime of the process. Past the cap the count still rises but no new path
+ * is retained, and `truncated` marks the count as a lower bound rather than
+ * letting it read as exact.
+ *
+ * Deliberately does no logging: `note()` runs per delta on a stream carrying
+ * 100+ values/sec, and building a message string there costs whether or not
+ * debug is enabled.
+ */
+export class UnstorableTracker {
+  private readonly paths = new Set<string>();
+  private capped = false;
+
+  constructor(private readonly cap = 50) {}
+
+  /** Records a path. Cheap and idempotent; safe to call per delta. */
+  note(path: string): void {
+    if (this.paths.has(path)) return;
+    if (this.paths.size >= this.cap) {
+      this.capped = true;
+      return;
+    }
+    this.paths.add(path);
+  }
+
+  get size(): number {
+    return this.paths.size;
+  }
+
+  get truncated(): boolean {
+    return this.capped;
+  }
+
+  examples(limit: number): string[] {
+    return [...this.paths].slice(0, limit);
+  }
+
+  clear(): void {
+    this.paths.clear();
+    this.capped = false;
+  }
+}
+
 // Static vessel identity arrives as EMPTY-path object deltas —
 // `{path: "", value: {name: "..."}}` is how AIS static reports reach the
 // server, and the exact shape Freeboard reads names from. These never make
