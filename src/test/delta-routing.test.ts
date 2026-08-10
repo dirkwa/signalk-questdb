@@ -99,6 +99,24 @@ describe("routeDeltaValue", () => {
     }
   });
 
+  it("refuses non-finite top-level numbers", () => {
+    // QuestDB does NOT reject these — verified live, `value=NaN` is accepted
+    // and stored — so recording one poisons the column and every aggregate
+    // over that path. A source reporting NaN is reporting "no reading".
+    for (const value of [NaN, Infinity, -Infinity]) {
+      assert.strictEqual(
+        routeDeltaValue("environment.depth.belowKeel", value),
+        null,
+        String(value),
+      );
+    }
+    assert.strictEqual(
+      routeDeltaValue("environment.depth.belowKeel", 4.2),
+      "number",
+      "finite numbers are unaffected",
+    );
+  });
+
   it("does not flatten arrays", () => {
     // Array indices are not stable identities, so `foo.0` would mean a
     // different thing from one delta to the next.
@@ -179,6 +197,20 @@ describe("flattenObjectValue (issue #128)", () => {
       const { leaves } = flattenObjectValue("a.b", value);
       assert.deepStrictEqual(leaves, [], JSON.stringify(value));
     }
+  });
+
+  it("yields nothing for an empty parent path", () => {
+    // Would otherwise build ".name" — a leading-dot path matching no Signal K
+    // path and no filter pattern. Empty-path deltas are AIS static reports,
+    // handled by extractVesselName; this function must not depend on the
+    // caller guarding that.
+    const { leaves, skipped } = flattenObjectValue("", {
+      name: "SEA BREEZE",
+      mmsi: "244813000",
+    });
+
+    assert.deepStrictEqual(leaves, []);
+    assert.deepStrictEqual(skipped, []);
   });
 
   it("records the anchor position's coordinates under its own path", () => {

@@ -479,6 +479,67 @@ describe("restore: query shape", () => {
     assert.ok(!captured[1].sql.includes("CAST(value_kind AS STRING)"));
   });
 
+  it("still restores a NAME through the value_kind fallback", async () => {
+    // The fallback query cannot read value_kind, so it used to report NULL —
+    // which failed the `kind === "identity"` gate and replayed every vessel
+    // name as a literal `name` path instead of the empty-path object
+    // Freeboard reads. On an unmigrated table that left targets unnamed for
+    // the same visible reason as #127.
+    let calls = 0;
+    const deltas: RestoredDelta[] = [];
+    const dataset: Row[] = [
+      position(AIS, 60_000),
+      [ago(6 * 3_600_000), "name", AIS, "SEA BREEZE", null] as Row,
+    ];
+
+    await restoreFromHistory(
+      {
+        queryClient: {
+          exec: async (sql: string) => {
+            if (++calls === 1) throw new Error("Invalid column: value_kind");
+            assert.ok(
+              sql.includes("THEN 'identity'"),
+              "fallback must synthesize the identity kind for the name path",
+            );
+            return {
+              columns: [],
+              dataset,
+              count: dataset.length,
+              timestamp: 0,
+            };
+          },
+          toObjects: (r: { dataset: unknown[][] }) =>
+            r.dataset.map((row) => ({
+              ts: row[0],
+              path: row[1],
+              context: row[2],
+              valuetext: row[3],
+              // What the CASE expression yields for a `name` row.
+              kind: row[1] === "name" ? "identity" : row[4],
+            })),
+        } as unknown as RestoreDeps["queryClient"],
+        handleMessage: (d) => deltas.push(d as RestoredDelta),
+        selfContext: SELF,
+        debug: () => {},
+      },
+      {
+        maxAgeMs: 9 * 60_000,
+        restoreSelf: true,
+        restoreOthers: true,
+        now: () => NOW,
+      },
+    );
+
+    assert.equal(calls, 2, "the fallback query must have run");
+    assert.equal(deltas.length, 1);
+    const named = allValues(deltas[0]).find((v) => v.path === "");
+    assert.deepEqual(
+      named?.value,
+      { name: "SEA BREEZE" },
+      "the name must replay as an empty-path object, not a `name` path",
+    );
+  });
+
   it("propagates a non-schema query error instead of masking it", async () => {
     await assert.rejects(
       restoreFromHistory(
@@ -502,5 +563,90 @@ describe("restore: query shape", () => {
       ),
       /connection refused/,
     );
+  });
+});
+
+describe("identity is restored over a longer window than motion (issue #127)", () => {
+  // A vessel's AIS static report — the one carrying its name — repeats only
+  // every ~6 minutes, while position arrives every few seconds. Sharing one
+  // window meant a target whose name landed just outside it came back
+  // UNNAMED: measured on a live install as 75 vessels restored and 0 named.
+
+  it("names a vessel whose identity is older than the motion window", () => {
+    const captured: Captured[] = [];
+    const { promise, deltas } = run(
+      [
+        position(AIS, 60_000),
+        // 40 minutes old: far outside the 9-minute motion window, and the
+        // whole point — this is a perfectly good name.
+        [ago(40 * 60_000), "name", AIS, "SEA BREEZE", "identity"] as Row,
+      ],
+      {},
+      captured,
+    );
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 1);
+      assert.equal(
+        result.skippedStale,
+        0,
+        "the row-level age check must use the identity window too, or it " +
+          "silently discards what the SQL reached back for",
+      );
+      const named = allValues(deltas[0]).find((v) => v.path === "");
+      assert.deepEqual(named?.value, { name: "SEA BREEZE" });
+    });
+  });
+
+  it("still refuses motion older than the short window", () => {
+    // The widened identity window must not leak into position: a stale fix
+    // draws a target somewhere it demonstrably is not.
+    const { promise, deltas } = run([
+      position(AIS, 40 * 60_000),
+      [ago(40 * 60_000), "name", AIS, "SEA BREEZE", "identity"] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 0, "no usable fix, so nothing to draw");
+      assert.equal(deltas.length, 0);
+    });
+  });
+
+  it("does not restore an identity-only vessel as a ghost target", () => {
+    // Reaching further back for names must not resurrect vessels that have
+    // no current position — they would be undrawable and never age out.
+    const { promise, deltas } = run([
+      [ago(40 * 60_000), "name", AIS, "SEA BREEZE", "identity"] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 0);
+      assert.equal(deltas.length, 0);
+    });
+  });
+
+  it("queries each path set with its own window", () => {
+    const captured: Captured[] = [];
+    const { promise } = run([position(AIS, 60_000)], {}, captured);
+
+    return promise.then(() => {
+      const sql = captured[0].sql;
+      // Motion is bounded at 9 minutes, identity at a flat 24 hours.
+      // Asserting the literal timestamps keeps the two windows from silently
+      // collapsing back into one.
+      assert.ok(
+        sql.includes(ago(9 * 60_000)),
+        "motion window missing from SQL",
+      );
+      assert.ok(
+        sql.includes(ago(24 * 60 * 60_000)),
+        "identity window missing from SQL",
+      );
+      // Position has no path column and is motion by definition.
+      assert.ok(
+        sql.includes(`signalk_position WHERE ts >= '${ago(9 * 60_000)}'`),
+        "position must keep the short window unconditionally",
+      );
+    });
   });
 });

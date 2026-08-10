@@ -60,23 +60,43 @@ export interface RestoreResult {
 }
 
 /**
- * Paths worth restoring. This is deliberately a small allowlist rather than
+ * The paths worth restoring are a deliberately small allowlist rather than
  * "everything recorded": the goal is to put targets on the chart with enough
  * identity to be useful, not to reconstruct the entire data model. Replaying
  * every recorded path would push thousands of stale sensor readings (tank
  * levels, engine temps) into the model as though they were live, which is
  * both misleading and a needless burst of deltas at startup.
  *
- * Position is the reason this feature exists; the rest is what a chart plotter
- * needs to draw and label a contact.
+ * They are split in two because they age differently, and one window for both
+ * is what made restored targets come back unnamed (issue #127).
+ *
+ * Paths describing where a vessel IS and how it is moving. These go stale
+ * fast — a fix from an hour ago is worse than no fix, because it draws a
+ * target somewhere it demonstrably is not — so they are restored only within
+ * the short window.
  */
-const RESTORE_PATHS = [
+const MOTION_PATHS = [
   "navigation.position",
   "navigation.courseOverGroundTrue",
   "navigation.speedOverGround",
   "navigation.headingTrue",
   "navigation.headingMagnetic",
   "navigation.state",
+] as const;
+
+/**
+ * Paths describing what a vessel IS. These do not go stale the way a fix
+ * does: a name from two hours ago is still that vessel's name.
+ *
+ * They are restored over IDENTITY_WINDOW_MS because AIS delivers them on a
+ * completely different cadence. Position arrives every few seconds; the
+ * static report carrying the name repeats roughly every 6 minutes, and only
+ * while the vessel is in range. Sharing the motion window meant a vessel
+ * whose static report happened to land 12 minutes ago came back as an
+ * UNNAMED target — measured on a live install as 75 vessels restored with a
+ * position and 0 of them carrying a name (issue #127).
+ */
+const IDENTITY_PATHS = [
   "design.aisShipType",
   // `design.length` is an OBJECT in Signal K ({overall, hull}), so it is
   // recorded as its leaves, not under the bare path — which never existed in
@@ -86,9 +106,48 @@ const RESTORE_PATHS = [
   "design.length",
   "design.length.overall",
   "design.beam",
-  "mmsi",
+  // No "mmsi": for another vessel the MMSI IS the context
+  // (`vessels.urn:mrn:imo:mmsi:244813000`), built by the decoder from the AIS
+  // userId — neither n2k-signalk nor nmea0183-signalk ever emits it as a
+  // path, and this database has never held a single row under one. For self
+  // it is server configuration written once via setSelfValue, not a delta, and
+  // signalk-server's staticDataFilter strips incoming attempts to set it. So
+  // the entry only ever widened the SQL `IN` list for a path that cannot
+  // exist.
   "name",
 ] as const;
+
+/**
+ * How far back identity is looked up, independent of the motion window.
+ *
+ * A fixed 24 hours rather than a multiple of `maxAgeMs`: identity has nothing
+ * to do with how fresh a fix must be, so scaling it off that window made the
+ * default (9 min x 40 = 6h) too short on a quiet day. Measured on a live
+ * install, 6 hours reached exactly ONE named vessel while 24 hours reached
+ * 192.
+ *
+ * There is no staleness risk to trade against. An MMSI is a unique, durable
+ * identifier — over a week of real AIS traffic here, not one vessel broadcast
+ * a different name — so an older name is not a wronger name. And the cost is
+ * flat: `LATEST ON` collapses to one row per (path, context), so widening the
+ * window changes which row is newest, not how many come back. 24h returned
+ * 192 rows against 6h's 1.
+ *
+ * A vessel is still only restored if it has a RECENT position, so this cannot
+ * resurrect anything; it only labels what motion already brought back.
+ */
+const IDENTITY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * True for a path fetched over the long identity window. The row-level age
+ * check must agree with the SQL, or it discards what the query deliberately
+ * reached back for.
+ */
+const IDENTITY_PATH_SET: ReadonlySet<string> = new Set(IDENTITY_PATHS);
+
+function isIdentityPath(path: string): boolean {
+  return IDENTITY_PATH_SET.has(path);
+}
 
 function sqlList(values: readonly string[]): string {
   return values.map((v) => `'${v.replace(/'/g, "''")}'`).join(", ");
@@ -103,25 +162,53 @@ function sqlList(values: readonly string[]): string {
  * large installs. Position partitions by context alone because that table has
  * no path column.
  */
-function snapshotSQL(sinceIso: string, withKind: boolean): string {
-  const at = `ts >= '${sinceIso}'`;
-  const paths = sqlList(RESTORE_PATHS);
-  const kind = withKind ? `CAST(value_kind AS STRING)` : `CAST(NULL AS STRING)`;
+function snapshotSQL(
+  sinceIso: string,
+  identitySinceIso: string,
+  withKind: boolean,
+): string {
+  const motion = sqlList(MOTION_PATHS);
+  const identity = sqlList(IDENTITY_PATHS);
+  // Without the column, synthesize "identity" for the synthetic `name` path
+  // rather than NULL. NULL failed the `kind === "identity"` gate below, so on
+  // a table predating value_kind every vessel name replayed as a literal
+  // `name` path instead of the empty-path object Freeboard reads — restoring
+  // targets that were, again, unnamed. The substitution is sound because that
+  // path is only ever written by the identity writer; a data path genuinely
+  // called "name" would be a different (non-synthetic) row, and on an
+  // unmigrated table there is no way to tell them apart anyway.
+  const kind = withKind
+    ? `CAST(value_kind AS STRING)`
+    : `CASE WHEN path = 'name' THEN 'identity' ELSE CAST(NULL AS STRING) END`;
+
+  // Each window is applied to its own path set, and the two are unioned. The
+  // alternative — one `ts >= earliest` scan with a CASE per row — would drag
+  // every motion path across the long window before filtering, which is the
+  // scan this file's LATEST ON structure exists to avoid.
+  //
+  // Written as `(a OR b)` inside one predicate per table rather than as extra
+  // UNION arms, so LATEST ON still resolves one row per (path, context): a
+  // path appearing in two arms would produce two rows to reconcile.
+  const window =
+    `((ts >= '${sinceIso}' AND path IN (${motion})) OR ` +
+    `(ts >= '${identitySinceIso}' AND path IN (${identity})))`;
 
   const num =
     `SELECT ts, path, context, CAST(value AS STRING) valuetext, ` +
-    `'number' kind FROM signalk WHERE ${at} AND path IN (${paths})` +
+    `'number' kind FROM signalk WHERE ${window}` +
     ` LATEST ON ts PARTITION BY path, context`;
 
   const str =
     `SELECT ts, path, context, value_str valuetext, ${kind} kind ` +
-    `FROM signalk_str WHERE ${at} AND path IN (${paths})` +
+    `FROM signalk_str WHERE ${window}` +
     ` LATEST ON ts PARTITION BY path, context`;
 
+  // Position has no path column and is motion by definition, so it keeps the
+  // short window unconditionally.
   const pos =
     `SELECT ts, 'navigation.position' path, context, ` +
     `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, ` +
-    `'position' kind FROM signalk_position WHERE ${at}` +
+    `'position' kind FROM signalk_position WHERE ts >= '${sinceIso}'` +
     ` LATEST ON ts PARTITION BY context`;
 
   return `(${num}) UNION ALL (${str}) UNION ALL (${pos})`;
@@ -166,12 +253,14 @@ export async function restoreFromHistory(
   const { queryClient, handleMessage, selfContext, debug } = deps;
   const now = options.now ? options.now() : Date.now();
   const sinceIso = new Date(now - options.maxAgeMs).toISOString();
+  // Identity reaches much further back than motion — see IDENTITY_PATHS.
+  const identitySinceIso = new Date(now - IDENTITY_WINDOW_MS).toISOString();
 
   const result = await queryClient
-    .exec(snapshotSQL(sinceIso, true))
+    .exec(snapshotSQL(sinceIso, identitySinceIso, true))
     .catch((err: unknown) => {
       if (!isMissingKindColumn(err)) throw err;
-      return queryClient.exec(snapshotSQL(sinceIso, false));
+      return queryClient.exec(snapshotSQL(sinceIso, identitySinceIso, false));
     });
 
   const rows = queryClient.toObjects(result);
@@ -201,10 +290,17 @@ export async function restoreFromHistory(
     if (!isSelf && !options.restoreOthers) continue;
 
     const ts = row.ts as string;
+    const path = row.path as string;
     // The window is applied in SQL, but a row whose timestamp does not parse
     // cannot be aged out by consumers, so it is not safe to replay.
+    //
+    // Must use the SAME window the SQL used for this path, or it silently
+    // undoes the split: identity is fetched over the long window and would
+    // then be discarded here as stale, which is exactly the bug that left
+    // restored targets unnamed (issue #127).
+    const maxAge = isIdentityPath(path) ? IDENTITY_WINDOW_MS : options.maxAgeMs;
     const rowTime = Date.parse(ts);
-    if (!Number.isFinite(rowTime) || now - rowTime > options.maxAgeMs) {
+    if (!Number.isFinite(rowTime) || now - rowTime > maxAge) {
       skippedStale++;
       continue;
     }
@@ -212,7 +308,6 @@ export async function restoreFromHistory(
     const value = decodeValue(row);
     if (value === null) continue;
 
-    const path = row.path as string;
     const entry = byContext.get(storedContext) ?? {
       byPath: new Map<
         string,

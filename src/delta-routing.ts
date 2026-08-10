@@ -83,7 +83,15 @@ export function extractVesselName(path: string, value: unknown): string | null {
 }
 
 export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
-  if (typeof value === "number") return "number";
+  // NaN and ±Infinity have no ILP representation. QuestDB does NOT reject
+  // them — verified against a live instance, `value=NaN` is accepted and
+  // stored — so an unguarded sensor fault silently poisons the numeric
+  // column, and every aggregate over that path afterwards. A source
+  // reporting a non-finite number is reporting "no reading", which is what
+  // recording nothing means. flattenObjectValue already applied this to
+  // leaves; the top-level path has to agree.
+  if (typeof value === "number")
+    return Number.isFinite(value) ? "number" : null;
   if (typeof value === "string") return "string";
   // Booleans are everywhere in Signal K — switch and relay states, pump and
   // valve states, autopilot flags — and used to fall through to null, so a
@@ -138,6 +146,12 @@ export function flattenObjectValue(
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return { leaves, skipped };
   }
+  // An empty parent would build ".name" — a leading-dot path that matches no
+  // Signal K path and no filter pattern. The recorder already returns before
+  // reaching here for path "" (that shape is the AIS static report, handled
+  // by extractVesselName), so this is belt-and-braces: the function must not
+  // depend on a caller's guard to avoid emitting a malformed path.
+  if (path === "") return { leaves, skipped };
   for (const [key, leaf] of Object.entries(value as Record<string, unknown>)) {
     const leafPath = `${path}.${key}`;
     if (typeof leaf === "number") {
