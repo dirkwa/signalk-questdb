@@ -1,4 +1,10 @@
 import { IRouter } from "express";
+import type {
+  ContainerConfig,
+  ContainerManagerApi,
+  ContainerResourceLimits,
+  UlimitClamp,
+} from "signalk-container-helper";
 import { ILPWriter } from "./ilp-writer.js";
 import { QueryClient, isReadOnlySQL } from "./query-client.js";
 import type { QuestDBResult } from "./query-client.js";
@@ -71,162 +77,12 @@ interface App {
   [key: string]: unknown;
 }
 
-interface ContainerResourceLimits {
-  cpus?: number | null;
-  memory?: string | null;
-}
-
-interface ContainerConfig {
-  image: string;
-  tag: string;
-  // Default (secure) connectivity path. signalk-container owns the networking
-  // (port allocation, host binding, or attaching the container to Signal K's
-  // own network) and exposes the resulting endpoint via
-  // resolveContainerAddress(). Connectivity then works in every topology
-  // (bare-metal SK, containerized SK on a user network, or default bridge)
-  // without exposing QuestDB beyond loopback / the shared network. Mutually
-  // exclusive with `ports`/`networkMode` — used when exposeToContainers is off.
-  signalkAccessiblePorts?: number[];
-  // Manual host port bindings ("9000/tcp" -> "0.0.0.0:9000"). Used for the
-  // LAN-exposure path (exposeToContainers=true) so a separate machine or a
-  // separate-Docker Grafana can reach QuestDB. Mutually exclusive with
-  // signalkAccessiblePorts.
-  ports?: Record<string, string>;
-  networkMode?: string;
-  volumes: Record<string, string>;
-  env: Record<string, string>;
-  restart?: string;
-  resources?: ContainerResourceLimits;
-  ulimits?: Record<string, number | { soft: number; hard: number }>;
-  healthcheck?:
-    | false
-    | {
-        test: string[];
-        interval?: string;
-        timeout?: string;
-        startPeriod?: string;
-        retries?: number;
-      };
-}
-
-// Mirror of signalk-container's `UlimitClamp` event (signalk-container ≥
-// 1.18.0). The plugin can't import the type — signalk-container is an optional
-// peer reached via globalThis — so it is redeclared here.
-interface UlimitClamp {
-  ulimit: string;
-  requested: number;
-  granted: number;
-  reason: string;
-}
-
-interface EnsureRunningOptions {
-  onUlimitClamped?: (event: UlimitClamp) => void;
-}
-
-interface ContainerManagerApi {
-  getRuntime: () => { runtime: string; version: string } | null;
-  whenReady: () => Promise<void>;
-  ensureRunning: (
-    name: string,
-    config: ContainerConfig,
-    options?: EnsureRunningOptions,
-  ) => Promise<void>;
-  stop: (name: string) => Promise<void>;
-  remove: (name: string) => Promise<void>;
-  /**
-   * Remove the managed container AND delete its bind-mount data at `hostPath`,
-   * working around the rootless-Podman subuid-ownership trap (data written by
-   * the container is owned by a subuid the Signal K user can't delete). Used by
-   * the "Remove all data" action so a user can fully reset QuestDB — Signal K's
-   * own plugin-uninstall can't delete this data. Optional: requires
-   * signalk-container >= 1.19.0; the plugin degrades (reports unsupported) on
-   * older versions.
-   */
-  removeManagedData?: (
-    name: string,
-    hostPath: string,
-    options?: { ownerPluginId?: string },
-  ) => Promise<void>;
-  /**
-   * Read the nofile limits the managed container is ACTUALLY running with
-   * (live /proc probe, falling back to the create-time inspect echo); null
-   * means unknown. Used to verify a recorded ulimit clamp against reality
-   * and clear the stale advisory. Optional: requires signalk-container >=
-   * 1.25.3; on older versions the advisory clears on the next plugin start.
-   */
-  getContainerNofile?: (
-    name: string,
-  ) => Promise<{ soft: number; hard: number } | null>;
-  ensureNetwork: (name: string) => Promise<void>;
-  /**
-   * Attach an existing managed container to a user-defined network so other
-   * containers on it can reach the container by its `sk-`-prefixed DNS name.
-   * On the default path we use it so the companion signalk-grafana (which
-   * joins `networkName` and resolves `sk-<name>`) still reaches QuestDB.
-   * Optional so the plugin degrades gracefully on older signalk-container.
-   */
-  connectToNetwork?: (
-    containerName: string,
-    networkName: string,
-  ) => Promise<void>;
-  pullImage: (
-    image: string,
-    onProgress?: (msg: string) => void,
-  ) => Promise<void>;
-  /**
-   * Diagnostics API. We only read `doctor.selfDeployment().isContainerized`:
-   * on the LAN-exposure path it decides whether the Signal K process reaches
-   * QuestDB's published port over the host loopback (bare-metal) or via the
-   * `host.containers.internal` gateway (Signal K itself in a container).
-   * Optional (the whole `doctor` object and its method) so the plugin degrades
-   * gracefully on older signalk-container.
-   */
-  doctor?: {
-    selfDeployment?: () => Promise<{ isContainerized: boolean }>;
-  };
-  /**
-   * Resolve the `host:port` string the Signal K process should use to reach
-   * `containerPort` on a managed container, for a port declared in that
-   * container's `signalkAccessiblePorts`. signalk-container returns the right
-   * endpoint for the current topology:
-   *
-   *   - bare-metal SK              → `127.0.0.1:<allocated host port>`
-   *   - containerized, user net    → `sk-<name>:<containerPort>` (container DNS)
-   *   - containerized, default net → `127.0.0.1:<containerPort>` (shared netns)
-   *
-   * Call after `ensureRunning()`. Returns `null` if the runtime is unavailable
-   * or the port was never declared; throws if declared but `ensureRunning()`
-   * has not run yet. Available in signalk-container 1.14.0+ — optional so the
-   * plugin degrades gracefully (falls back to `questdbHost`) on older versions.
-   */
-  resolveContainerAddress?: (
-    containerName: string,
-    containerPort: number,
-  ) => Promise<string | null>;
-  /**
-   * Translate a container-internal absolute path (e.g. the value
-   * `app.getDataDirPath()` returns when SK is itself running in a
-   * container) into the host-side source signalk-container should
-   * pass to the runtime as a bind-mount source. Returns `null` on
-   * bare-metal SK (no translation needed) or when no SK mount covers
-   * the path; the caller falls back to the original path in that case.
-   */
-  resolveHostPath?: (
-    absPath: string,
-  ) => Promise<{ source: string; subPath: string } | null>;
-  /**
-   * One-shot container log fetch (combined stdout+stderr). Used to capture
-   * the WAL apply job's real failure reason: wal_tables() reports no
-   * errorTag for a raw Java error, and the engine-side detail is in-memory
-   * only — the log is the single place the cause survives long enough to
-   * diagnose. Optional so the plugin degrades gracefully on an older
-   * signalk-container (diagnosis then omits the engine error).
-   */
-  getLogs?: (
-    name: string,
-    options?: { tail?: number; since?: number },
-  ) => Promise<string[]>;
-}
+// signalk-container's API, imported rather than mirrored. The 156-line
+// hand-written copy that used to live here drifted by construction: it was
+// only ever updated when this plugin happened to need a new member, so
+// getContainerNofile sat unmirrored from 1.25.3 until a probe needed it.
+// signalk-container-helper carries the same types and pins them against
+// signalk-container/types in CI, so a drift fails there instead of here.
 
 // The managed QuestDB container's name. signalk-container prefixes it with
 // `sk-` for the actual container and its DNS name (e.g. `sk-signalk-questdb`).
@@ -597,8 +453,22 @@ export default (app: App) => {
         [`${QUESTDB_INTERNAL_ILP_PORT}/tcp`]: `${bind}:${ilpPort}`,
         [`${QUESTDB_INTERNAL_PG_PORT}/tcp`]: `${bind}:${pgPort}`,
       };
+      // ensureNetwork is feature-detected: the helper types every
+      // version-gated member as optional so a plugin degrades on an older
+      // signalk-container rather than throwing. The previous hand-written
+      // mirror declared it required, which hid the need for this guard —
+      // and the connectToNetwork call further down was already guarding, so
+      // the two disagreed about the same API.
+      //
+      // networkMode is set REGARDLESS. Creating the network is the optional
+      // step; joining it is what the companion Grafana depends on, and on a
+      // signalk-container without ensureNetwork the network the operator
+      // named almost certainly exists already. Gating the assignment on the
+      // probe would silently drop the container off that network.
       if (config.networkName) {
-        await containers.ensureNetwork(config.networkName);
+        if (typeof containers.ensureNetwork === "function") {
+          await containers.ensureNetwork(config.networkName);
+        }
         containerConfig.networkMode = config.networkName;
       }
       // A 0.0.0.0-published port is reached on 127.0.0.1 or via the host
@@ -628,12 +498,19 @@ export default (app: App) => {
     // endpoint from whatever address signalk-container reports.
     containerConfig.signalkAccessiblePorts = QUESTDB_ACCESSIBLE_PORTS;
     return async () => {
+      // The two are feature-detected SEPARATELY. Requiring both would skip
+      // attachment entirely on a signalk-container that has connectToNetwork
+      // but not ensureNetwork -- and there the network almost certainly
+      // already exists, so attaching still works. Creating it is the
+      // optional step; joining it is the one Grafana depends on.
       if (
         config.networkName &&
         typeof containers.connectToNetwork === "function"
       ) {
         try {
-          await containers.ensureNetwork(config.networkName);
+          if (typeof containers.ensureNetwork === "function") {
+            await containers.ensureNetwork(config.networkName);
+          }
           await containers.connectToNetwork(name, config.networkName);
         } catch (err) {
           // Non-fatal: SK->QuestDB does not depend on this network; only the

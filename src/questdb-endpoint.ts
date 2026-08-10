@@ -133,10 +133,21 @@ export async function resolveManagedEndpoints(
   };
 }
 
+/**
+ * The narrowest shape resolveLanExposureHost needs from the container
+ * manager: one optional method returning one field.
+ *
+ * Deliberately NOT the helper's ContainerManagerApi. Structural typing means
+ * a real manager satisfies this, while a test can pass
+ * `{ doctor: { selfDeployment: async () => ({ isContainerized: true }) } }` —
+ * against the full type every fake would have to supply all twelve fields of
+ * SelfDeploymentResult, which is noise rather than safety.
+ *
+ * selfDeployment lives on the diagnostics sub-API (containers.doctor), not at
+ * the top level. Both the object and its method are optional so the plugin
+ * degrades gracefully on an older signalk-container.
+ */
 export interface DeploymentResolver {
-  // selfDeployment lives on the diagnostics sub-API (containers.doctor), not at
-  // the top level. The whole `doctor` object and its method are optional so the
-  // plugin degrades gracefully on older signalk-container.
   doctor?: {
     selfDeployment?: () => Promise<{ isContainerized: boolean }>;
   };
