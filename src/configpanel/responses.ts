@@ -9,32 +9,10 @@
 //
 // These helpers keep the "trust but verify" boundary in one testable place.
 
-import type { MigrationSource, QuestdbVersion } from "../api-contract.js";
+import type { MigrationSource } from "../api-contract.js";
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null;
-
-/**
- * GET /api/versions returns an array of releases. Anything else becomes an
- * empty list, and malformed members are dropped: the version dropdown is
- * then short or empty rather than the panel being gone.
- *
- * Members are validated, not just the array — `versions.filter(v =>
- * !v.prerelease)` runs during render, so a single null element is as fatal
- * as a non-array body.
- */
-export function toVersionList(body: unknown): QuestdbVersion[] {
-  if (!Array.isArray(body)) return [];
-  return body.filter(
-    (v): v is QuestdbVersion =>
-      isRecord(v) &&
-      typeof v.tag === "string" &&
-      // Not merely cosmetic: the two filters below partition on this, so a
-      // missing or non-boolean value would list a pre-release as stable —
-      // and the stable list is what the version dropdown defaults to.
-      typeof v.prerelease === "boolean",
-  );
-}
 
 /**
  * GET /api/migration/detect returns `{ sources: [...] }`. A body without it

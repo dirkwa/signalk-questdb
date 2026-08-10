@@ -7,7 +7,6 @@ import type {
   ApiError,
   DbStatus,
   MigrationSource,
-  QuestdbVersion,
   ResumeWalResponse,
   SkipWalResponse,
   UpdateApplyResponse,
@@ -15,8 +14,18 @@ import type {
   WalDiagnosis,
 } from "../api-contract.js";
 import type { SkipPlan } from "../wal-monitor.js";
+import {
+  ActionStatus,
+  Button,
+  CollapsibleSection,
+  formatNumber,
+  StatusCard,
+  useStatusPoll,
+  useVersions,
+  VersionSelect,
+} from "signalk-container-helper/ui";
 import { S } from "./styles.js";
-import { toMigrationSources, toVersionList } from "./responses.js";
+import { toMigrationSources } from "./responses.js";
 
 type FilterMode = Config["pathFilter"]["mode"];
 type Compression = Config["compression"];
@@ -37,68 +46,16 @@ function apiText(value: string | undefined, fallback: string): string {
 
 const COMPRESSIONS = ["none", "lz4", "zstd"] as const;
 
+// The update row's buttons sit inline with status text, so they run smaller
+// than a form button. Not the helper's `small` (4px 10px / 11px) — that is a
+// shade tighter than what this row was built around.
+const UPDATE_BTN = { padding: "4px 12px", fontSize: 12 } as const;
+
 /** A <select> value is `string` to the type system; narrow it back. */
 function toCompression(value: string): Compression {
   return (COMPRESSIONS as readonly string[]).includes(value)
     ? (value as Compression)
     : "lz4";
-}
-
-function CollapsibleSection({
-  title,
-  defaultOpen = false,
-  children,
-}: {
-  title: string;
-  /**
-   * Initial state only \u2014 seeded once on mount, exactly like the config-derived
-   * state in the panel below. Deliberately NOT kept in sync with an effect: a
-   * section that opens because it has content would then snap shut the moment
-   * the user cleared the field, fighting them mid-edit.
-   *
-   * This holds only because the host has the configuration in hand before the
-   * panel mounts: signalk-server seeds it via `useState(plugin.data.configuration)`
-   * and passes it straight down, so there is no render where it is absent and
-   * then arrives. A caller deriving this from data fetched inside the panel
-   * would seed `false` forever and silently lose the behaviour.
-   */
-  defaultOpen?: boolean;
-  children: React.ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <div>
-      {/* A real <button> so keyboard users can toggle with Enter/Space and
-          screen readers announce expanded state. sectionToggle resets the
-          default button chrome but keeps a darker colour than a plain heading,
-          so it reads as a control \u2014 at sectionTitle's grey it did not, and the
-          settings inside looked absent rather than collapsed (issue #123). */}
-      <button
-        type="button"
-        aria-expanded={open}
-        style={{ ...S.sectionTitle, ...S.sectionToggle }}
-        onClick={() => setOpen(!open)}
-      >
-        <span
-          style={{
-            ...S.sectionMarker,
-            transform: open ? "rotate(90deg)" : "rotate(0deg)",
-          }}
-        >
-          {"\u25b6"}
-        </span>
-        {title}
-      </button>
-      {open && <div style={{ marginBottom: 16 }}>{children}</div>}
-    </div>
-  );
-}
-
-function formatNumber(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
-  return String(n);
 }
 
 interface PluginConfigurationPanelProps {
@@ -185,10 +142,30 @@ export default function PluginConfigurationPanel({
     cfg.exposeToContainers || false,
   );
 
-  const [versions, setVersions] = useState<QuestdbVersion[]>([]);
-  const [versionsLoading, setVersionsLoading] = useState(false);
-  const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
-  const [statusLoading, setStatusLoading] = useState(true);
+  // useVersions keeps the last good list when a fetch fails. The local
+  // version wiped it: a 200 carrying non-JSON set `versions` to [], and an
+  // empty dropdown is what lets a Save silently change the running image.
+  const {
+    versions,
+    versionsError,
+    loading: versionsLoading,
+    refresh: fetchVersions,
+  } = useVersions("/plugins/signalk-questdb/api/versions");
+  // Self-scheduling rather than setInterval: a response slower than the
+  // period cannot stack overlapping requests, and a generation counter drops
+  // stale responses that land after newer ones. The panel already did this
+  // for WAL diagnosis but not for status.
+  const {
+    status: dbStatus,
+    loading: statusLoading,
+    refresh: fetchStatus,
+  } = useStatusPoll<DbStatus>("/plugins/signalk-questdb/api/status", {
+    // Parsed even on non-2xx: the unhealthy 503 carries fields the panel
+    // must still surface (hostMaxMapCount — mmap exhaustion is one of the
+    // ways QuestDB becomes unhealthy).
+    fallback: { status: "not_running" },
+    intervalMs: 5000,
+  });
   const [migrationSources, setMigrationSources] = useState<
     MigrationSource[] | null
   >(null);
@@ -213,39 +190,6 @@ export default function PluginConfigurationPanel({
   // overwriting fresher data.
   const walDiagGen = useRef(0);
   const [skipping, setSkipping] = useState(false);
-
-  const fetchVersions = useCallback(async () => {
-    setVersionsLoading(true);
-    try {
-      const res = await fetch("/plugins/signalk-questdb/api/versions");
-      if (res.ok) {
-        // `.catch(() => null)` for the same reason as the migration probe:
-        // a 200 that is not JSON should leave the dropdown empty, not
-        // depend on the bare catch below to swallow a parse error.
-        setVersions(toVersionList(await res.json().catch(() => null)));
-      }
-    } catch {
-      // offline or error
-    }
-    setVersionsLoading(false);
-  }, []);
-
-  const fetchStatus = useCallback(async () => {
-    try {
-      const res = await fetch("/plugins/signalk-questdb/api/status");
-      // Parse the body on non-2xx too: the unhealthy 503 carries fields the
-      // panel must still surface (hostMaxMapCount — mmap exhaustion is one
-      // of the ways QuestDB becomes unhealthy). Unparseable bodies fall
-      // through to the plain not_running shape.
-      const body = (await res.json().catch(() => null)) as DbStatus | null;
-      setDbStatus(
-        body && typeof body === "object" ? body : { status: "not_running" },
-      );
-    } catch {
-      setDbStatus({ status: "not_running" });
-    }
-    setStatusLoading(false);
-  }, []);
 
   const fetchWalDiagnosis = useCallback(async (signal?: AbortSignal) => {
     const gen = ++walDiagGen.current;
@@ -495,13 +439,6 @@ export default function PluginConfigurationPanel({
     setMigrationDetecting(false);
   };
 
-  useEffect(() => {
-    fetchVersions();
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
-    return () => clearInterval(interval);
-  }, [fetchVersions, fetchStatus]);
-
   const [exportFrom, setExportFrom] = useState("");
   const [exportTo, setExportTo] = useState("");
   const [exportFormat, setExportFormat] = useState("parquet");
@@ -615,10 +552,6 @@ export default function PluginConfigurationPanel({
   const maxMapCount =
     (dbStatus?.hostMaxMapCount?.tooLow && dbStatus.hostMaxMapCount) || null;
 
-  // Build version options: latest first, then pre-releases, then stable
-  const stableVersions = versions.filter((v) => !v.prerelease).slice(0, 3);
-  const preVersions = versions.filter((v) => v.prerelease).slice(0, 2);
-
   return (
     <div style={S.root}>
       {/* QuestDB Status */}
@@ -690,17 +623,15 @@ export default function PluginConfigurationPanel({
                   </div>
                 ))}
               <div style={{ marginTop: 10 }}>
-                <button
-                  style={{
-                    ...S.btn,
-                    ...S.btnPrimary,
-                    ...(resuming || skipping ? S.btnDisabled : {}),
-                  }}
-                  disabled={resuming || skipping}
+                <Button
+                  variant="primary"
+                  busy={resuming}
+                  busyLabel="Resuming..."
+                  disabled={skipping}
                   onClick={handleResumeWal}
                 >
-                  {resuming ? "Resuming..." : "Resume recording"}
-                </button>
+                  Resume recording
+                </Button>
               </div>
               {suspendedTables
                 .filter((t) => t.autoResume === "failed")
@@ -759,21 +690,15 @@ export default function PluginConfigurationPanel({
                           )} txns) is replayed without loss`}
                       .
                       <div style={{ marginTop: 8 }}>
-                        <button
-                          style={{
-                            ...S.btn,
-                            ...S.btnDanger,
-                            ...(skipping || resuming || walDiagStale
-                              ? S.btnDisabled
-                              : {}),
-                          }}
-                          disabled={skipping || resuming || walDiagStale}
+                        <Button
+                          variant="danger"
+                          busy={skipping}
+                          busyLabel="Skipping..."
+                          disabled={resuming || walDiagStale}
                           onClick={() => handleSkipWal(t.name, plan)}
                         >
-                          {skipping
-                            ? "Skipping..."
-                            : "Skip unreadable segment (loses data)"}
-                        </button>
+                          Skip unreadable segment (loses data)
+                        </Button>
                         {walDiagStale && (
                           <div style={{ marginTop: 6, fontSize: 12 }}>
                             The diagnosis could not be refreshed — the numbers
@@ -865,27 +790,20 @@ export default function PluginConfigurationPanel({
               .
             </div>
           )}
-          <div style={S.card}>
-            <div
-              style={{ ...S.cardIcon, background: "#7c3aed", color: "#fff" }}
-            >
-              Q
-            </div>
-            <div style={S.cardInfo}>
-              <div style={S.cardTitle}>QuestDB</div>
-              <div style={S.cardMeta}>
+          <StatusCard
+            icon="Q"
+            iconBackground="#7c3aed"
+            iconColor="#fff"
+            title="QuestDB"
+            meta={
+              <>
                 {dbStatus?.endpoint || `${questdbHost}:${questdbHttpPort}`}{" "}
                 &middot; {walSuspended ? "WAL suspended" : "Recording"}
-              </div>
-            </div>
-            <div
-              style={{
-                ...S.stateIndicator,
-                background: walSuspended ? "#ef4444" : "#10b981",
-              }}
-              title={walSuspended ? "WAL suspended" : "Running"}
-            />
-          </div>
+              </>
+            }
+            state={walSuspended ? "error" : "ok"}
+            stateTitle={walSuspended ? "WAL suspended" : "Running"}
+          />
 
           <div style={S.statsGrid}>
             <div style={S.statCard}>
@@ -931,61 +849,50 @@ export default function PluginConfigurationPanel({
                   v{updateInfo.currentVersion} &rarr;{" "}
                   <strong>v{updateInfo.latestVersion}</strong> available
                 </span>
-                <button
-                  style={{
-                    ...S.btn,
-                    ...S.btnPrimary,
-                    padding: "4px 12px",
-                    fontSize: 12,
-                    ...(updating ? S.btnDisabled : {}),
-                  }}
+                <Button
+                  variant="primary"
+                  busy={updating}
+                  busyLabel="Updating..."
                   onClick={applyUpdate}
-                  disabled={updating}
+                  style={UPDATE_BTN}
                 >
-                  {updating ? "Updating..." : "Update QuestDB"}
-                </button>
+                  Update QuestDB
+                </Button>
               </>
             ) : updateInfo && !updateInfo.updateAvailable ? (
               <span style={{ fontSize: 12, color: "#888" }}>
                 v{updateInfo.currentVersion} (up to date)
               </span>
             ) : (
-              <button
-                style={{
-                  ...S.btn,
-                  padding: "4px 12px",
-                  fontSize: 12,
-                  background: "#f1f5f9",
-                  color: "#475569",
-                  border: "1px solid #e2e8f0",
-                  ...(checkingUpdate ? S.btnDisabled : {}),
-                }}
+              <Button
+                variant="secondary"
+                busy={checkingUpdate}
+                busyLabel="Checking..."
                 onClick={checkForUpdate}
-                disabled={checkingUpdate}
+                style={UPDATE_BTN}
               >
-                {checkingUpdate ? "Checking..." : "Check for updates"}
-              </button>
+                Check for updates
+              </Button>
             )}
           </div>
         </>
       ) : (
-        <div style={S.card}>
-          <div
-            style={{ ...S.cardIcon, background: "#fef2f2", color: "#ef4444" }}
-          >
-            Q
-          </div>
-          <div style={S.cardInfo}>
-            <div style={S.cardTitle}>QuestDB</div>
-            <div style={S.cardMeta}>
+        // No explicit icon colours: the error state supplies the shared
+        // muted-red treatment, which is where the local #fef2f2/#ef4444 pair
+        // came from in the first place.
+        <StatusCard
+          icon="Q"
+          title="QuestDB"
+          meta={
+            <>
               {dbStatus?.status === "unhealthy"
                 ? "Not responding"
                 : "Not running"}
               {managedContainer ? " — enable plugin to start container" : ""}
-            </div>
-          </div>
-          <div style={{ ...S.stateIndicator, background: "#ef4444" }} />
-        </div>
+            </>
+          }
+          state="error"
+        />
       )}
 
       {/* Image Version */}
@@ -993,36 +900,23 @@ export default function PluginConfigurationPanel({
 
       <div style={S.fieldRow}>
         <span style={S.label}>QuestDB version</span>
-        <select
-          style={S.select}
+        {/* The hand-rolled <select> had no option for a value outside the
+            listed releases. A pinned tag that aged out of the top 3 — or any
+            tag at all when GitHub rate-limited the listing and `versions` came
+            back empty — rendered the box blank on "latest", and doSave writes
+            questdbVersion unconditionally, so the next Save silently changed
+            the running image. VersionSelect injects a synthetic
+            "<tag> (running)" option instead. */}
+        <VersionSelect
           value={questdbVersion}
-          onChange={(e) => setQuestdbVersion(e.target.value)}
-        >
-          <option value="latest">latest (recommended)</option>
-          {preVersions.map((v) => (
-            <option key={v.tag} value={v.tag}>
-              {v.tag} (pre-release)
-            </option>
-          ))}
-          {stableVersions.map((v, i) => (
-            <option key={v.tag} value={v.tag}>
-              {v.tag}
-              {i === 0 ? " (current stable)" : ""}
-            </option>
-          ))}
-        </select>
-        {versionsLoading && <span style={S.hint}>loading releases...</span>}
-        <button
-          style={{
-            ...S.btn,
-            ...S.btnPrimary,
-            padding: "4px 10px",
-            fontSize: 11,
-          }}
-          onClick={fetchVersions}
-        >
-          ↻
-        </button>
+          onChange={setQuestdbVersion}
+          versions={versions}
+          loading={versionsLoading}
+          onRefresh={() => void fetchVersions()}
+          error={versionsError}
+          stableCount={3}
+          preCount={2}
+        />
       </div>
 
       {/* Connection Settings */}
@@ -1273,7 +1167,14 @@ export default function PluginConfigurationPanel({
       {/* Open on mount when patterns are already configured, so a user who has
           set filtering sees it rather than a collapsed header. Keyed on the
           paths, not the mode: mode defaults to "exclude" and is never empty,
-          so keying on it would open this for everyone and say nothing. */}
+          so keying on it would open this for everyone and say nothing.
+
+          defaultOpen is read ONCE, on mount. That works here only because the
+          host has the configuration in hand before the panel renders —
+          signalk-server seeds it via useState(plugin.data.configuration) and
+          passes it straight down, so there is no render where it is absent
+          and then arrives. Deriving this from anything the panel fetches
+          itself would seed false forever and lose the behaviour silently. */}
       <CollapsibleSection
         title="Path filtering"
         defaultOpen={filterPaths.trim() !== ""}
@@ -1362,17 +1263,14 @@ export default function PluginConfigurationPanel({
             marginBottom: 10,
           }}
         >
-          <button
-            style={{
-              ...S.btn,
-              ...S.btnPrimary,
-              ...(migrationDetecting ? S.btnDisabled : {}),
-            }}
+          <Button
+            variant="primary"
+            busy={migrationDetecting}
+            busyLabel="Detecting..."
             onClick={detectMigration}
-            disabled={migrationDetecting}
           >
-            {migrationDetecting ? "Detecting..." : "Detect InfluxDB"}
-          </button>
+            Detect InfluxDB
+          </Button>
           <span style={S.hint}>
             Checks localhost:8086 for InfluxDB 1.x and 2.x
           </span>
@@ -1465,17 +1363,14 @@ export default function PluginConfigurationPanel({
           </select>
         </div>
 
-        <button
-          style={{
-            ...S.btn,
-            ...S.btnPrimary,
-            ...(exporting ? S.btnDisabled : {}),
-          }}
+        <Button
+          variant="primary"
+          busy={exporting}
+          busyLabel="Exporting..."
           onClick={doExport}
-          disabled={exporting}
         >
-          {exporting ? "Exporting..." : "Export Data"}
-        </button>
+          Export Data
+        </Button>
       </CollapsibleSection>
 
       {cfg.managedContainer !== false && (
@@ -1485,38 +1380,25 @@ export default function PluginConfigurationPanel({
             data. Use this to fully reset QuestDB — Signal K's plugin-uninstall
             cannot delete this data on rootless Podman. This cannot be undone.
           </div>
-          <button
-            style={{
-              ...S.btn,
-              ...S.btnDanger,
-              ...(purging ? S.btnDisabled : {}),
-            }}
+          <Button
+            variant="danger"
+            busy={purging}
+            busyLabel="Removing..."
             onClick={purgeData}
-            disabled={purging}
           >
-            {purging ? "Removing..." : "Remove container & all data"}
-          </button>
+            Remove container &amp; all data
+          </Button>
         </CollapsibleSection>
       )}
 
-      {/* Status */}
-      {actionStatus && (
-        <div
-          style={{
-            ...S.status,
-            color: statusError ? "#ef4444" : "#10b981",
-            marginTop: 16,
-          }}
-        >
-          {actionStatus}
-        </div>
-      )}
+      <ActionStatus
+        message={actionStatus}
+        error={statusError}
+        style={{ marginTop: 16 }}
+      />
 
-      {/* Save */}
       <div style={{ marginTop: 24 }}>
-        <button style={{ ...S.btn, ...S.btnSave }} onClick={doSave}>
-          Save Configuration
-        </button>
+        <Button onClick={doSave}>Save Configuration</Button>
       </div>
     </div>
   );

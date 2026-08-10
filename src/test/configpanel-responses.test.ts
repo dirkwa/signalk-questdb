@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { toMigrationSources, toVersionList } from "../configpanel/responses.js";
+import { toMigrationSources } from "../configpanel/responses.js";
 
 // The panel casts every `res.json()` to a contract type, which asserts a
 // shape rather than checking one. The plugin's own handlers are well
@@ -23,12 +23,6 @@ const parsedBody = async (raw: string, contentType = "application/json") => {
 };
 
 describe("a 200 response whose body is not JSON", () => {
-  it("degrades to an empty version list, not a parse error", async () => {
-    const body = await parsedBody("<html>login</html>", "text/html");
-    assert.equal(body, null);
-    assert.deepEqual(toVersionList(body), []);
-  });
-
   it("degrades to 'nothing detected' for migration sources", async () => {
     const body = await parsedBody("<html>login</html>", "text/html");
     // The user sees "No InfluxDB found" rather than
@@ -38,78 +32,7 @@ describe("a 200 response whose body is not JSON", () => {
 
   it("handles an empty body the same way", async () => {
     const body = await parsedBody("");
-    assert.deepEqual(toVersionList(body), []);
     assert.deepEqual(toMigrationSources(body), []);
-  });
-});
-
-describe("toVersionList", () => {
-  // `versions.filter(...)` runs during render with no error boundary above
-  // it, so a non-array here throws mid-render and unmounts the entire
-  // config panel — a blank area, no message.
-  it("passes a well-formed release list through", () => {
-    const body = [
-      { tag: "9.0.1", prerelease: false },
-      { tag: "9.1.0-rc1", prerelease: true },
-    ];
-    assert.deepEqual(toVersionList(body), body);
-  });
-
-  it("preserves an empty list", () => {
-    assert.deepEqual(toVersionList([]), []);
-  });
-
-  for (const [label, body] of [
-    ["an object", {}],
-    ["an error envelope", { error: "Bad Gateway" }],
-    ["null", null],
-    ["a bare string", "<html>502</html>"],
-    ["a number", 502],
-    ["undefined", undefined],
-  ] as const) {
-    it(`yields an empty list for ${label}`, () => {
-      const result = toVersionList(body);
-      assert.ok(Array.isArray(result), "must always return an array");
-      assert.equal(result.length, 0);
-      // The property that actually matters: the render-time call is safe.
-      assert.doesNotThrow(() => result.filter((v) => !v.prerelease));
-    });
-  }
-
-  it("drops malformed members but keeps the valid ones", () => {
-    // A single null element is as fatal as a non-array body: the render-time
-    // `versions.filter(v => !v.prerelease)` dereferences every member.
-    const body = [
-      { tag: "9.0.1", prerelease: false },
-      null,
-      { noTag: true },
-      "9.0.2",
-      { tag: "9.1.0-rc1", prerelease: true },
-    ];
-    const result = toVersionList(body);
-
-    assert.deepEqual(
-      result.map((v) => v.tag),
-      ["9.0.1", "9.1.0-rc1"],
-    );
-    assert.doesNotThrow(() => result.filter((v) => !v.prerelease));
-    assert.doesNotThrow(() => result.map((v) => v.tag.toUpperCase()));
-  });
-
-  it("drops releases whose prerelease flag is not a boolean", () => {
-    // The dropdown partitions on this flag, so a missing or coerced value
-    // would offer a pre-release as if it were the stable default.
-    const result = toVersionList([
-      { tag: "9.0.1", prerelease: false },
-      { tag: "9.0.2" },
-      { tag: "9.0.3", prerelease: "false" },
-      { tag: "9.0.4", prerelease: null },
-    ]);
-
-    assert.deepEqual(
-      result.map((v) => v.tag),
-      ["9.0.1"],
-    );
   });
 });
 
