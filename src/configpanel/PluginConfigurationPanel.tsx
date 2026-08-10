@@ -1391,14 +1391,12 @@ export default function PluginConfigurationPanel({
         </CollapsibleSection>
       )}
 
-      {/* Status */}
       <ActionStatus
         message={actionStatus}
         error={statusError}
         style={{ marginTop: 16 }}
       />
 
-      {/* Save */}
       <div style={{ marginTop: 24 }}>
         <Button onClick={doSave}>Save Configuration</Button>
       </div>
