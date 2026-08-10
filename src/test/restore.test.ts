@@ -504,3 +504,88 @@ describe("restore: query shape", () => {
     );
   });
 });
+
+describe("identity is restored over a longer window than motion (issue #127)", () => {
+  // A vessel's AIS static report — the one carrying its name — repeats only
+  // every ~6 minutes, while position arrives every few seconds. Sharing one
+  // window meant a target whose name landed just outside it came back
+  // UNNAMED: measured on a live install as 75 vessels restored and 0 named.
+
+  it("names a vessel whose identity is older than the motion window", () => {
+    const captured: Captured[] = [];
+    const { promise, deltas } = run(
+      [
+        position(AIS, 60_000),
+        // 40 minutes old: far outside the 9-minute motion window, and the
+        // whole point — this is a perfectly good name.
+        [ago(40 * 60_000), "name", AIS, "SEA BREEZE", "identity"] as Row,
+      ],
+      {},
+      captured,
+    );
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 1);
+      assert.equal(
+        result.skippedStale,
+        0,
+        "the row-level age check must use the identity window too, or it " +
+          "silently discards what the SQL reached back for",
+      );
+      const named = allValues(deltas[0]).find((v) => v.path === "");
+      assert.deepEqual(named?.value, { name: "SEA BREEZE" });
+    });
+  });
+
+  it("still refuses motion older than the short window", () => {
+    // The widened identity window must not leak into position: a stale fix
+    // draws a target somewhere it demonstrably is not.
+    const { promise, deltas } = run([
+      position(AIS, 40 * 60_000),
+      [ago(40 * 60_000), "name", AIS, "SEA BREEZE", "identity"] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 0, "no usable fix, so nothing to draw");
+      assert.equal(deltas.length, 0);
+    });
+  });
+
+  it("does not restore an identity-only vessel as a ghost target", () => {
+    // Reaching further back for names must not resurrect vessels that have
+    // no current position — they would be undrawable and never age out.
+    const { promise, deltas } = run([
+      [ago(40 * 60_000), "name", AIS, "SEA BREEZE", "identity"] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 0);
+      assert.equal(deltas.length, 0);
+    });
+  });
+
+  it("queries each path set with its own window", () => {
+    const captured: Captured[] = [];
+    const { promise } = run([position(AIS, 60_000)], {}, captured);
+
+    return promise.then(() => {
+      const sql = captured[0].sql;
+      // Motion is bounded at 9 minutes, identity at a flat 24 hours.
+      // Asserting the literal timestamps keeps the two windows from silently
+      // collapsing back into one.
+      assert.ok(
+        sql.includes(ago(9 * 60_000)),
+        "motion window missing from SQL",
+      );
+      assert.ok(
+        sql.includes(ago(24 * 60 * 60_000)),
+        "identity window missing from SQL",
+      );
+      // Position has no path column and is motion by definition.
+      assert.ok(
+        sql.includes(`signalk_position WHERE ts >= '${ago(9 * 60_000)}'`),
+        "position must keep the short window unconditionally",
+      );
+    });
+  });
+});
