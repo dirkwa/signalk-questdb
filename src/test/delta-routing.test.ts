@@ -247,6 +247,26 @@ describe("UnstorableTracker (issue #128)", () => {
     assert.strictEqual(t.truncated, false, "a known path is not a new one");
   });
 
+  it("counts an all-unstorable object once per leaf, not per leaf plus parent", () => {
+    // The handler reports `skipped` and nothing else. Also noting the parent
+    // would double-count one problem and burn a second slot against the cap,
+    // hitting it sooner and hiding genuinely distinct paths — measured at 16
+    // of 50 slots wasted on a stream of per-vessel wrapper objects.
+    const t = new UnstorableTracker();
+    const { leaves, skipped } = flattenObjectValue("some.wrapper", {
+      nested: { a: 1 },
+      alsoNested: { b: 2 },
+    });
+    for (const p of skipped) t.note(p);
+
+    assert.strictEqual(leaves.length, 0, "nothing storable in this object");
+    assert.deepStrictEqual(t.examples(10), [
+      "some.wrapper.nested",
+      "some.wrapper.alsoNested",
+    ]);
+    assert.strictEqual(t.size, 2, "two leaves, two entries — not three");
+  });
+
   it("resets fully on clear", () => {
     // The plugin clears this on stop: a path unstorable under one config may
     // not be under the next, so nothing may carry across a restart.

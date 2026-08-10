@@ -1231,13 +1231,15 @@ export default (app: App) => {
       } else if (route === "flatten") {
         // Object values are recorded as their scalar leaves (issue #128).
         const { leaves, skipped } = flattenObjectValue(path, value);
+        // Only the leaves are reported, never the parent as well. Each
+        // skipped leaf is already named here, so also noting the parent
+        // double-counts one problem and — worse — burns a second slot against
+        // the cap, hitting it sooner and hiding genuinely distinct paths.
+        //
+        // An object with NO storable leaf still gets reported: `skipped` then
+        // holds every key, so the drop is visible through them. The only
+        // silent case left is an empty object, which carries no data to lose.
         for (const leafPath of skipped) noteUnstorable(leafPath);
-        if (leaves.length === 0) {
-          // An object whose every leaf was unstorable stores nothing, so the
-          // parent path is dropped as surely as before — just visibly now.
-          noteUnstorable(path);
-          return;
-        }
         for (const leaf of leaves) {
           // Filtered and throttled on the LEAF path, not the parent: the
           // leaves are what the history API exposes, so excluding

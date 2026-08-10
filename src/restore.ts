@@ -78,7 +78,13 @@ const RESTORE_PATHS = [
   "navigation.headingMagnetic",
   "navigation.state",
   "design.aisShipType",
+  // `design.length` is an OBJECT in Signal K ({overall, hull}), so it is
+  // recorded as its leaves, not under the bare path — which never existed in
+  // the table and so restored nothing. Both spellings are listed: the leaf is
+  // what new data writes, and the bare path stays for databases recorded
+  // before flattening by a source that emitted it as a plain number.
   "design.length",
+  "design.length.overall",
   "design.beam",
   "mmsi",
   "name",
