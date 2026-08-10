@@ -1,24 +1,21 @@
 import type React from "react";
+import { panelStyles } from "signalk-container-helper/ui";
 
-// Inline styles for the config panel, kept in one object so the JSX reads as
-// structure rather than styling and shared chrome (buttons, cards, banners)
-// has a single definition to spread from.
+// Panel styles layered on signalk-container-helper's shared set.
+//
+// The helper already carries 32 of these keys with byte-identical values —
+// they were hand-copied between the container plugins before the library
+// existed. Only what is genuinely questdb's own is declared here, so a change
+// to the shared look reaches every panel at once instead of drifting per
+// plugin.
+//
+// btnDanger deliberately takes the HELPER's version rather than this panel's
+// former larger padding/fontSize. Converging on the shared sizing is the point
+// of adopting panelStyles, and both call sites — skipping a WAL segment and
+// purging all data — read fine at the standard size.
 export const S = {
-  root: {
-    fontFamily:
-      '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-    color: "#333",
-    padding: "16px 0",
-  },
-  sectionTitle: {
-    fontSize: 13,
-    fontWeight: 600,
-    color: "#888",
-    textTransform: "uppercase",
-    letterSpacing: "0.05em",
-    marginBottom: 10,
-    marginTop: 24,
-  },
+  ...panelStyles,
+
   // Chrome for a CollapsibleSection's header button. Spread OVER sectionTitle,
   // so the `color` here deliberately overrides that block's `#888`: a
   // collapsed section hides real settings, and at #888 the header read as a
@@ -41,48 +38,7 @@ export const S = {
   // The ▶ disclosure triangle. `transform` stays at the call site because it
   // is derived from open/closed state.
   sectionMarker: { fontSize: 11, transition: "transform 0.15s" },
-  btn: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 8,
-    padding: "8px 16px",
-    border: "none",
-    borderRadius: 6,
-    fontSize: 13,
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  btnPrimary: { background: "#3b82f6", color: "#fff" },
   btnSave: { background: "#3b82f6", color: "#fff" },
-  btnDanger: {
-    background: "#ef4444",
-    color: "#fff",
-    padding: "6px 12px",
-    fontSize: 12,
-  },
-  btnDisabled: { opacity: 0.5, cursor: "not-allowed" },
-  status: { marginTop: 8, fontSize: 12, minHeight: 18 },
-  warnBanner: {
-    padding: "12px 16px",
-    background: "#fef2f2",
-    border: "1px solid #fecaca",
-    borderRadius: 10,
-    marginBottom: 12,
-    fontSize: 13,
-    color: "#991b1b",
-    lineHeight: 1.5,
-  },
-  warnBannerTitle: { fontWeight: 700, marginBottom: 4 },
-  infoBanner: {
-    padding: "12px 16px",
-    background: "#fffbeb",
-    border: "1px solid #fde68a",
-    borderRadius: 10,
-    marginBottom: 12,
-    fontSize: 13,
-    color: "#92400e",
-    lineHeight: 1.5,
-  },
   warnBannerCode: {
     display: "block",
     marginTop: 8,
@@ -96,112 +52,11 @@ export const S = {
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
   },
-  card: {
-    display: "flex",
-    alignItems: "center",
-    gap: 14,
-    padding: "14px 18px",
-    background: "#f8f9fa",
-    border: "1px solid #e0e0e0",
-    borderRadius: 10,
-    marginBottom: 12,
-  },
-  cardIcon: {
-    width: 44,
-    height: 44,
-    borderRadius: 10,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 20,
-    fontWeight: 700,
-    flexShrink: 0,
-  },
-  cardInfo: { flex: 1 },
-  cardTitle: { fontSize: 15, fontWeight: 600, color: "#333" },
-  cardMeta: { fontSize: 12, color: "#888" },
-  stateIndicator: {
-    width: 10,
-    height: 10,
-    borderRadius: "50%",
-    flexShrink: 0,
-  },
-  fieldRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    marginBottom: 10,
-  },
-  label: {
-    fontSize: 13,
-    fontWeight: 500,
-    color: "#555",
-    width: 180,
-    flexShrink: 0,
-  },
-  select: {
-    padding: "6px 10px",
-    borderRadius: 6,
-    border: "1px solid #ccc",
-    fontSize: 13,
-    background: "#fff",
-    color: "#333",
-    minWidth: 200,
-  },
-  input: {
-    padding: "6px 10px",
-    borderRadius: 6,
-    border: "1px solid #ccc",
-    fontSize: 13,
-    background: "#fff",
-    color: "#333",
-    width: 200,
-  },
-  inputSmall: {
-    padding: "6px 10px",
-    borderRadius: 6,
-    border: "1px solid #ccc",
-    fontSize: 13,
-    background: "#fff",
-    color: "#333",
-    width: 80,
-  },
-  checkbox: { width: 16, height: 16, accentColor: "#3b82f6" },
-  hint: { fontSize: 11, color: "#aaa", marginLeft: 8 },
   // Helper text that has to be READ, not merely available — darker and larger
   // than `hint`. A `hint` sits below a field the user is already looking at;
   // this one has to out-argue a textarea's own grey placeholder, and at
   // hint's #aaa/11px it lost that argument (issue #123).
   fieldHelp: { fontSize: 12, color: "#666", marginTop: 6, lineHeight: 1.5 },
-  textarea: {
-    padding: "6px 10px",
-    borderRadius: 6,
-    border: "1px solid #ccc",
-    fontSize: 13,
-    fontFamily: "monospace",
-    background: "#fff",
-    color: "#333",
-    width: "100%",
-    minHeight: 70,
-    boxSizing: "border-box",
-    resize: "vertical",
-  },
-  empty: {
-    textAlign: "center",
-    padding: "30px 16px",
-    color: "#999",
-    fontSize: 13,
-  },
-  tag: {
-    display: "inline-block",
-    padding: "2px 8px",
-    borderRadius: 4,
-    fontSize: 10,
-    fontWeight: 600,
-    marginLeft: 8,
-  },
-  tagPre: { background: "#fef3c7", color: "#92400e" },
-  tagLatest: { background: "#dcfce7", color: "#166534" },
   migrationItem: {
     display: "flex",
     alignItems: "center",
@@ -217,21 +72,6 @@ export const S = {
     gap: 8,
     alignItems: "center",
   },
-  statsGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
-    gap: 10,
-    marginBottom: 12,
-  },
-  statCard: {
-    padding: "12px 16px",
-    background: "#f8f9fa",
-    border: "1px solid #e0e0e0",
-    borderRadius: 10,
-    textAlign: "center",
-  },
-  statValue: { fontSize: 22, fontWeight: 700, color: "#333" },
-  statLabel: { fontSize: 11, color: "#888", marginTop: 2 },
   // `satisfies` rather than a type annotation: it checks every value against
   // CSSProperties while keeping each key's literal type, so `textAlign:
   // "center"` stays assignable where a widened `string` would not. An
