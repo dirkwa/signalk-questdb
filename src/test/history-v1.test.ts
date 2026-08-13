@@ -704,3 +704,158 @@ describe("history-v1 streamHistory does not outlive its process", () => {
     );
   });
 });
+
+describe("history-v1 source attribution", () => {
+  // Rows as the unified query returns them since the source migration:
+  // ts, path, context, source, valuetext, kind.
+  function sourceMockClient(
+    captured: Captured[],
+    responder: (sql: string) => unknown[][],
+  ) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        const dataset = responder(sql);
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+      toObjects: (result: { dataset: unknown[][] }) =>
+        result.dataset.map((row) => ({
+          ts: row[0],
+          path: row[1],
+          context: row[2],
+          source: row[3],
+          valuetext: row[4],
+          kind: row[5],
+        })),
+    } as unknown as HistoryClient;
+  }
+
+  const getHistoryDeltas = (
+    responder: (sql: string) => unknown[][],
+    captured: Captured[] = [],
+  ) => {
+    const provider = createHistoryProviderV1(
+      sourceMockClient(captured, responder),
+      SELF,
+      noop,
+    );
+    return new Promise<any[]>((resolve) =>
+      provider.getHistory(new Date("2024-01-01T00:00:00Z"), "", resolve),
+    );
+  };
+
+  it("replays each source as its own $source-labelled update", async () => {
+    // Two receivers' rows sharing a timestamp must not merge into one
+    // update — a single $source would misattribute one receiver's fix to
+    // the other, exactly the ambiguity the source column exists to remove.
+    const ts = "2024-01-01T00:00:00.000000Z";
+    const deltas = await getHistoryDeltas(() => [
+      [ts, "navigation.position", "self", "gps.main", "60.1,24.9", "position"],
+      [
+        ts,
+        "navigation.position",
+        "self",
+        "gps.backup",
+        "60.2,24.8",
+        "position",
+      ],
+      [ts, "environment.depth.belowKeel", "self", null, "3.2", "number"],
+    ]);
+
+    assert.equal(deltas.length, 3);
+    const bySource = new Map(
+      deltas.map((d: any) => [d.updates[0].$source, d.updates[0].values]),
+    );
+    assert.deepEqual(bySource.get("gps.main"), [
+      {
+        path: "navigation.position",
+        value: { latitude: 60.1, longitude: 24.9 },
+      },
+    ]);
+    assert.deepEqual(bySource.get("gps.backup"), [
+      {
+        path: "navigation.position",
+        value: { latitude: 60.2, longitude: 24.8 },
+      },
+    ]);
+    // The pre-migration row (source null) replays without a $source at all.
+    assert.deepEqual(bySource.get(undefined), [
+      { path: "environment.depth.belowKeel", value: 3.2 },
+    ]);
+    const unlabelled = deltas.find((d: any) => !d.updates[0].$source);
+    assert.ok(!("$source" in unlabelled.updates[0]));
+  });
+
+  it("selects the source column from every table", async () => {
+    const captured: Captured[] = [];
+    await getHistoryDeltas(() => [], captured);
+    const branches = captured[0].sql.split("UNION ALL");
+    assert.equal(branches.length, 3);
+    for (const branch of branches) {
+      assert.ok(
+        branch.includes("CAST(source AS STRING) source"),
+        `every branch must carry source, got: ${branch}`,
+      );
+    }
+  });
+
+  it("retries without source when the column is not migrated yet", async () => {
+    const captured: Captured[] = [];
+    const deltas = await getHistoryDeltas((sql) => {
+      if (sql.includes("CAST(source AS STRING)")) {
+        throw new Error("Invalid column: source");
+      }
+      return [
+        [
+          "2024-01-01T00:00:00.000000Z",
+          "environment.depth.belowKeel",
+          "self",
+          null,
+          "3.2",
+          "number",
+        ],
+      ];
+    }, captured);
+
+    assert.equal(captured.length, 2);
+    assert.ok(
+      captured[1].sql.includes("CAST(NULL AS STRING) source"),
+      `retry must degrade source to NULL, got: ${captured[1].sql}`,
+    );
+    assert.equal(deltas.length, 1);
+    assert.ok(!("$source" in deltas[0].updates[0]));
+  });
+
+  it("drops value_kind and source independently when both are missing", async () => {
+    // An external QuestDB the plugin does not own can predate BOTH
+    // migrations; each retry must shed only the column actually complained
+    // about, or the fallback ladder never reaches a query that runs.
+    const captured: Captured[] = [];
+    const deltas = await getHistoryDeltas((sql) => {
+      if (sql.includes("CAST(value_kind AS STRING)")) {
+        throw new Error("Invalid column: value_kind");
+      }
+      if (sql.includes("CAST(source AS STRING)")) {
+        throw new Error("Invalid column: source");
+      }
+      return [
+        [
+          "2024-01-01T00:00:00.000000Z",
+          "environment.depth.belowKeel",
+          "self",
+          null,
+          "3.2",
+          "number",
+        ],
+      ];
+    }, captured);
+
+    assert.equal(captured.length, 3);
+    assert.ok(
+      captured[2].sql.includes("CAST(NULL AS STRING) source") &&
+        !captured[2].sql.includes("CAST(value_kind"),
+      `final query must run with both degraded, got: ${captured[2].sql}`,
+    );
+    assert.equal(deltas.length, 1);
+  });
+});

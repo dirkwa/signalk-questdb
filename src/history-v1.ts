@@ -10,6 +10,7 @@ interface Delta {
   context: string;
   updates: {
     timestamp: string;
+    $source?: string;
     values: { path: string; value: unknown }[];
   }[];
 }
@@ -25,9 +26,18 @@ interface Delta {
 // branch — the snapshot's LATEST ON clause. Keeping every branch here is the
 // point: the snapshot query used to re-implement these by hand and drifted,
 // silently replaying booleans as text on that path only.
-function numBranch(where: string, tail = ""): string {
+// `withSource: false` degrades like `withKind: false` below: the source
+// column is a later migration still, so a read racing ensureTables() (or an
+// external QuestDB the plugin does not own) replays unattributed rather than
+// not at all.
+function sourceCol(withSource: boolean): string {
+  return withSource ? `CAST(source AS STRING)` : `CAST(NULL AS STRING)`;
+}
+
+function numBranch(where: string, withSource: boolean, tail = ""): string {
   return (
-    `SELECT ts, path, context, CAST(value AS STRING) valuetext, ` +
+    `SELECT ts, path, context, ${sourceCol(withSource)} source, ` +
+    `CAST(value AS STRING) valuetext, ` +
     `'number' kind FROM signalk WHERE ${where}${tail}`
   );
 }
@@ -38,18 +48,25 @@ function numBranch(where: string, tail = ""): string {
 // union with "Invalid column: value_kind" — turning a missing type tag into
 // no history at all. The NULL is cast so the union's column type is stated
 // rather than inferred.
-function strBranch(where: string, withKind: boolean, tail = ""): string {
+function strBranch(
+  where: string,
+  withKind: boolean,
+  withSource: boolean,
+  tail = "",
+): string {
   const kind = withKind ? `CAST(value_kind AS STRING)` : `CAST(NULL AS STRING)`;
   return (
-    `SELECT ts, path, context, value_str valuetext, ${kind} kind ` +
+    `SELECT ts, path, context, ${sourceCol(withSource)} source, ` +
+    `value_str valuetext, ${kind} kind ` +
     `FROM signalk_str WHERE ${where}${tail}`
   );
 }
 
 // The track table has no path column, so the path is supplied as a literal.
-function posBranch(where: string, tail = ""): string {
+function posBranch(where: string, withSource: boolean, tail = ""): string {
   return (
     `SELECT ts, 'navigation.position' path, context, ` +
+    `${sourceCol(withSource)} source, ` +
     `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, ` +
     `'position' kind FROM signalk_position WHERE ${where}${tail}`
   );
@@ -59,17 +76,26 @@ function unionValueRowsSQL(
   where: string,
   orderAndLimit: string,
   withKind = true,
+  withSource = true,
 ): string {
   return (
-    `${numBranch(where)} UNION ALL ` +
-    `${strBranch(where, withKind)} UNION ALL ` +
-    `${posBranch(where)} ${orderAndLimit}`
+    `${numBranch(where, withSource)} UNION ALL ` +
+    `${strBranch(where, withKind, withSource)} UNION ALL ` +
+    `${posBranch(where, withSource)} ${orderAndLimit}`
   );
 }
 
 // True for the error QuestDB returns when value_kind has not been added yet.
 function isMissingKindColumn(err: unknown): boolean {
   return /Invalid column:\s*value_kind/i.test(
+    err instanceof Error ? err.message : String(err),
+  );
+}
+
+// Same, for the source column (a later migration than value_kind, so each
+// can be missing independently of the other).
+function isMissingSourceColumn(err: unknown): boolean {
+  return /Invalid column:\s*source/i.test(
     err instanceof Error ? err.message : String(err),
   );
 }
@@ -107,14 +133,27 @@ function decodeValue(row: Record<string, unknown>): unknown {
 }
 
 function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
+  // Grouped by (ts, context, source): mixing two sources' rows into one
+  // update would force a single $source label onto both, so each source
+  // gets its own update — exactly how the live deltas arrived. Rows with no
+  // recorded source (pre-migration data) group under `undefined` and replay
+  // without a $source, as before.
   const byTimestamp = new Map<
     string,
-    Map<string, { path: string; value: unknown }[]>
+    Map<
+      string,
+      {
+        context: string;
+        source?: string;
+        values: { path: string; value: unknown }[];
+      }
+    >
   >();
 
   for (const row of rows) {
     const ts = row.ts as string;
     const context = (row.context as string) || "self";
+    const source = typeof row.source === "string" ? row.source : undefined;
     const path = row.path as string;
     // Both call sites query the unified shape, so every row carries
     // `valuetext` + `kind` for decodeValue to reconstruct.
@@ -123,18 +162,21 @@ function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
     if (!byTimestamp.has(ts)) {
       byTimestamp.set(ts, new Map());
     }
-    const byContext = byTimestamp.get(ts)!;
-    if (!byContext.has(context)) {
-      byContext.set(context, []);
+    const byGroup = byTimestamp.get(ts)!;
+    // A NUL byte can appear in neither a context nor a sourceRef, so the
+    // composite key is unambiguous.
+    const groupKey = source ? `${context}\u0000${source}` : context;
+    if (!byGroup.has(groupKey)) {
+      byGroup.set(groupKey, { context, source, values: [] });
     }
     // Vessel-name rows are stored under the synthetic path "name" (tagged
     // kind "identity") but were received as empty-path object deltas —
     // replay them in that original shape, the only one consumers
     // (Freeboard) read names from. The kind gate keeps a data path
     // literally named "name" replaying as the plain string it is.
-    byContext
-      .get(context)!
-      .push(
+    byGroup
+      .get(groupKey)!
+      .values.push(
         path === "name" && row.kind === "identity" && typeof value === "string"
           ? { path: "", value: { name: value } }
           : { path, value },
@@ -142,11 +184,15 @@ function groupRowsIntoDeltas(rows: Record<string, unknown>[]): Delta[] {
   }
 
   const deltas: Delta[] = [];
-  for (const [ts, byContext] of byTimestamp) {
-    for (const [context, values] of byContext) {
+  for (const [ts, byGroup] of byTimestamp) {
+    for (const { context, source, values } of byGroup.values()) {
       deltas.push({
         context,
-        updates: [{ timestamp: ts, values }],
+        updates: [
+          source
+            ? { timestamp: ts, $source: source, values }
+            : { timestamp: ts, values },
+        ],
       });
     }
   }
@@ -193,6 +239,33 @@ export function createHistoryProviderV1(
   selfContext: string,
   debug: (msg: string) => void,
 ) {
+  // Run a unified read, retrying without whichever optional column QuestDB
+  // reports missing. value_kind and source are separate migrations, so
+  // either — or both, on an external database ensureTables() has not
+  // touched — can be absent independently; each retry drops only the column
+  // actually complained about.
+  async function execUnified(
+    build: (withKind: boolean, withSource: boolean) => string,
+  ) {
+    let withKind = true;
+    let withSource = true;
+    for (;;) {
+      try {
+        return await queryClient.exec(build(withKind, withSource));
+      } catch (err) {
+        if (withKind && isMissingKindColumn(err)) {
+          withKind = false;
+          continue;
+        }
+        if (withSource && isMissingSourceColumn(err)) {
+          withSource = false;
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   function hasAnyData(
     options: HistoryOptions,
     callback: (hasResults: boolean) => void,
@@ -272,12 +345,9 @@ export function createHistoryProviderV1(
       try {
         const window = `ts >= '${from}' AND ts < '${to}'`;
         const order = `ORDER BY ts LIMIT ${CHUNK_ROW_LIMIT}`;
-        const result = await queryClient
-          .exec(unionValueRowsSQL(window, order))
-          .catch((err) => {
-            if (!isMissingKindColumn(err)) throw err;
-            return queryClient.exec(unionValueRowsSQL(window, order, false));
-          });
+        const result = await execUnified((withKind, withSource) =>
+          unionValueRowsSQL(window, order, withKind, withSource),
+        );
 
         if (result.dataset.length === 0) {
           currentTime = chunkEnd;
@@ -413,19 +483,14 @@ export function createHistoryProviderV1(
     const at = `ts <= '${ts}'`;
     const byPath = ` LATEST ON ts PARTITION BY path, context`;
     const byContext = ` LATEST ON ts PARTITION BY context`;
-    const snapshotSQL = (withKind: boolean) =>
-      `(${numBranch(at, byPath)})` +
+    const snapshotSQL = (withKind: boolean, withSource: boolean) =>
+      `(${numBranch(at, withSource, byPath)})` +
       ` UNION ALL ` +
-      `(${strBranch(at, withKind, byPath)})` +
+      `(${strBranch(at, withKind, withSource, byPath)})` +
       ` UNION ALL ` +
-      `(${posBranch(at, byContext)})`;
+      `(${posBranch(at, withSource, byContext)})`;
 
-    queryClient
-      .exec(snapshotSQL(true))
-      .catch((err) => {
-        if (!isMissingKindColumn(err)) throw err;
-        return queryClient.exec(snapshotSQL(false));
-      })
+    execUnified(snapshotSQL)
       .then((result) => {
         const rows = queryClient.toObjects(result);
         const deltas = groupRowsIntoDeltas(rows);

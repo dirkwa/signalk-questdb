@@ -119,11 +119,12 @@ export class QueryClient {
         ts        TIMESTAMP,
         path      SYMBOL CAPACITY 512 CACHE,
         context   SYMBOL CAPACITY 128 CACHE,
+        source    SYMBOL CAPACITY 256 CACHE,
         value     DOUBLE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP UPSERT KEYS(ts, path, context)
+        DEDUP UPSERT KEYS(ts, path, context, source)
     `);
 
     await this.exec(`
@@ -131,12 +132,13 @@ export class QueryClient {
         ts         TIMESTAMP,
         path       SYMBOL CAPACITY 256 CACHE,
         context    SYMBOL CAPACITY 128 CACHE,
+        source     SYMBOL CAPACITY 256 CACHE,
         value_str  VARCHAR,
         value_kind SYMBOL CAPACITY 8 CACHE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP UPSERT KEYS(ts, path, context)
+        DEDUP UPSERT KEYS(ts, path, context, source)
     `);
 
     // Tables created before value_kind existed keep working: CREATE TABLE IF
@@ -153,13 +155,31 @@ export class QueryClient {
       CREATE TABLE IF NOT EXISTS signalk_position (
         ts        TIMESTAMP,
         context   SYMBOL CAPACITY 128 CACHE,
+        source    SYMBOL CAPACITY 256 CACHE,
         lat       DOUBLE,
         lon       DOUBLE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP UPSERT KEYS(ts, context)
+        DEDUP UPSERT KEYS(ts, context, source)
     `);
+
+    // Same migration pattern for `source` (the delta's sourceRef): rows from
+    // before the column have source = null, which reads back as "unknown" —
+    // there is nothing to backfill them from. The dedup keys must grow with
+    // the column, or two sources stamped identically (only possible on ILP
+    // batch replay, where original stamps are kept) would upsert over each
+    // other and replay-idempotency would silently drop one source's row.
+    for (const [table, keys] of [
+      ["signalk", "ts, path, context, source"],
+      ["signalk_str", "ts, path, context, source"],
+      ["signalk_position", "ts, context, source"],
+    ] as const) {
+      await this.exec(
+        `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS source SYMBOL CAPACITY 256 CACHE`,
+      );
+      await this.exec(`ALTER TABLE ${table} DEDUP ENABLE UPSERT KEYS(${keys})`);
+    }
   }
 
   // QuestDB's ILP ingestion auto-creates a missing table, but names the

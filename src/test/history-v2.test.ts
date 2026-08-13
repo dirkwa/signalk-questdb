@@ -636,3 +636,221 @@ describe("history-v2 path and context discovery", () => {
     );
   });
 });
+
+describe("history-v2 sourceRef filtering", () => {
+  // The server delivers `paths=<path>|<sourceRef>` (signalk-server #2737) as
+  // PathSpec.sourceRef. Filtering happens in SQL — the rows carry a `source`
+  // column since the same-named migration — and the spec's sourceRef is
+  // echoed in the response metadata so a caller can tell the columns apart.
+  function mockClient(
+    captured: CapturedQuery[],
+    responder: (sql: string) => unknown[][],
+  ) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        const dataset = responder(sql);
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+    } as any;
+  }
+
+  const range = {
+    from: { toString: () => "2024-01-01T00:00:00Z" },
+    to: { toString: () => "2024-01-01T01:00:00Z" },
+    context: "self",
+  };
+
+  it("adds a source clause when the spec carries a sourceRef", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, () => [["2024-01-01T00:00:01.000000Z", 4.2]]),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      ...range,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+          sourceRef: "n2k-on-ve.can0.115",
+        },
+      ],
+    } as any);
+
+    assert.ok(
+      captured[0].sql.includes("AND source = 'n2k-on-ve.can0.115'"),
+      `expected a source filter, got: ${captured[0].sql}`,
+    );
+  });
+
+  it("omits the source clause when no sourceRef is given", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, () => [["2024-01-01T00:00:01.000000Z", 4.2]]),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      ...range,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+        },
+      ],
+    } as any);
+
+    assert.ok(
+      !captured[0].sql.includes("source ="),
+      `expected no source filter, got: ${captured[0].sql}`,
+    );
+  });
+
+  it("filters the position table by source too", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, () => [["2024-01-01T00:00:01.000000Z", 60.1, 24.9]]),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      ...range,
+      pathSpecs: [
+        {
+          path: "navigation.position",
+          aggregate: "first",
+          parameter: [],
+          sourceRef: "gps.main",
+        },
+      ],
+    } as any);
+
+    assert.ok(
+      captured[0].sql.includes("signalk_position") &&
+        captured[0].sql.includes("AND source = 'gps.main'"),
+      `expected a source-filtered position query, got: ${captured[0].sql}`,
+    );
+  });
+
+  it("keeps the source clause on the string-table fallback", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:01.000000Z", "true"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      ...range,
+      pathSpecs: [
+        {
+          path: "switches.bilge.state",
+          aggregate: "first",
+          parameter: [],
+          sourceRef: "n2k-on-ve.can0.42",
+        },
+      ],
+    } as any);
+
+    const fallback = captured.find((c) => c.sql.includes("signalk_str"));
+    assert.ok(fallback, "expected the string-table fallback to run");
+    assert.ok(
+      fallback.sql.includes("AND source = 'n2k-on-ve.can0.42'"),
+      `fallback must keep the source filter, got: ${fallback.sql}`,
+    );
+  });
+
+  it("echoes the sourceRef in the values metadata", async () => {
+    const provider = createHistoryProviderV2(
+      mockClient([], () => [["2024-01-01T00:00:01.000000Z", 4.2]]),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues({
+      ...range,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+          sourceRef: "gps.main",
+        },
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+        },
+      ],
+    } as any);
+
+    assert.equal(result.values[0].sourceRef, "gps.main");
+    assert.ok(
+      !("sourceRef" in result.values[1]),
+      "an unfiltered spec must not grow a sourceRef",
+    );
+  });
+
+  it("serves the same path from two sources as two distinct columns", async () => {
+    // sourceRef filtering is what makes the same path twice in one request
+    // meaningful; keyed by path the second spec's rows would overwrite the
+    // first's and both columns would show the same series.
+    const provider = createHistoryProviderV2(
+      mockClient([], (sql) => {
+        if (sql.includes("source = 'gps.main'"))
+          return [["2024-01-01T00:00:01.000000Z", 1.1]];
+        if (sql.includes("source = 'gps.backup'"))
+          return [["2024-01-01T00:00:01.000000Z", 2.2]];
+        return [];
+      }),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues({
+      ...range,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+          sourceRef: "gps.main",
+        },
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+          sourceRef: "gps.backup",
+        },
+      ],
+    } as any);
+
+    assert.deepEqual(result.data, [["2024-01-01T00:00:01.000000Z", 1.1, 2.2]]);
+  });
+
+  it("rejects a sourceRef that is not a safe identifier", async () => {
+    const provider = createHistoryProviderV2(
+      mockClient([], () => []),
+      SELF_CONTEXT,
+    );
+
+    await assert.rejects(() =>
+      provider.getValues({
+        ...range,
+        pathSpecs: [
+          {
+            path: "navigation.speedOverGround",
+            aggregate: "average",
+            parameter: [],
+            sourceRef: "x'; DROP TABLE signalk",
+          },
+        ],
+      } as any),
+    );
+  });
+});

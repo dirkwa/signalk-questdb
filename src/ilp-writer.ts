@@ -280,10 +280,20 @@ export class ILPWriter {
     return this.lastNanos;
   }
 
-  write(path: string, context: string, value: number, timestamp?: Date): void {
+  // `source` is the delta's sourceRef, a tag (SYMBOL) like the other
+  // dimensions. Omitted when the delta carried none, leaving the column null —
+  // exactly how rows written before the column existed read back.
+  write(
+    path: string,
+    context: string,
+    value: number,
+    timestamp?: Date,
+    source?: string,
+  ): void {
     const ts = this.nextNanos(timestamp);
+    const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     this.enqueue(
-      `signalk,path=${escapeTag(path)},context=${escapeTag(context)} value=${value} ${ts}\n`,
+      `signalk,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag} value=${value} ${ts}\n`,
     );
   }
 
@@ -298,11 +308,13 @@ export class ILPWriter {
     value: string,
     timestamp?: Date,
     kind?: "boolean" | "identity",
+    source?: string,
   ): void {
     const ts = this.nextNanos(timestamp);
+    const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     const kindTag = kind ? `,value_kind=${escapeTag(kind)}` : "";
     this.enqueue(
-      `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)}${kindTag} value_str="${escapeFieldString(value)}" ${ts}\n`,
+      `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag}${kindTag} value_str="${escapeFieldString(value)}" ${ts}\n`,
     );
   }
 
@@ -312,10 +324,12 @@ export class ILPWriter {
     context: string,
     position: { latitude: number; longitude: number },
     timestamp?: Date,
+    source?: string,
   ): void {
     const ts = this.nextNanos(timestamp);
+    const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     this.enqueue(
-      `signalk_position,context=${escapeTag(context)} lat=${position.latitude},lon=${position.longitude} ${ts}\n`,
+      `signalk_position,context=${escapeTag(context)}${sourceTag} lat=${position.latitude},lon=${position.longitude} ${ts}\n`,
     );
   }
 
