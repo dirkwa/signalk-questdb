@@ -198,11 +198,15 @@ export class QueryClient {
         // table (which the mismatch probe cannot see) rejects DEDUP too,
         // and failing startup over it would brick recording against a
         // database that worked fine before this migration existed. The
-        // cost of continuing is bounded — dedup stays off, so a replayed
-        // ILP batch may store duplicate rows on that table.
+        // warning states the condition, not a resulting mode, because the
+        // resulting mode differs by prior state: a non-WAL table has no
+        // dedup at all (replay may duplicate rows), while an old-version
+        // table whose ALTER timed out keeps dedup ON with the stale keys
+        // (two sources sharing a stamp upsert-collide) — opposite failures.
         if (await this.hasSchemaMismatch(table)) continue;
         onWarning(
-          `${table}: source migration incomplete, deduplication stays off ` +
+          `${table}: source migration incomplete, deduplication keys were ` +
+            `not updated to include source ` +
             `(${err instanceof Error ? err.message : String(err)})`,
         );
       }

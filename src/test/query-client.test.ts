@@ -407,6 +407,9 @@ describe("QueryClient.ensureTables schema migration", () => {
 
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /signalk_str/);
-    assert.match(warnings[0], /deduplication stays off/);
+    // The message must state the condition (keys not updated), not a
+    // resulting mode: depending on prior state dedup may be fully off
+    // (non-WAL) or still on with the stale keys (timed-out ALTER).
+    assert.match(warnings[0], /deduplication keys were not updated/);
   });
 });
