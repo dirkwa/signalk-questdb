@@ -826,6 +826,67 @@ describe("history-v1 source attribution", () => {
     assert.ok(!("$source" in deltas[0].updates[0]));
   });
 
+  it("keeps the degraded source flag for the whole playback session", async () => {
+    // A playback reads once per minute of history; re-probing a missing
+    // column on every chunk pays a rejected statement per chunk on QuestDB's
+    // single shared worker. The probe must run once per session, not once
+    // per chunk — while one-shot reads (getHistory) still re-probe.
+    const windowReads: string[] = [];
+    const client = {
+      exec: async (sql: string) => {
+        if (sql.includes("LATEST ON")) {
+          return { columns: [], dataset: [], count: 0, timestamp: 0 };
+        }
+        windowReads.push(sql);
+        if (sql.includes("CAST(source AS STRING)")) {
+          throw new Error("Invalid column: source");
+        }
+        const dataset = [
+          [
+            "2024-01-01T00:00:00.000000Z",
+            "environment.depth.belowKeel",
+            "self",
+            null,
+            "3.2",
+            "number",
+          ],
+        ];
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+      toObjects: (result: { dataset: unknown[][] }) =>
+        result.dataset.map((row) => ({
+          ts: row[0],
+          path: row[1],
+          context: row[2],
+          source: row[3],
+          valuetext: row[4],
+          kind: row[5],
+        })),
+    } as unknown as HistoryClient;
+
+    const provider = createHistoryProviderV1(client, SELF, noop);
+    const stop = provider.streamHistory(
+      { write: () => {}, on: () => {} },
+      { startTime: new Date("2024-01-01T00:00:00Z"), playbackRate: 1000 },
+      () => {},
+    );
+    const deadline = Date.now() + 2000;
+    while (windowReads.length < 4 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    stop();
+    assert.ok(windowReads.length >= 4, `got ${windowReads.length} reads`);
+
+    const probes = windowReads.filter((q) =>
+      q.includes("CAST(source AS STRING)"),
+    );
+    assert.equal(
+      probes.length,
+      1,
+      "only the session's first chunk may probe the missing column",
+    );
+  });
+
   it("drops value_kind and source independently when both are missing", async () => {
     // An external QuestDB the plugin does not own can predate BOTH
     // migrations; each retry must shed only the column actually complained

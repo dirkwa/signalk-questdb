@@ -113,7 +113,12 @@ export class QueryClient {
     }
   }
 
-  async ensureTables(): Promise<void> {
+  // `onWarning` surfaces a non-fatal migration failure (see the source
+  // migration below); the default keeps callers that can't log — tests,
+  // the console proxy — from having to care.
+  async ensureTables(
+    onWarning: (msg: string) => void = () => {},
+  ): Promise<void> {
     await this.exec(`
       CREATE TABLE IF NOT EXISTS signalk (
         ts        TIMESTAMP,
@@ -175,10 +180,32 @@ export class QueryClient {
       ["signalk_str", "ts, path, context, source"],
       ["signalk_position", "ts, context, source"],
     ] as const) {
-      await this.exec(
-        `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS source SYMBOL CAPACITY 256 CACHE`,
-      );
-      await this.exec(`ALTER TABLE ${table} DEDUP ENABLE UPSERT KEYS(${keys})`);
+      try {
+        await this.exec(
+          `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS source SYMBOL CAPACITY 256 CACHE`,
+        );
+        await this.exec(
+          `ALTER TABLE ${table} DEDUP ENABLE UPSERT KEYS(${keys})`,
+        );
+      } catch (err) {
+        // A table ILP auto-created with the wrong schema (designated
+        // timestamp `timestamp`, no `ts`) rejects these keys. Throwing here
+        // would abort startup BEFORE healSchema() gets its turn — and the
+        // heal fixes exactly this table, recreating it with the right
+        // columns and keys. So a mismatched table skips quietly.
+        //
+        // Everything else is reported but not fatal: a non-WAL external
+        // table (which the mismatch probe cannot see) rejects DEDUP too,
+        // and failing startup over it would brick recording against a
+        // database that worked fine before this migration existed. The
+        // cost of continuing is bounded — dedup stays off, so a replayed
+        // ILP batch may store duplicate rows on that table.
+        if (await this.hasSchemaMismatch(table)) continue;
+        onWarning(
+          `${table}: source migration incomplete, deduplication stays off ` +
+            `(${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
     }
   }
 
@@ -222,10 +249,13 @@ export class QueryClient {
   // The rows ILP wrote into the wrong-schema table are lost, but they are
   // unreadable anyway (history API and status query filter on `ts`, which the
   // auto-created table lacks).
-  async healSchema(table: string): Promise<boolean> {
+  async healSchema(
+    table: string,
+    onWarning: (msg: string) => void = () => {},
+  ): Promise<boolean> {
     if (!(await this.hasSchemaMismatch(table))) return false;
     await this.exec(`DROP TABLE IF EXISTS ${validateIdentifier(table)}`);
-    await this.ensureTables();
+    await this.ensureTables(onWarning);
     return true;
   }
 

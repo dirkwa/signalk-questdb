@@ -364,4 +364,49 @@ describe("QueryClient.ensureTables schema migration", () => {
       );
     }
   });
+
+  it("skips the dedup migration quietly on a wrong-schema table", async () => {
+    // An ILP auto-created table (designated timestamp `timestamp`) rejects
+    // UPSERT KEYS naming `ts`. Throwing would abort startup BEFORE
+    // healSchema() runs — and the heal is what fixes this exact table — so
+    // the mismatch case must neither throw nor warn, and the remaining
+    // tables must still get their migration.
+    const warnings: string[] = [];
+    const { client, sql } = stubClient((q) => {
+      if (q.includes("ALTER TABLE signalk DEDUP ENABLE")) {
+        throw new Error("Invalid column: ts");
+      }
+      if (q.includes("table_columns('signalk')")) return tsRow("timestamp");
+      return emptyResult;
+    });
+    await client.ensureTables((msg) => warnings.push(msg));
+
+    assert.deepEqual(warnings, []);
+    for (const table of ["signalk_str", "signalk_position"]) {
+      assert.ok(
+        sql.some((q) => q.includes(`ALTER TABLE ${table} DEDUP ENABLE`)),
+        `${table} must still be migrated after signalk's failure`,
+      );
+    }
+  });
+
+  it("warns instead of throwing when dedup fails on a well-shaped table", async () => {
+    // A non-WAL external table also rejects DEDUP ENABLE, but looks healthy
+    // to the mismatch probe (its designated timestamp IS `ts`). healSchema
+    // will never rebuild it, so the degradation has to be reported — while
+    // still not failing a startup that worked before this migration existed.
+    const warnings: string[] = [];
+    const { client } = stubClient((q) => {
+      if (q.includes("ALTER TABLE signalk_str DEDUP ENABLE")) {
+        throw new Error("table is not WAL enabled");
+      }
+      if (q.includes("table_columns('signalk_str')")) return tsRow("ts");
+      return emptyResult;
+    });
+    await client.ensureTables((msg) => warnings.push(msg));
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /signalk_str/);
+    assert.match(warnings[0], /deduplication stays off/);
+  });
 });

@@ -244,21 +244,27 @@ export function createHistoryProviderV1(
   // either — or both, on an external database ensureTables() has not
   // touched — can be absent independently; each retry drops only the column
   // actually complained about.
+  //
+  // `state` lets a caller keep the degraded flags across calls: a playback
+  // session issues one read per minute of history, and re-probing from
+  // scratch each time pays two rejected statements per chunk on QuestDB's
+  // single shared worker. The default (a fresh object per call) keeps
+  // one-shot reads re-probing, so a read that raced the migration recovers
+  // on the next request rather than staying degraded until restart.
   async function execUnified(
     build: (withKind: boolean, withSource: boolean) => string,
+    state = { withKind: true, withSource: true },
   ) {
-    let withKind = true;
-    let withSource = true;
     for (;;) {
       try {
-        return await queryClient.exec(build(withKind, withSource));
+        return await queryClient.exec(build(state.withKind, state.withSource));
       } catch (err) {
-        if (withKind && isMissingKindColumn(err)) {
-          withKind = false;
+        if (state.withKind && isMissingKindColumn(err)) {
+          state.withKind = false;
           continue;
         }
-        if (withSource && isMissingSourceColumn(err)) {
-          withSource = false;
+        if (state.withSource && isMissingSourceColumn(err)) {
+          state.withSource = false;
           continue;
         }
         throw err;
@@ -334,6 +340,11 @@ export function createHistoryProviderV1(
     // several reads rather than truncated (see the resume logic below).
     const CHUNK_ROW_LIMIT = 10000;
     let currentTime = new Date(startTime);
+    // Session-scoped degraded-column flags: probe the optional columns once,
+    // then remember for every chunk of this playback (see execUnified). A
+    // new session starts fresh, so a mid-migration race degrades one
+    // playback, not the provider's lifetime.
+    const columnState = { withKind: true, withSource: true };
 
     async function streamChunk() {
       if (stopped) return;
@@ -345,8 +356,10 @@ export function createHistoryProviderV1(
       try {
         const window = `ts >= '${from}' AND ts < '${to}'`;
         const order = `ORDER BY ts LIMIT ${CHUNK_ROW_LIMIT}`;
-        const result = await execUnified((withKind, withSource) =>
-          unionValueRowsSQL(window, order, withKind, withSource),
+        const result = await execUnified(
+          (withKind, withSource) =>
+            unionValueRowsSQL(window, order, withKind, withSource),
+          columnState,
         );
 
         if (result.dataset.length === 0) {

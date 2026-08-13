@@ -318,7 +318,7 @@ export default (app: App) => {
     try {
       let mismatch = false;
       for (const table of OWNED_TABLES) {
-        if (await queryClient.healSchema(table)) {
+        if (await queryClient.healSchema(table, (msg) => app.error(msg))) {
           app.debug(
             `Rebuilt ${table}: ILP had auto-created it with a wrong schema`,
           );
@@ -925,7 +925,9 @@ export default (app: App) => {
     }
 
     app.setPluginStatus("Creating tables...");
-    await queryClient.ensureTables();
+    // A migration that degrades (dedup off on an external table) is worth a
+    // line in the server log, but must never abort startup — see ensureTables.
+    await queryClient.ensureTables((msg) => app.error(msg));
     // A prior crash/drop may have left an ILP-auto-created `signalk` table with
     // the wrong (`timestamp`, not `ts`) schema; heal it before the writer can
     // ingest into the broken shape.
