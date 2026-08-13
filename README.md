@@ -44,11 +44,11 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 
 Three tables, all with WAL mode, daily partitioning, and deduplication:
 
-| Table              | Purpose        | Columns                                                          |
-| ------------------ | -------------- | ---------------------------------------------------------------- |
-| `signalk`          | Numeric values | `ts`, `path` (SYMBOL), `context` (SYMBOL), `value` (DOUBLE)      |
-| `signalk_str`      | String values  | `ts`, `path` (SYMBOL), `context` (SYMBOL), `value_str` (VARCHAR) |
-| `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)         |
+| Table              | Purpose        | Columns                                                                                        |
+| ------------------ | -------------- | ---------------------------------------------------------------------------------------------- |
+| `signalk`          | Numeric values | `ts`, `path` (SYMBOL), `context` (SYMBOL), `source` (SYMBOL), `value` (DOUBLE)                 |
+| `signalk_str`      | String values  | `ts`, `path` (SYMBOL), `context` (SYMBOL), `source` (SYMBOL), `value_str` (VARCHAR), `value_kind` (SYMBOL) |
+| `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `source` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)                    |
 
 `ts` is the **server receive time**, not the timestamp a source claims. Marine
 sources carry independent clocks, and storing their timestamps makes commits
@@ -56,6 +56,11 @@ land out of order — QuestDB then rewrites partition tails on every merge
 (observed as >3000x write amplification). Receive time keeps ingestion
 append-only; the millisecond difference is far below the sampling resolution,
 and a device with a broken clock gets more accurate history, not less.
+
+`source` is the delta's sourceRef — which receiver produced the row. Two GPS
+units feeding the same server interleave in storage, and without the column a
+track drawn from history zigzags between them. Rows recorded before the column
+existed have `source` null; they replay unattributed and cannot be filtered.
 
 ## History API
 
@@ -80,9 +85,19 @@ Query example:
 GET /signalk/v2/api/history/values?paths=navigation.speedOverGround&duration=PT1H&resolution=60
 ```
 
+Append `|<sourceRef>` to a path to read one source's rows only (server 2.29+,
+[signalk-server#2737](https://github.com/SignalK/signalk-server/pull/2737)).
+The same path may appear once per source, giving one column per receiver:
+
+```
+GET /signalk/v2/api/history/values?paths=navigation.position|gps.main,navigation.position|gps.backup&duration=PT1H
+```
+
+Without a sourceRef a path returns all sources mixed, as before.
+
 ### v1 (WebSocket playback)
 
-Registered via `app.registerHistoryProvider()`. Supports playback at configurable speed multipliers using chunked reads from QuestDB.
+Registered via `app.registerHistoryProvider()`. Supports playback at configurable speed multipliers using chunked reads from QuestDB. Replayed updates carry the recorded sourceRef as `$source`, one update per source, so consumers see the same attribution the live stream had.
 
 ## REST Endpoints
 
