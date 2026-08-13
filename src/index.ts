@@ -318,7 +318,7 @@ export default (app: App) => {
     try {
       let mismatch = false;
       for (const table of OWNED_TABLES) {
-        if (await queryClient.healSchema(table)) {
+        if (await queryClient.healSchema(table, (msg) => app.error(msg))) {
           app.debug(
             `Rebuilt ${table}: ILP had auto-created it with a wrong schema`,
           );
@@ -925,7 +925,9 @@ export default (app: App) => {
     }
 
     app.setPluginStatus("Creating tables...");
-    await queryClient.ensureTables();
+    // A migration that degrades (dedup off on an external table) is worth a
+    // line in the server log, but must never abort startup — see ensureTables.
+    await queryClient.ensureTables((msg) => app.error(msg));
     // A prior crash/drop may have left an ILP-auto-created `signalk` table with
     // the wrong (`timestamp`, not `ts`) schema; heal it before the writer can
     // ingest into the broken shape.
@@ -1002,6 +1004,14 @@ export default (app: App) => {
       // overwriting a vessel that actually transmitted.
       if (delta.$source === RESTORE_SOURCE) return;
 
+      // The delta's sourceRef, stored as the rows' `source` column so
+      // interleaved multi-source streams (two GPS receivers) can be told
+      // apart afterwards and filtered via the History API's `path|sourceRef`
+      // syntax. Undefined when the delta carries none — the column stays
+      // null, same as rows written before it existed.
+      const source =
+        typeof delta.$source === "string" ? delta.$source : undefined;
+
       // Note the context BEFORE any early return or filter: identity-only
       // deltas return below, and path filters and throttles decide what gets
       // STORED — but any delta at all proves the vessel is transmitting now,
@@ -1047,6 +1057,7 @@ export default (app: App) => {
               vesselName,
               undefined,
               "identity",
+              source,
             );
           }
         }
@@ -1082,7 +1093,12 @@ export default (app: App) => {
         if (!shouldRecord(path, config.pathFilter.mode)) return;
         // Throttled per path AND context: the sampling rate bounds each
         // vessel's stream, not the fleet's (issue #93). The stored context
-        // ("self" vs raw) is the key, matching what the rows carry.
+        // ("self" vs raw) is the key, matching what the rows carry. The key
+        // deliberately does NOT include source: the sampling rate bounds the
+        // per-path row volume, and keying per source would multiply it by the
+        // number of receivers. With two sources alternating, each window
+        // keeps whichever arrived first — a source-filtered read then sees
+        // roughly every other sample, which the rate already allows for.
         if (
           isThrottled(
             path,
@@ -1108,9 +1124,16 @@ export default (app: App) => {
       const ctx = isSelf ? "self" : context;
 
       if (route === "number") {
-        writer.write(path, ctx, value as number);
+        writer.write(path, ctx, value as number, undefined, source);
       } else if (route === "string") {
-        writer.writeString(path, ctx, value as string);
+        writer.writeString(
+          path,
+          ctx,
+          value as string,
+          undefined,
+          undefined,
+          source,
+        );
       } else if (route === "boolean") {
         // Tagged, so a replayed boolean stays a boolean instead of becoming
         // the text "true" — indistinguishable from a path whose value really
@@ -1121,11 +1144,14 @@ export default (app: App) => {
           value ? "true" : "false",
           undefined,
           "boolean",
+          source,
         );
       } else if (route === "position") {
         writer.writePosition(
           ctx,
           value as { latitude: number; longitude: number },
+          undefined,
+          source,
         );
       } else if (route === "flatten") {
         // Object values are recorded as their scalar leaves (issue #128).
@@ -1149,7 +1175,7 @@ export default (app: App) => {
           if (isThrottled(leaf.path, ctx, config.defaultSamplingRate ?? 2000))
             continue;
           if (typeof leaf.value === "number") {
-            writer.write(leaf.path, ctx, leaf.value);
+            writer.write(leaf.path, ctx, leaf.value, undefined, source);
           } else if (typeof leaf.value === "boolean") {
             writer.writeString(
               leaf.path,
@@ -1157,9 +1183,17 @@ export default (app: App) => {
               leaf.value ? "true" : "false",
               undefined,
               "boolean",
+              source,
             );
           } else {
-            writer.writeString(leaf.path, ctx, leaf.value);
+            writer.writeString(
+              leaf.path,
+              ctx,
+              leaf.value,
+              undefined,
+              undefined,
+              source,
+            );
           }
         }
       }

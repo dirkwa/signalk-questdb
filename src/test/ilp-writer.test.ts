@@ -119,6 +119,74 @@ describe("ILPWriter", () => {
     );
   });
 
+  it("tags rows with their source and leaves sourceless writes untagged", async () => {
+    // The source tag is what lets interleaved multi-receiver streams be told
+    // apart afterwards. A write without one must omit the tag entirely so the
+    // column stays null, exactly like rows written before it existed.
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (chunk) => received.push(chunk.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
+    await writer.connect();
+
+    const ts = new Date("2024-06-15T12:00:00.000Z");
+    writer.write("navigation.speedOverGround", "self", 6.4, ts, "gps.main");
+    writer.writeString(
+      "navigation.state",
+      "self",
+      "true",
+      ts,
+      "boolean",
+      "n2k-on-ve.can0.115",
+    );
+    writer.writePosition(
+      "self",
+      { latitude: 60.1, longitude: 24.9 },
+      ts,
+      "gps.main",
+    );
+    writer.write("environment.depth.belowKeel", "self", 3.2, ts);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await writer.disconnect();
+    server.close();
+
+    const all = received.join("");
+    assert.ok(
+      all.includes(
+        "signalk,path=navigation.speedOverGround,context=self,source=gps.main value=6.4",
+      ),
+      `Expected a source-tagged numeric line in: ${all}`,
+    );
+    assert.ok(
+      all.includes(
+        "signalk_str,path=navigation.state,context=self," +
+          'source=n2k-on-ve.can0.115,value_kind=boolean value_str="true"',
+      ),
+      `Expected a source-tagged string line in: ${all}`,
+    );
+    assert.ok(
+      all.includes(
+        "signalk_position,context=self,source=gps.main lat=60.1,lon=24.9",
+      ),
+      `Expected a source-tagged position line in: ${all}`,
+    );
+    assert.ok(
+      all.includes(
+        "signalk,path=environment.depth.belowKeel,context=self value=3.2",
+      ),
+      `Expected the sourceless line to carry no source tag in: ${all}`,
+    );
+  });
+
   it("sends position data to signalk_position table", async () => {
     const received: string[] = [];
 

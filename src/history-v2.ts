@@ -9,6 +9,10 @@ interface PathSpec {
   path: string;
   aggregate: string;
   parameter: string[];
+  // Delivered by the server for `paths=<path>|<sourceRef>` requests
+  // (signalk-server #2737): restrict the series to rows recorded from that
+  // source. Absent = all sources mixed, the pre-source behaviour.
+  sourceRef?: string;
 }
 
 interface ValuesRequest {
@@ -27,7 +31,7 @@ interface ValuesRequest {
 interface ValuesResponse {
   context: string;
   range: { from: string; to: string };
-  values: { path: string; method: string }[];
+  values: { path: string; method: string; sourceRef?: string }[];
   data: [string, ...unknown[]][];
 }
 
@@ -106,6 +110,14 @@ function buildRangeWhere(range: ResolvedRange, context?: string): string {
     where += ` AND context = '${validateIdentifier(context)}'`;
   }
   return where;
+}
+
+// A source filter deliberately errors loudly on a database whose tables
+// predate the `source` column (external QuestDB the migration could not
+// touch): returning all sources when one was asked for would silently
+// reintroduce exactly the mixed-source ambiguity the filter exists to remove.
+function buildSourceWhere(sourceRef?: string): string {
+  return sourceRef ? ` AND source = '${validateIdentifier(sourceRef)}'` : "";
 }
 
 /**
@@ -226,18 +238,28 @@ export function createHistoryProviderV2(
     const storedContext = normalizeContext(requestedContext, selfContext);
     const safeContext = validateIdentifier(storedContext);
 
-    const valuesList: { path: string; method: string }[] = [];
-    const columnData: Map<string, [string, unknown][]> = new Map();
+    const valuesList: { path: string; method: string; sourceRef?: string }[] =
+      [];
+    // Keyed by SPEC INDEX, not path: sourceRef filtering makes the same path
+    // twice in one request meaningful (one column per receiver), and a
+    // path-keyed map would let the second spec's rows overwrite the first's.
+    const columnData: Map<number, [string, unknown][]> = new Map();
 
-    for (const spec of query.pathSpecs) {
+    for (const [specIndex, spec] of query.pathSpecs.entries()) {
       const safePath = validateIdentifier(spec.path);
-      valuesList.push({ path: spec.path, method: spec.aggregate });
+      const entry: { path: string; method: string; sourceRef?: string } = {
+        path: spec.path,
+        method: spec.aggregate,
+      };
+      if (spec.sourceRef) entry.sourceRef = spec.sourceRef;
+      valuesList.push(entry);
 
+      const sourceWhere = buildSourceWhere(spec.sourceRef);
       const isPosition = spec.path === "navigation.position";
       const table = isPosition ? "signalk_position" : "signalk";
 
       if (isPosition) {
-        const where = buildRangeWhere(range, safeContext);
+        const where = buildRangeWhere(range, safeContext) + sourceWhere;
         // Position is an object-valued lat/lon pair. Only first/last keep a
         // real, co-recorded coordinate; per-axis avg/min/max/mid would
         // fabricate a point the vessel never occupied, so they fall back to
@@ -256,11 +278,11 @@ export function createHistoryProviderV2(
             ? { latitude: row[1], longitude: row[2] }
             : null,
         ]);
-        columnData.set(spec.path, rows);
+        columnData.set(specIndex, rows);
         continue;
       }
 
-      const where = `${buildRangeWhere(range, safeContext)} AND path = '${safePath}'`;
+      const where = `${buildRangeWhere(range, safeContext)} AND path = '${safePath}'${sourceWhere}`;
 
       if (needsClientSideAggregation(spec.aggregate)) {
         const sql = `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 50000`;
@@ -284,7 +306,7 @@ export function createHistoryProviderV2(
           ts,
           computed[i],
         ]);
-        columnData.set(spec.path, rows);
+        columnData.set(specIndex, rows);
         continue;
       }
 
@@ -315,17 +337,16 @@ export function createHistoryProviderV2(
         // the caller's requested method in the response would label the
         // series with an aggregation that never ran.
         if (query.resolution && query.resolution > 0) {
-          const reported = valuesList[valuesList.length - 1];
-          if (reported.path === spec.path) reported.method = "last";
+          valuesList[specIndex].method = "last";
         }
         columnData.set(
-          spec.path,
+          specIndex,
           await readStringRows(where, query.resolution),
         );
         continue;
       }
 
-      columnData.set(spec.path, rows);
+      columnData.set(specIndex, rows);
     }
 
     const allTimestamps = new Set<string>();
@@ -336,20 +357,19 @@ export function createHistoryProviderV2(
     }
     const sortedTimestamps = Array.from(allTimestamps).sort();
 
-    const pathOrder = query.pathSpecs.map((s) => s.path);
-    const indexMaps = new Map<string, Map<string, unknown>>();
-    for (const [path, rows] of columnData) {
+    const indexMaps = new Map<number, Map<string, unknown>>();
+    for (const [specIndex, rows] of columnData) {
       const m = new Map<string, unknown>();
       for (const [ts, val] of rows) {
         m.set(ts, val);
       }
-      indexMaps.set(path, m);
+      indexMaps.set(specIndex, m);
     }
 
     const data: [string, ...unknown[]][] = sortedTimestamps.map((ts) => {
       const row: [string, ...unknown[]] = [ts];
-      for (const path of pathOrder) {
-        const m = indexMaps.get(path);
+      for (let i = 0; i < query.pathSpecs.length; i++) {
+        const m = indexMaps.get(i);
         row.push(m?.get(ts) ?? null);
       }
       return row;

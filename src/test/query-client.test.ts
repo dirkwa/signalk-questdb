@@ -321,4 +321,95 @@ describe("QueryClient.ensureTables schema migration", () => {
       `migration must be idempotent, got: ${altered}`,
     );
   });
+
+  it("adds the source column and grows the dedup keys on every table", async () => {
+    // Same shape as the value_kind migration: CREATE TABLE IF NOT EXISTS
+    // leaves pre-existing tables untouched, so each table needs the explicit
+    // idempotent ALTER. The dedup keys must grow with the column too — a
+    // replayed ILP batch keeps its original stamps, so two sources stamped
+    // identically would otherwise upsert over each other and replay would
+    // silently drop one source's row.
+    const { client, sql } = stubClient(() => emptyResult);
+    await client.ensureTables();
+
+    for (const table of ["signalk", "signalk_str", "signalk_position"]) {
+      const created = sql.find((q) =>
+        q.includes(`CREATE TABLE IF NOT EXISTS ${table} (`),
+      );
+      assert.ok(created, `expected ${table} to be created`);
+      assert.match(
+        created,
+        /source\s+SYMBOL/,
+        `new ${table} must include the source column`,
+      );
+      assert.match(
+        created,
+        /DEDUP UPSERT KEYS\([^)]*\bsource\)/,
+        `new ${table} must dedup on source, got: ${created}`,
+      );
+
+      assert.ok(
+        sql.some((q) =>
+          q.includes(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS source`),
+        ),
+        `expected the source ADD COLUMN migration for ${table}`,
+      );
+      const dedup = sql.find((q) =>
+        q.includes(`ALTER TABLE ${table} DEDUP ENABLE UPSERT KEYS(`),
+      );
+      assert.ok(dedup, `expected the dedup-key migration for ${table}`);
+      assert.ok(
+        dedup.includes("source"),
+        `migrated dedup keys must include source, got: ${dedup}`,
+      );
+    }
+  });
+
+  it("skips the dedup migration quietly on a wrong-schema table", async () => {
+    // An ILP auto-created table (designated timestamp `timestamp`) rejects
+    // UPSERT KEYS naming `ts`. Throwing would abort startup BEFORE
+    // healSchema() runs — and the heal is what fixes this exact table — so
+    // the mismatch case must neither throw nor warn, and the remaining
+    // tables must still get their migration.
+    const warnings: string[] = [];
+    const { client, sql } = stubClient((q) => {
+      if (q.includes("ALTER TABLE signalk DEDUP ENABLE")) {
+        throw new Error("Invalid column: ts");
+      }
+      if (q.includes("table_columns('signalk')")) return tsRow("timestamp");
+      return emptyResult;
+    });
+    await client.ensureTables((msg) => warnings.push(msg));
+
+    assert.deepEqual(warnings, []);
+    for (const table of ["signalk_str", "signalk_position"]) {
+      assert.ok(
+        sql.some((q) => q.includes(`ALTER TABLE ${table} DEDUP ENABLE`)),
+        `${table} must still be migrated after signalk's failure`,
+      );
+    }
+  });
+
+  it("warns instead of throwing when dedup fails on a well-shaped table", async () => {
+    // A non-WAL external table also rejects DEDUP ENABLE, but looks healthy
+    // to the mismatch probe (its designated timestamp IS `ts`). healSchema
+    // will never rebuild it, so the degradation has to be reported — while
+    // still not failing a startup that worked before this migration existed.
+    const warnings: string[] = [];
+    const { client } = stubClient((q) => {
+      if (q.includes("ALTER TABLE signalk_str DEDUP ENABLE")) {
+        throw new Error("table is not WAL enabled");
+      }
+      if (q.includes("table_columns('signalk_str')")) return tsRow("ts");
+      return emptyResult;
+    });
+    await client.ensureTables((msg) => warnings.push(msg));
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /signalk_str/);
+    // The message must state the condition (keys not updated), not a
+    // resulting mode: depending on prior state dedup may be fully off
+    // (non-WAL) or still on with the stale keys (timed-out ALTER).
+    assert.match(warnings[0], /deduplication keys were not updated/);
+  });
 });

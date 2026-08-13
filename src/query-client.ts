@@ -113,17 +113,23 @@ export class QueryClient {
     }
   }
 
-  async ensureTables(): Promise<void> {
+  // `onWarning` surfaces a non-fatal migration failure (see the source
+  // migration below); the default keeps callers that can't log — tests,
+  // the console proxy — from having to care.
+  async ensureTables(
+    onWarning: (msg: string) => void = () => {},
+  ): Promise<void> {
     await this.exec(`
       CREATE TABLE IF NOT EXISTS signalk (
         ts        TIMESTAMP,
         path      SYMBOL CAPACITY 512 CACHE,
         context   SYMBOL CAPACITY 128 CACHE,
+        source    SYMBOL CAPACITY 256 CACHE,
         value     DOUBLE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP UPSERT KEYS(ts, path, context)
+        DEDUP UPSERT KEYS(ts, path, context, source)
     `);
 
     await this.exec(`
@@ -131,12 +137,13 @@ export class QueryClient {
         ts         TIMESTAMP,
         path       SYMBOL CAPACITY 256 CACHE,
         context    SYMBOL CAPACITY 128 CACHE,
+        source     SYMBOL CAPACITY 256 CACHE,
         value_str  VARCHAR,
         value_kind SYMBOL CAPACITY 8 CACHE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP UPSERT KEYS(ts, path, context)
+        DEDUP UPSERT KEYS(ts, path, context, source)
     `);
 
     // Tables created before value_kind existed keep working: CREATE TABLE IF
@@ -153,13 +160,57 @@ export class QueryClient {
       CREATE TABLE IF NOT EXISTS signalk_position (
         ts        TIMESTAMP,
         context   SYMBOL CAPACITY 128 CACHE,
+        source    SYMBOL CAPACITY 256 CACHE,
         lat       DOUBLE,
         lon       DOUBLE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
         WAL
-        DEDUP UPSERT KEYS(ts, context)
+        DEDUP UPSERT KEYS(ts, context, source)
     `);
+
+    // Same migration pattern for `source` (the delta's sourceRef): rows from
+    // before the column have source = null, which reads back as "unknown" —
+    // there is nothing to backfill them from. The dedup keys must grow with
+    // the column, or two sources stamped identically (only possible on ILP
+    // batch replay, where original stamps are kept) would upsert over each
+    // other and replay-idempotency would silently drop one source's row.
+    for (const [table, keys] of [
+      ["signalk", "ts, path, context, source"],
+      ["signalk_str", "ts, path, context, source"],
+      ["signalk_position", "ts, context, source"],
+    ] as const) {
+      try {
+        await this.exec(
+          `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS source SYMBOL CAPACITY 256 CACHE`,
+        );
+        await this.exec(
+          `ALTER TABLE ${table} DEDUP ENABLE UPSERT KEYS(${keys})`,
+        );
+      } catch (err) {
+        // A table ILP auto-created with the wrong schema (designated
+        // timestamp `timestamp`, no `ts`) rejects these keys. Throwing here
+        // would abort startup BEFORE healSchema() gets its turn — and the
+        // heal fixes exactly this table, recreating it with the right
+        // columns and keys. So a mismatched table skips quietly.
+        //
+        // Everything else is reported but not fatal: a non-WAL external
+        // table (which the mismatch probe cannot see) rejects DEDUP too,
+        // and failing startup over it would brick recording against a
+        // database that worked fine before this migration existed. The
+        // warning states the condition, not a resulting mode, because the
+        // resulting mode differs by prior state: a non-WAL table has no
+        // dedup at all (replay may duplicate rows), while an old-version
+        // table whose ALTER timed out keeps dedup ON with the stale keys
+        // (two sources sharing a stamp upsert-collide) — opposite failures.
+        if (await this.hasSchemaMismatch(table)) continue;
+        onWarning(
+          `${table}: source migration incomplete, deduplication keys were ` +
+            `not updated to include source ` +
+            `(${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+    }
   }
 
   // QuestDB's ILP ingestion auto-creates a missing table, but names the
@@ -202,10 +253,13 @@ export class QueryClient {
   // The rows ILP wrote into the wrong-schema table are lost, but they are
   // unreadable anyway (history API and status query filter on `ts`, which the
   // auto-created table lacks).
-  async healSchema(table: string): Promise<boolean> {
+  async healSchema(
+    table: string,
+    onWarning: (msg: string) => void = () => {},
+  ): Promise<boolean> {
     if (!(await this.hasSchemaMismatch(table))) return false;
     await this.exec(`DROP TABLE IF EXISTS ${validateIdentifier(table)}`);
-    await this.ensureTables();
+    await this.ensureTables(onWarning);
     return true;
   }
 
