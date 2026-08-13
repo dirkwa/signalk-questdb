@@ -44,11 +44,11 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 
 Three tables, all with WAL mode, daily partitioning, and deduplication:
 
-| Table              | Purpose        | Columns                                                                                        |
-| ------------------ | -------------- | ---------------------------------------------------------------------------------------------- |
-| `signalk`          | Numeric values | `ts`, `path` (SYMBOL), `context` (SYMBOL), `source` (SYMBOL), `value` (DOUBLE)                 |
+| Table              | Purpose        | Columns                                                                                                    |
+| ------------------ | -------------- | ---------------------------------------------------------------------------------------------------------- |
+| `signalk`          | Numeric values | `ts`, `path` (SYMBOL), `context` (SYMBOL), `source` (SYMBOL), `value` (DOUBLE)                             |
 | `signalk_str`      | String values  | `ts`, `path` (SYMBOL), `context` (SYMBOL), `source` (SYMBOL), `value_str` (VARCHAR), `value_kind` (SYMBOL) |
-| `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `source` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)                    |
+| `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `source` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)                                |
 
 `ts` is the **server receive time**, not the timestamp a source claims. Marine
 sources carry independent clocks, and storing their timestamps makes commits
