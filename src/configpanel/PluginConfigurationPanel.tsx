@@ -778,14 +778,15 @@ export default function PluginConfigurationPanel({
                 <>
                   QuestDB requested a <code>{ulimitClamp.ulimit}</code> limit of{" "}
                   {formatNumber(ulimitClamp.requested)}, but the container host
-                  rejected it, so QuestDB is running with the runtime's default
-                  limits. This is typical for podman machine on macOS, where the
-                  limits live inside the VM and cannot be read from here. Raise
-                  the limits of the service that runs the container runtime (on
-                  macOS: inside the VM, via <code>podman machine ssh</code>),
-                  then remove the container once with{" "}
-                  <code>podman rm -f sk-signalk-questdb</code> and restart
-                  Signal K — a restart alone cannot re-grant a rejected ask.
+                  rejected it, so QuestDB is running with the runtime&apos;s
+                  default limits. This is typical for podman machine on macOS,
+                  where the limits live inside the VM and cannot be read from
+                  here. Raise the limits of the service that runs the container
+                  runtime (on macOS: inside the VM, via{" "}
+                  <code>podman machine ssh</code>), then remove the container
+                  once with <code>podman rm -f sk-signalk-questdb</code> and
+                  restart Signal K — a restart alone cannot re-grant a rejected
+                  ask.
                 </>
               ) : (
                 <>
