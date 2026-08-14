@@ -326,6 +326,14 @@ The plugin is optimized for Raspberry Pi and similar low-power devices:
 
 ## Troubleshooting
 
+### 'Module "signalk-questdb" is not available' right after install or update
+
+Right after installing or updating the plugin, the admin UI can show
+`Module "signalk-questdb" is not available. Make sure the webapp is installed.`
+It is installed — the browser tab is still running the admin UI it loaded
+before the update, which looks for the panel bundle it knew then. A hard
+refresh of the tab (Shift-Reload) fixes it.
+
 ### "QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory"
 
 This status appears when the plugin's ILP writer connects to QuestDB, gets
@@ -426,6 +434,74 @@ This takes effect immediately — no container or host restart needed. See
 [QuestDB capacity planning](https://questdb.com/docs/getting-started/capacity-planning/#max-virtual-memory-areas-limit)
 for background.
 
+### QuestDB container never starts on macOS (podman machine)
+
+On macOS the QuestDB container is created but never starts. What you see
+depends on the signalk-container version: current versions name the problem
+outright (an open-files limit the host refuses) and start the container on
+the runtime's default limits instead, with the config panel showing a
+**"request rejected by the host"** banner — the remediation below applies
+unchanged. Older versions never start the container at all and show either
+a misleading **"Permission denied"** (the runtime's error text contains
+"operation not permitted") or only a generic **"Unexpected error. See logs
+for details."** — and the container log view stays empty, because a
+container that never started has no logs.
+
+The cause is the plugin's open-files request. On macOS, Signal K runs on the
+Mac while podman runs inside a Fedora CoreOS VM ("podman machine"). The
+plugin asks for 1048576 open files, and signalk-container normally clamps
+that request to what the host can grant — but from macOS it cannot read the
+VM's limits, so the full request reaches the VM, exceeds its default hard
+limit (524288), and the OCI runtime refuses to start the container. The VM's
+`vm.max_map_count` is already 1048576 on Fedora CoreOS, so unlike on the
+Linux hosts above, only the file-descriptor limit needs raising.
+
+Raise it inside the VM. From a macOS terminal:
+
+```bash
+podman machine ssh
+```
+
+Inside the VM, add a systemd drop-in for every user manager (the
+`user@.service` template covers each user instance, including the machine's
+`core` user, whose session runs rootless containers) and the same drop-in
+for `podman.service` to cover the rootful connection:
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d /etc/systemd/system/podman.service.d
+sudo tee /etc/systemd/system/user@.service.d/nofile.conf >/dev/null <<'EOF'
+[Service]
+LimitNOFILE=1048576
+EOF
+sudo cp /etc/systemd/system/user@.service.d/nofile.conf /etc/systemd/system/podman.service.d/nofile.conf
+sudo systemctl daemon-reload
+exit
+```
+
+Back on macOS, restart the VM:
+
+```bash
+podman machine stop && podman machine start
+```
+
+and verify the new limit is grantable:
+
+```bash
+podman run --rm --ulimit nofile=1048576:1048576 docker.io/library/alpine sh -c 'ulimit -n -H'
+```
+
+This should print `1048576`. Finally, remove the half-created container so it
+is recreated with the full limit — the limit is set at create time, so a
+restart is not enough:
+
+```bash
+podman rm -f sk-signalk-questdb
+```
+
+then restart Signal K — on the next plugin start the container is recreated
+with the full limit. (The container manager's **Start** button only starts an
+existing container, so it cannot replace this step.)
+
 ## History API Provider
 
 QuestDB automatically registers as the **default** Signal K v2 History API provider. Any app or Grafana plugin that queries `/signalk/v2/api/history/` uses QuestDB.
@@ -468,6 +544,7 @@ SAMPLE BY $__interval
 
 - Node.js >= 22
 - [signalk-container](https://github.com/dirkwa/signalk-container) >= 1.14.0 plugin (for managed mode; older versions still work but fall back to loopback connectivity)
+- Podman >= 5.4 (the version Debian 13 "trixie" ships) or Docker, for managed mode. On rootless Podman below 5.5 the plugin's open-files request is inherited from the podman service rather than granted per container ([containers/podman#25881](https://github.com/containers/podman/issues/25881)); signalk-container accounts for this.
 - Signal K server
 
 ## License
