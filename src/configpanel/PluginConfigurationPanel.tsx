@@ -543,6 +543,13 @@ export default function PluginConfigurationPanel({
   const walSuspended = suspendedTables.length > 0;
   const schemaMismatch = (isRunning && dbStatus.schemaMismatch) || false;
   const ulimitClamp = (isRunning && dbStatus.ulimitClamp) || null;
+  // A non-positive granted is the manager's "not granted / unreadable"
+  // marker, not a cap of zero: the host rejected the ask outright (podman
+  // machine on macOS) and the container runs on the runtime's default
+  // limits. That case needs different wording and remediation — a bare
+  // restart cannot re-grant a rejected ask; the container must be removed
+  // once.
+  const ulimitRejected = ulimitClamp !== null && ulimitClamp.granted <= 0;
   // Only surfaced when too low — a healthy limit needs no banner. NOT gated
   // on isRunning: mmap exhaustion is one of the ways QuestDB becomes
   // unhealthy, so the hint must stay visible while it is down (the status
@@ -763,24 +770,49 @@ export default function PluginConfigurationPanel({
           {ulimitClamp && (
             <div style={S.infoBanner}>
               <div style={S.warnBannerTitle}>
-                QuestDB open-files limit capped by the host
+                {ulimitRejected
+                  ? "QuestDB open-files request rejected by the host"
+                  : "QuestDB open-files limit capped by the host"}
               </div>
-              QuestDB requested a <code>{ulimitClamp.ulimit}</code> limit of{" "}
-              {formatNumber(ulimitClamp.requested)}, but this host only allows{" "}
-              {formatNumber(ulimitClamp.granted)}, so it was capped. QuestDB is
-              running on the lower limit. To grant the full value, raise the
-              host limit for the user running the container runtime — under
-              rootless Podman that means a systemd <code>user@.service</code>{" "}
-              <code>LimitNOFILE</code> drop-in (editing{" "}
-              <code>/etc/security/limits.conf</code> alone is usually not
-              enough) — then restart the Signal K server so the plugin can
-              re-create the QuestDB container with the raised limit
-              (signalk-container 1.25.3+; on older versions remove the container
-              once with <code>podman rm -f sk-signalk-questdb</code> instead).
+              {ulimitRejected ? (
+                <>
+                  QuestDB requested a <code>{ulimitClamp.ulimit}</code> limit of{" "}
+                  {formatNumber(ulimitClamp.requested)}, but the container host
+                  rejected it, so QuestDB is running with the runtime&apos;s
+                  default limits. This is typical for podman machine on macOS,
+                  where the limits live inside the VM and cannot be read from
+                  here. Raise the limits of the service that runs the container
+                  runtime (on macOS: inside the VM, via{" "}
+                  <code>podman machine ssh</code>), then remove the container
+                  once with <code>podman rm -f sk-signalk-questdb</code> and
+                  restart Signal K — a restart alone cannot re-grant a rejected
+                  ask.
+                </>
+              ) : (
+                <>
+                  QuestDB requested a <code>{ulimitClamp.ulimit}</code> limit of{" "}
+                  {formatNumber(ulimitClamp.requested)}, but this host only
+                  allows {formatNumber(ulimitClamp.granted)}, so it was capped.
+                  QuestDB is running on the lower limit. To grant the full
+                  value, raise the host limit for the user running the container
+                  runtime — under rootless Podman that means a systemd{" "}
+                  <code>user@.service</code> <code>LimitNOFILE</code> drop-in
+                  (editing <code>/etc/security/limits.conf</code> alone is
+                  usually not enough) — then restart the Signal K server so the
+                  plugin can re-create the QuestDB container with the raised
+                  limit (signalk-container 1.25.3+; on older versions remove the
+                  container once with{" "}
+                  <code>podman rm -f sk-signalk-questdb</code> instead).
+                </>
+              )}{" "}
               This warning clears itself once the container is running with the
               full value.{" "}
               <a
-                href="https://github.com/dirkwa/signalk-container#raising-the-open-files-limit-nofile"
+                href={
+                  ulimitRejected
+                    ? "https://github.com/dirkwa/signalk-questdb#questdb-container-never-starts-on-macos-podman-machine"
+                    : "https://github.com/dirkwa/signalk-container#raising-the-open-files-limit-nofile"
+                }
                 target="_blank"
                 rel="noreferrer"
                 style={{ color: "#92400e", textDecoration: "underline" }}
