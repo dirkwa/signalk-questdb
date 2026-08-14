@@ -436,12 +436,13 @@ for background.
 
 ### QuestDB container never starts on macOS (podman machine)
 
-On macOS the QuestDB container is created but never starts. What you see
-depends on the signalk-container version: current versions name the problem
-outright (an open-files limit the host refuses) and start the container on
-the runtime's default limits instead, with the config panel showing a
-**"request rejected by the host"** banner — the remediation below applies
-unchanged. Older versions never start the container at all and show either
+On macOS the QuestDB container is created but may never start. What you
+see depends on the signalk-container version: with signalk-container 1.26
+or later, the manager names the problem outright (an open-files limit the
+host refuses) and starts the container on the runtime's default limits
+instead, with this plugin's config panel showing a **"request rejected by
+the host"** banner — the remediation below applies unchanged. Older
+versions never start the container at all and show either
 a misleading **"Permission denied"** (the runtime's error text contains
 "operation not permitted") or only a generic **"Unexpected error. See logs
 for details."** — and the container log view stays empty, because a
