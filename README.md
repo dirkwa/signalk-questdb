@@ -453,9 +453,19 @@ Mac while podman runs inside a Fedora CoreOS VM ("podman machine"). The
 plugin asks for 1048576 open files, and signalk-container normally clamps
 that request to what the host can grant — but from macOS it cannot read the
 VM's limits, so the full request reaches the VM, exceeds its default hard
-limit (524288), and the OCI runtime refuses to start the container. The VM's
-`vm.max_map_count` is already 1048576 on Fedora CoreOS, so unlike on the
-Linux hosts above, only the file-descriptor limit needs raising.
+limit (524288), and the OCI runtime refuses to start the container. On
+current Fedora CoreOS the VM's `vm.max_map_count` already meets QuestDB's
+1048576, so usually only the file-descriptor limit needs raising — but an
+older machine image may sit lower, so check it first:
+
+```bash
+podman machine ssh -- sysctl -n vm.max_map_count
+```
+
+If that prints less than 1048576, raise it inside the VM before relying on
+the file-descriptor fix alone (`podman machine ssh`, then
+`sudo tee /etc/sysctl.d/99-signalk-questdb.conf <<< 'vm.max_map_count=1048576'`
+and `sudo sysctl --system`).
 
 Raise it inside the VM. From a macOS terminal:
 
@@ -502,6 +512,13 @@ podman rm -f sk-signalk-questdb
 then restart Signal K — on the next plugin start the container is recreated
 with the full limit. (The container manager's **Start** button only starts an
 existing container, so it cannot replace this step.)
+
+The verify and `rm` commands run on podman's default connection — normally
+the rootless one the plugin uses. Rootless and rootful connections keep
+separate container stores, so on a setup with a non-default connection add
+the same `--connection <name>` (list them with
+`podman system connection list`) to both commands, so they hit the store
+where `sk-signalk-questdb` actually lives (`podman ps -a` shows it).
 
 ## History API Provider
 
