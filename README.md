@@ -567,4 +567,19 @@ SAMPLE BY $__interval
 
 ## License
 
-MIT
+signalk-questdb 2.0.0 and later is **source available, not open source**.
+See [LICENSE.md](LICENSE.md).
+
+**You may**, free of charge: run it on your own boat or fleet, private or
+commercial; use it for internal company operations; modify it for your own use;
+use it in education and research; and provide professional services around it.
+
+**You may not**: redistribute it, or publish a modified version of it to npm or
+anywhere else. Verbatim copies of official releases may be mirrored and cached.
+
+Versions 1.9.2 and earlier remain available under the MIT license, see
+[LICENSE-MIT-through-v1.x.txt](LICENSE-MIT-through-v1.x.txt).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
