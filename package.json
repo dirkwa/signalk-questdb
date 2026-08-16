@@ -1,6 +1,6 @@
 {
   "name": "signalk-questdb",
-  "version": "1.9.2",
+  "version": "2.0.0",
   "type": "module",
   "description": "QuestDB history provider for Signal K — replaces signalk-to-influxdb",
   "keywords": [
@@ -39,7 +39,7 @@
     "node": ">=22"
   },
   "author": "Dirk Wahrheit <dirkwahrheit@gmail.com>",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE.md",
   "repository": {
     "type": "git",
     "url": "https://github.com/dirkwa/signalk-questdb"

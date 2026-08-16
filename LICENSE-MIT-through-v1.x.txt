@@ -1,3 +1,7 @@
+This MIT license applied to signalk-questdb version 1.9.2 and all earlier
+releases. Those versions remain available under MIT in perpetuity.
+Version 2.0.0 and later are licensed under the terms in LICENSE.md.
+
 MIT License
 
 Copyright (c) 2026 Dirk Wahrheit
