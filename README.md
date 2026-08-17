@@ -522,7 +522,16 @@ where `sk-signalk-questdb` actually lives (`podman ps -a` shows it).
 
 ## History API Provider
 
-QuestDB automatically registers as the **default** Signal K v2 History API provider. Any app or Grafana plugin that queries `/signalk/v2/api/history/` uses QuestDB.
+QuestDB registers as a Signal K v2 History API provider. Which registered
+provider answers `/signalk/v2/api/history/` by default is the operator's
+choice: pick it once under **Data → Preferences → Default History Provider**
+(server ≥ 2.31); the server persists it as `historyApi.defaultProvider` in
+`settings.json`, and it survives restarts and plugin load order. If no default
+is configured, the server uses whichever provider registers first.
+
+Versions 2.0.0 and earlier asked the server to make QuestDB the default on
+every start. That is gone as of 2.0.1 — it could silently override a default
+you had chosen, and on servers with security enabled it never worked at all.
 
 ## Data Storage
 
@@ -563,7 +572,7 @@ SAMPLE BY $__interval
 - Node.js >= 22
 - [signalk-container](https://github.com/dirkwa/signalk-container) >= 1.14.0 plugin (for managed mode; older versions still work but fall back to loopback connectivity)
 - Podman >= 5.4 (the version Debian 13 "trixie" ships) or Docker, for managed mode. On rootless Podman below 5.5 the plugin's open-files request is inherited from the podman service rather than granted per container ([containers/podman#25881](https://github.com/containers/podman/issues/25881)); signalk-container accounts for this.
-- Signal K server
+- Signal K server (≥ 2.31 to choose the default history provider in the admin UI)
 
 ## License
 
