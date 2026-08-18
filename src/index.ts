@@ -22,6 +22,7 @@ import { startRetention } from "./retention.js";
 import { RESTORE_SOURCE, restoreFromHistory } from "./restore.js";
 import { createConsoleProxy } from "./console-proxy.js";
 import { buildFullExportWhere } from "./full-export-range.js";
+import { detectInflux, validateInfluxUrl } from "./influx-detect.js";
 import {
   WalMonitor,
   buildPendingSegmentsSQL,
@@ -2446,76 +2447,36 @@ export default (app: App) => {
       });
 
       router.get("/api/migration/detect", async (req, res) => {
-        const baseUrl = (req.query.url as string) || "http://localhost:8086";
-
-        try {
-          const urlObj = new URL(baseUrl);
-          const host = urlObj.hostname;
-          const isLocal =
-            host === "localhost" || host === "127.0.0.1" || host === "::1";
-          const isPrivate = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(
-            host,
-          );
-          if (!isLocal && !isPrivate) {
-            res.status(400).json({
-              error: "Only localhost and private network URLs allowed",
-            });
-            return;
-          }
-        } catch {
-          res.status(400).json({ error: "Invalid URL" });
+        // `?url=a&url=b` arrives as an ARRAY, not a string — the cast this
+        // replaces would have handed a non-string to validateInfluxUrl and
+        // thrown inside the handler rather than answering 400.
+        const requestedUrl = req.query.url;
+        if (requestedUrl !== undefined && typeof requestedUrl !== "string") {
+          res.status(400).json({
+            error: "url must be a single value",
+            sources: [],
+          } satisfies MigrationDetectResponse);
           return;
         }
-
-        const sources: {
-          type: string;
-          url: string;
-          status: string;
-          version?: string;
-        }[] = [];
-
-        // Detect InfluxDB 1.x
-        try {
-          const r = await fetch(`${baseUrl}/ping`, {
-            method: "HEAD",
-            signal: AbortSignal.timeout(3000),
-          });
-          if (r.status === 204) {
-            sources.push({
-              type: "influxdb1",
-              url: baseUrl,
-              status: "found",
-              version: r.headers.get("X-Influxdb-Version") || "unknown",
-            });
-          }
-        } catch {
-          // not running
+        const baseUrl = validateInfluxUrl(
+          requestedUrl || "http://localhost:8086",
+        );
+        if (!baseUrl) {
+          res.status(400).json({
+            error: "Only localhost and private network http(s) URLs allowed",
+            sources: [],
+          } satisfies MigrationDetectResponse);
+          return;
         }
-
-        // Detect InfluxDB 2.x
         try {
-          const r = await fetch(`${baseUrl}/health`, {
-            signal: AbortSignal.timeout(3000),
-          });
-          if (r.ok) {
-            const data = (await r.json()) as {
-              status?: string;
-              version?: string;
-            };
-            if (data.status === "pass") {
-              sources.push({
-                type: "influxdb2",
-                url: baseUrl,
-                status: "found",
-                version: data.version || "unknown",
-              });
-            }
-          }
-        } catch {
-          // not running
+          const sources = await detectInflux(baseUrl);
+          res.json({ sources } satisfies MigrationDetectResponse);
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            sources: [],
+          } satisfies MigrationDetectResponse);
         }
-
-        res.json({ sources } satisfies MigrationDetectResponse);
       });
 
       router.get("/api/export", async (req, res) => {
