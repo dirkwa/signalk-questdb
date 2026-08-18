@@ -24,7 +24,14 @@ export async function detectInflux(
   baseUrl: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<MigrationSource[]> {
-  let version: string | undefined;
+  // Two separate facts, deliberately not folded into one variable: whether an
+  // InfluxDB answered at all, and what version it claimed. Using `undefined`
+  // for both meant a server that answered /health with {"status":"pass"} but
+  // no `version` field (a reverse proxy or gateway can strip it) fell through
+  // to /ping and, if that was disabled too, was reported as NOT RUNNING —
+  // "no InfluxDB found" pointing at a live server.
+  let responded = false;
+  let version = "";
 
   // /health carries the version in its body on both majors.
   try {
@@ -38,15 +45,23 @@ export async function detectInflux(
     });
     if (r.ok) {
       const data = (await r.json()) as { status?: string; version?: string };
-      if (data.status === "pass") version = data.version;
+      if (data.status === "pass") {
+        responded = true;
+        // The body is whatever the far end chose to send. A non-string
+        // `version` (number, object) would reach `.replace()` below and throw
+        // a TypeError the route reports as a 500 — so anything that is not a
+        // string is treated as "answered, version unknown".
+        version = typeof data.version === "string" ? data.version : "";
+      }
     }
   } catch {
-    // not running, or no /health — /ping may still answer
+    // not running, no /health, or a 200 that was not JSON — /ping may answer
   }
 
-  // /ping carries it in a header. Also the only probe a 1.x server with
-  // /health disabled will answer.
-  if (version === undefined) {
+  // /ping carries it in a header. Worth probing both when /health answered
+  // without a version: /ping may still name it, and knowing the major version
+  // is what keeps 1.x and 2.x from being confused for each other.
+  if (!responded || version === "") {
     try {
       const r = await fetchImpl(`${baseUrl}/ping`, {
         method: "HEAD",
@@ -56,26 +71,32 @@ export async function detectInflux(
         redirect: "manual",
       });
       if (r.status === 204) {
+        responded = true;
         // A server that answers /ping but reports no version is still an
-        // InfluxDB; treat it as 1.x, which is what the compat endpoint means.
-        version = r.headers.get("X-Influxdb-Version") ?? "";
+        // InfluxDB; the empty string keeps it "found, version unknown".
+        version = r.headers.get("X-Influxdb-Version") ?? version;
       }
     } catch {
       // not running
     }
   }
 
-  if (version === undefined) return [];
+  if (!responded) return [];
 
   // 3.x is reported as nothing rather than as a version it is not. It drops
   // the /health and Flux APIs this code path assumes, so labelling it either
   // "2.x" or "1.x" would promise an interface it does not serve and send the
   // caller into a query dialect it cannot answer. "No InfluxDB found here"
   // is the honest answer until 3.x is genuinely supported.
-  if (/^v?3\./.test(version)) return [];
+  //
+  // The major is matched with an explicit boundary (dot, dash or end of
+  // string) rather than a bare `3\.`: a version reported as exactly "3" — or
+  // "3-alpha" — would otherwise miss this check and fall through to the 1.x
+  // label, which is the very misidentification this module exists to prevent.
+  const major = /^v?(\d+)(?:[.\-+]|$)/.exec(version)?.[1];
+  if (major === "3") return [];
 
-  // Leading "v" is optional: 2.9.1 reports "v2.9.1", 1.8.10 reports "1.8.10".
-  const isTwo = /^v?2\./.test(version);
+  const isTwo = major === "2";
   return [
     {
       type: isTwo ? "influxdb2" : "influxdb1",
@@ -115,6 +136,15 @@ export function validateInfluxUrl(raw: string): string | null {
     // so the join never doubles it.
     urlObj.search = "";
     urlObj.hash = "";
+    // Credentials are stripped rather than passed through. Node's fetch
+    // REFUSES a URL carrying them ("Request cannot be constructed from a URL
+    // that includes credentials"), and that TypeError is swallowed by the
+    // probe's catch — so a pasted `http://user:pw@host:8086` reported "no
+    // InfluxDB found" against a perfectly healthy server, with nothing saying
+    // why. Dropping them makes the probe work; InfluxDB auth belongs in the
+    // token / username fields, which is where the import reads it from.
+    urlObj.username = "";
+    urlObj.password = "";
     const normalised = urlObj.toString().replace(/\/+$/, "");
 
     // "localhost" is the one NAME allowed; everything else must be an IP

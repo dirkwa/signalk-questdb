@@ -148,6 +148,107 @@ describe("InfluxDB version detection", () => {
     assert.strictEqual(sources[0].type, "influxdb2");
   });
 
+  // A gateway or reverse proxy can answer /health without the `version`
+  // field. Keying "did anything answer?" off the version string meant such a
+  // server — with /ping also unavailable — was reported as NOT RUNNING: "no
+  // InfluxDB found" pointing straight at a live one.
+  test("a healthy server that reports no version is still found", async () => {
+    const fakeFetch = (async (url: string | URL) => {
+      if (String(url).endsWith("/health"))
+        return new Response(JSON.stringify({ status: "pass" }), {
+          status: 200,
+        });
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const sources = await detectInflux("http://localhost:8086", fakeFetch);
+    assert.strictEqual(sources.length, 1);
+    assert.strictEqual(sources[0].status, "found");
+    assert.strictEqual(sources[0].version, "unknown");
+  });
+
+  // /health answering without a version is still worth probing /ping for:
+  // that header is what tells 1.x and 2.x apart.
+  test("a version-less /health falls back to the /ping version header", async () => {
+    const fakeFetch = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/health"))
+        return new Response(JSON.stringify({ status: "pass" }), {
+          status: 200,
+        });
+      if (u.endsWith("/ping"))
+        return new Response(null, {
+          status: 204,
+          headers: { "X-Influxdb-Version": "v2.9.1" },
+        });
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const sources = await detectInflux("http://localhost:8086", fakeFetch);
+    assert.strictEqual(sources.length, 1);
+    assert.strictEqual(sources[0].type, "influxdb2");
+    assert.strictEqual(sources[0].version, "2.9.1");
+  });
+
+  // The 3.x exclusion is matched on the major with an explicit boundary. A
+  // version of exactly "3" has no dot to match, and previously fell through
+  // to the 1.x label — the same misidentification this module prevents.
+  test("a bare major version does not fall through to the 1.x label", async () => {
+    for (const version of ["3", "3-alpha", "v3", "3.0.0-core"]) {
+      const fakeFetch = (async (url: string | URL) => {
+        if (String(url).endsWith("/health"))
+          return new Response(JSON.stringify({ status: "pass", version }), {
+            status: 200,
+          });
+        return new Response(null, { status: 404 });
+      }) as unknown as typeof fetch;
+
+      const sources = await detectInflux("http://localhost:8086", fakeFetch);
+      assert.deepStrictEqual(
+        sources,
+        [],
+        `version "${version}" should not be reported as a supported major`,
+      );
+    }
+  });
+
+  test("a 2.x version with a suffix is still 2.x", async () => {
+    const fakeFetch = (async (url: string | URL) => {
+      if (String(url).endsWith("/health"))
+        return new Response(
+          JSON.stringify({ status: "pass", version: "2.7.0-rc1" }),
+          { status: 200 },
+        );
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const sources = await detectInflux("http://localhost:8086", fakeFetch);
+    assert.strictEqual(sources[0].type, "influxdb2");
+  });
+
+  // The response body is whatever the far end chose to send. A non-string
+  // `version` reached `.replace()` and threw a TypeError, which the route
+  // turns into a 500 rather than an honest detection result.
+  test("a non-string version is handled, not thrown on", async () => {
+    for (const version of [123, { a: 1 }, ["x"], true, null]) {
+      const fakeFetch = (async (url: string | URL) => {
+        if (String(url).endsWith("/health"))
+          return new Response(JSON.stringify({ status: "pass", version }), {
+            status: 200,
+          });
+        return new Response(null, { status: 404 });
+      }) as unknown as typeof fetch;
+
+      const sources = await detectInflux("http://localhost:8086", fakeFetch);
+      assert.strictEqual(
+        sources.length,
+        1,
+        `version ${JSON.stringify(version)}`,
+      );
+      assert.strictEqual(sources[0].version, "unknown");
+    }
+  });
+
   test("nothing running yields no sources", async () => {
     const fakeFetch = (async () => {
       throw new Error("ECONNREFUSED");
@@ -257,6 +358,34 @@ describe("InfluxDB URL validation", () => {
     assert.strictEqual(
       validateInfluxUrl("http://192.168.1.5:8086/influx"),
       "http://192.168.1.5:8086/influx",
+    );
+  });
+
+  // Node's fetch REFUSES a URL carrying credentials — the resulting TypeError
+  // is swallowed by the probe's catch, so a pasted
+  // "http://user:pw@host:8086" reported "no InfluxDB found" against a
+  // perfectly healthy server. Stripping them makes the probe work.
+  test("credentials are stripped from the URL", () => {
+    assert.strictEqual(
+      validateInfluxUrl("http://admin:hunter2@127.0.0.1:8086"),
+      "http://127.0.0.1:8086",
+    );
+    assert.strictEqual(
+      validateInfluxUrl("http://admin@192.168.1.5:8086"),
+      "http://192.168.1.5:8086",
+    );
+  });
+
+  // The host is what the allowlist judges — userinfo must not be able to
+  // disguise a public host as a private one.
+  test("a private-looking userinfo does not launder a public host", () => {
+    assert.strictEqual(
+      validateInfluxUrl("http://127.0.0.1@example.com:8086"),
+      null,
+    );
+    assert.strictEqual(
+      validateInfluxUrl("http://192.168.1.1:8086@8.8.8.8:8086"),
+      null,
     );
   });
 
