@@ -4,6 +4,7 @@ import type {
   ContainerConfig,
   ContainerManagerApi,
   ContainerResourceLimits,
+  ContainerWedged,
   UlimitClamp,
 } from "signalk-container-helper";
 import { ILPWriter } from "./ilp-writer.js";
@@ -297,6 +298,18 @@ export default (app: App) => {
   const onUlimitClamped = (event: UlimitClamp): void => {
     ulimitClamp = event;
     app.debug(event.reason);
+  };
+
+  // A wedged container (the runtime can't stop/remove it — usually an orphaned
+  // rootless-Podman user namespace after a Podman service restart) cannot be
+  // recovered from the plugin; signalk-container defers the recreate and fires
+  // this once. Surface the remedy as a plugin error rather than letting the
+  // operator see only a silent drift loop in the server log. Requires
+  // signalk-container >= 1.29.0; on older versions the callback never fires.
+  const onContainerWedged = (event: ContainerWedged): void => {
+    // publishError → setPluginError already lands in the server log at error
+    // level and drives the admin-UI status; matches every other error site.
+    publishError(event.reason);
   };
 
   // Tables the plugin owns; each is rebuilt if ILP auto-created it with the
@@ -874,6 +887,7 @@ export default (app: App) => {
           containerConfig,
           {
             onUlimitClamped,
+            onContainerWedged,
           },
         );
         // ensureRunning() just (re)created the container. If purge preempted us
@@ -1277,7 +1291,13 @@ export default (app: App) => {
       }
     }
 
-    app.setPluginStatus(recordingStatus(ilpHost, ilpPort));
+    // Guarded: if ensureRunning surfaced an error (e.g. a wedged container via
+    // onContainerWedged, which defers rather than throws), keep it on the
+    // status line instead of overwriting it with a false "Recording".
+    // Guarded: if ensureRunning surfaced an error (e.g. a wedged container via
+    // onContainerWedged, which defers rather than throws), keep it on the
+    // status line instead of overwriting it with a false "Recording".
+    publishRecordingStatus(ilpHost, ilpPort);
     // Everything is registered — only now does the plugin count as running.
     // Any earlier return/throw leaves the flag false, so a half-started
     // plugin rejects lifecycle-dependent requests like /api/update/apply.
@@ -1904,6 +1924,7 @@ export default (app: App) => {
               updateConfig,
               {
                 onUlimitClamped,
+                onContainerWedged,
               },
             );
             assertNotStopped();
@@ -1966,9 +1987,14 @@ export default (app: App) => {
             return { ilpHost, ilpPort };
           });
 
-          app.setPluginStatus(
-            `Recording to QuestDB ${newTag} at ${ilp.ilpHost}:${ilp.ilpPort}`,
-          );
+          // Guarded: a wedge (or any error) surfaced during the update's
+          // ensureRunning must not be hidden by a "Recording {newTag}" line
+          // that also wrongly implies the new tag was applied.
+          if (!pluginErrorActive) {
+            app.setPluginStatus(
+              `Recording to QuestDB ${newTag} at ${ilp.ilpHost}:${ilp.ilpPort}`,
+            );
+          }
 
           res.json({
             status: "updated",
