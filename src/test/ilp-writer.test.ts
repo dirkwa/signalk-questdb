@@ -78,6 +78,50 @@ describe("ILPWriter", () => {
     );
   });
 
+  // ILP is a LINE protocol. A raw newline inside a quoted value splits the
+  // row into two malformed lines and QuestDB silently stores NEITHER —
+  // verified against a live instance, which recorded 0 rows for such a write.
+  // Signal K string values do carry newlines (notification messages,
+  // free-text fields), and the failure is invisible: no error, no row.
+  it("encodes newlines in string values so the row stays one ILP line", async () => {
+    const received: string[] = [];
+
+    const server = net.createServer((socket) => {
+      socket.on("data", (data) => {
+        received.push(data.toString());
+      });
+    });
+
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 100,
+    });
+    await writer.connect();
+
+    const ts = new Date("2024-06-15T12:00:00.000Z");
+    writer.writeString("notifications.msg", "self", "line1\nline2\rmore", ts);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await writer.disconnect();
+    server.close();
+
+    const all = received.join("");
+    // Exactly one physical line reached the socket.
+    assert.strictEqual(
+      all.split("\n").filter((l) => l.length > 0).length,
+      1,
+      `Expected one ILP line, got: ${JSON.stringify(all)}`,
+    );
+    assert.ok(
+      all.includes('value_str="line1\\nline2\\rmore"'),
+      `Expected escaped newlines in: ${JSON.stringify(all)}`,
+    );
+  });
+
   it("tags booleans with value_kind and leaves text untagged", async () => {
     // value_kind is what keeps a recorded boolean distinguishable from a
     // path whose text value is literally "true". Text must stay untagged so

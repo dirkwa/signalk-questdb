@@ -6,7 +6,10 @@ import type { Config } from "../config/schema.js";
 import type {
   ApiError,
   DbStatus,
+  MigrationBucket,
+  MigrationMeasurement,
   MigrationSource,
+  MigrationStatusResponse,
   ResumeWalResponse,
   SkipWalResponse,
   UpdateApplyResponse,
@@ -25,7 +28,13 @@ import {
   VersionSelect,
 } from "signalk-container-helper/ui";
 import { S } from "./styles.js";
-import { toMigrationSources } from "./responses.js";
+import {
+  toMigrationBuckets,
+  toMigrationRange,
+  toMigrationMeasurements,
+  toMigrationSources,
+  toMigrationStatus,
+} from "./responses.js";
 
 type FilterMode = Config["pathFilter"]["mode"];
 type Compression = Config["compression"];
@@ -171,6 +180,29 @@ export default function PluginConfigurationPanel({
   >(null);
   const [migrationDetecting, setMigrationDetecting] = useState(false);
   const [migrationUrl, setMigrationUrl] = useState("");
+  // The source the operator picked to import from. Detection can return one
+  // entry; selecting it is still explicit, because starting an import is a
+  // write into recorded history and should not be one click away by accident.
+  const [migrationSelected, setMigrationSelected] =
+    useState<MigrationSource | null>(null);
+  const [migrationToken, setMigrationToken] = useState("");
+  const [migrationOrg, setMigrationOrg] = useState("");
+  const [migrationUser, setMigrationUser] = useState("");
+  const [migrationPassword, setMigrationPassword] = useState("");
+  const [migrationBuckets, setMigrationBuckets] = useState<
+    MigrationBucket[] | null
+  >(null);
+  const [migrationBucket, setMigrationBucket] = useState("");
+  const [migrationMeasurements, setMigrationMeasurements] = useState<
+    MigrationMeasurement[] | null
+  >(null);
+  const [migrationLoadingMeta, setMigrationLoadingMeta] = useState(false);
+  const [migrationFrom, setMigrationFrom] = useState("");
+  const [migrationTo, setMigrationTo] = useState("");
+  const [migrationRun, setMigrationRun] = useState<
+    MigrationStatusResponse["run"] | null
+  >(null);
+  const [migrationStarting, setMigrationStarting] = useState(false);
   const [actionStatus, setActionStatus] = useState("");
   const [statusError, setStatusError] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -438,6 +470,233 @@ export default function PluginConfigurationPanel({
     }
     setMigrationDetecting(false);
   };
+
+  // Credentials are request-scoped rather than saved config: they are only
+  // needed while an import runs, and persisting a token into the plugin's
+  // settings file would keep a credential the operator never asked us to
+  // store. They travel in the request BODY — Signal K logs full request URLs
+  // (morgan "combined"), so a token in a query string would be written to the
+  // access log and kept in browser history.
+  const migrationAuthBody = useCallback(
+    () => ({
+      token: migrationToken || undefined,
+      org: migrationOrg || undefined,
+      username: migrationUser || undefined,
+      password: migrationPassword || undefined,
+    }),
+    [migrationToken, migrationOrg, migrationUser, migrationPassword],
+  );
+
+  const loadBuckets = useCallback(
+    async (
+      src: MigrationSource,
+      // Passed EXPLICITLY rather than read from state. React state updates are
+      // asynchronous, so a caller that has just cleared the credential fields
+      // would still see the PREVIOUS source's token here — sending one
+      // server's credentials to another, which is the leak the clearing was
+      // meant to prevent.
+      auth: ReturnType<typeof migrationAuthBody> = migrationAuthBody(),
+    ) => {
+      setMigrationLoadingMeta(true);
+      setActionStatus("");
+      // Drop any previously chosen bucket before the list is replaced: a name
+      // selected from the OLD list is not necessarily present in the new one,
+      // and leaving it set would show a <select> whose value matches no
+      // option while the import button reads as ready.
+      setMigrationBucket("");
+      try {
+        const res = await fetch(
+          "/plugins/signalk-questdb/api/migration/buckets",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: src.url,
+              type: src.type,
+              ...auth,
+            }),
+          },
+        );
+        const body = await res.json().catch(() => null);
+        const buckets = toMigrationBuckets(body);
+        setMigrationBuckets(buckets);
+        if (!res.ok) {
+          setActionStatus(
+            (body as ApiError | null)?.error ?? "Could not list buckets.",
+          );
+          setStatusError(true);
+        } else if (buckets.length === 0) {
+          setActionStatus(
+            "No buckets found. InfluxDB 2.x needs an API token with read access.",
+          );
+          setStatusError(true);
+        } else if (buckets.length === 1) {
+          // A single bucket is the overwhelmingly common case on a boat;
+          // preselecting it saves a click without hiding the choice.
+          setMigrationBucket(buckets[0].name);
+        }
+      } catch (e) {
+        setActionStatus("Could not list buckets: " + errorMessage(e));
+        setStatusError(true);
+      }
+      setMigrationLoadingMeta(false);
+    },
+    [migrationAuthBody],
+  );
+
+  const loadMeasurements = useCallback(async () => {
+    if (!migrationSelected || !migrationBucket) return;
+    setMigrationLoadingMeta(true);
+    try {
+      const res = await fetch(
+        "/plugins/signalk-questdb/api/migration/measurements",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: migrationSelected.url,
+            type: migrationSelected.type,
+            bucket: migrationBucket,
+            ...migrationAuthBody(),
+          }),
+        },
+      );
+      const body = await res.json().catch(() => null);
+      const measurements = toMigrationMeasurements(body);
+      setMigrationMeasurements(measurements);
+      if (!res.ok) {
+        setActionStatus(
+          (body as ApiError | null)?.error ?? "Could not list measurements.",
+        );
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus("Could not list measurements: " + errorMessage(e));
+      setStatusError(true);
+    }
+    setMigrationLoadingMeta(false);
+  }, [migrationSelected, migrationBucket, migrationAuthBody]);
+
+  const startMigration = async () => {
+    if (!migrationSelected || !migrationBucket) return;
+
+    // Convert before doing anything else: an incomplete datetime-local reads
+    // back "" and `new Date("").toISOString()` throws, which would kill this
+    // handler before any request went out. See toMigrationRange.
+    const range = toMigrationRange(migrationFrom, migrationTo);
+    if ("error" in range) {
+      setActionStatus(range.error);
+      setStatusError(true);
+      return;
+    }
+
+    setMigrationStarting(true);
+    setActionStatus("");
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/migration/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: migrationSelected.url,
+          type: migrationSelected.type,
+          bucket: migrationBucket,
+          ...migrationAuthBody(),
+          from: range.from,
+          to: range.to,
+        }),
+      });
+      const body = await res.json().catch(() => null);
+      if (res.ok) {
+        setMigrationRun(toMigrationStatus(body) ?? null);
+      } else {
+        setActionStatus(
+          (body as ApiError | null)?.error ?? "Could not start migration.",
+        );
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus("Could not start migration: " + errorMessage(e));
+      setStatusError(true);
+    }
+    setMigrationStarting(false);
+  };
+
+  const cancelMigration = async () => {
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/migration/cancel", {
+        method: "POST",
+      });
+      const body = await res.json().catch(() => null);
+      setMigrationRun(toMigrationStatus(body) ?? migrationRun);
+    } catch (e) {
+      setActionStatus("Could not cancel: " + errorMessage(e));
+      setStatusError(true);
+    }
+  };
+
+  // Poll only while a run is active. Self-scheduling rather than setInterval,
+  // matching the status poll above: a slow response must not stack requests.
+  useEffect(() => {
+    if (migrationRun?.state !== "running") return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          "/plugins/signalk-questdb/api/migration/status",
+        );
+        const body = await res.json().catch(() => null);
+        const run = toMigrationStatus(body);
+        if (!cancelled) {
+          if (run) {
+            setMigrationRun(run);
+          } else if (res.ok) {
+            // A 200 carrying no run means the server genuinely has none —
+            // the plugin restarted, taking the in-memory run with it. Keeping
+            // the last snapshot on screen would leave "Importing" frozen at
+            // stale counters, polling forever against a run that no longer
+            // exists. Say so instead.
+            setMigrationRun(null);
+            setActionStatus(
+              "The import stopped because the plugin restarted. Re-run it to continue — already-imported rows are not duplicated.",
+            );
+            setStatusError(true);
+          }
+          // A non-OK response is a transport hiccup, not proof the run is
+          // gone; leave the last known state and retry.
+        }
+      } catch {
+        // A failed poll is not a failed migration — the run continues
+        // server-side. Stay quiet and retry on the next tick.
+      }
+      if (!cancelled) timer = setTimeout(poll, 1000);
+    };
+    timer = setTimeout(poll, 1000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [migrationRun?.state]);
+
+  // Pick up a run that was already going when the panel mounted (a reload
+  // mid-import, or a second browser tab).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(
+          "/plugins/signalk-questdb/api/migration/status",
+        );
+        const run = toMigrationStatus(await res.json().catch(() => null));
+        if (!cancelled && run) setMigrationRun(run);
+      } catch {
+        // No run, or the endpoint is unavailable; nothing to restore.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [exportFrom, setExportFrom] = useState("");
   const [exportTo, setExportTo] = useState("");
@@ -1310,34 +1569,95 @@ export default function PluginConfigurationPanel({
 
         {migrationSources && migrationSources.length > 0 && (
           <div>
-            {migrationSources.map((src, i) => (
-              <div key={i} style={S.migrationItem}>
+            {migrationSources.map((src, i) => {
+              const selected =
+                migrationSelected?.url === src.url &&
+                migrationSelected?.type === src.type;
+              // Selecting a source is the entry point to the whole import
+              // flow, so it has to be reachable without a mouse: a bare
+              // clickable <div> is invisible to keyboard and screen readers.
+              const select = () => {
+                setMigrationSelected(src);
+                setMigrationBuckets(null);
+                setMigrationBucket("");
+                setMigrationMeasurements(null);
+                // Credentials belong to the source they were typed for.
+                // Carrying them across a selection change would send one
+                // server's token to another the moment the next request goes
+                // out — including to a manually-entered remote host.
+                setMigrationToken("");
+                setMigrationOrg("");
+                setMigrationUser("");
+                setMigrationPassword("");
+                // 2.x always needs a token, and the fields were just
+                // cleared, so listing now would produce a guaranteed
+                // "rejected the credentials" error. Let the credential fields
+                // appear and the explicit "List buckets" button do it. 1.x
+                // commonly has auth off, so it can load straight away.
+                if (src.type !== "influxdb2") {
+                  // The fields were just cleared; say so explicitly rather
+                  // than letting the default read stale state.
+                  void loadBuckets(src, {
+                    token: undefined,
+                    org: undefined,
+                    username: undefined,
+                    password: undefined,
+                  });
+                }
+              };
+              return (
                 <div
+                  key={i}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={selected}
                   style={{
-                    ...S.cardIcon,
-                    width: 36,
-                    height: 36,
-                    fontSize: 16,
-                    background:
-                      src.type === "influxdb2" ? "#020a47" : "#22adf6",
-                    color: "#fff",
+                    ...S.migrationItem,
+                    cursor: "pointer",
+                    outline: selected ? "2px solid #22adf6" : undefined,
+                  }}
+                  onClick={select}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      // Space would otherwise scroll the panel.
+                      e.preventDefault();
+                      select();
+                    }
                   }}
                 >
-                  {src.type === "influxdb2" ? "2" : "1"}
-                </div>
-                <div style={S.cardInfo}>
-                  <div style={S.cardTitle}>
-                    InfluxDB {src.type === "influxdb2" ? "2.x" : "1.x"}
-                    <span style={{ ...S.tag, ...S.tagLatest }}>
-                      {src.status}
-                    </span>
+                  <div
+                    style={{
+                      ...S.cardIcon,
+                      width: 36,
+                      height: 36,
+                      fontSize: 16,
+                      background:
+                        src.type === "influxdb2" ? "#020a47" : "#22adf6",
+                      color: "#fff",
+                    }}
+                  >
+                    {src.type === "influxdb2" ? "2" : "1"}
+                  </div>
+                  <div style={S.cardInfo}>
+                    <div style={S.cardTitle}>
+                      InfluxDB {src.type === "influxdb2" ? "2.x" : "1.x"}
+                      <span style={{ ...S.tag, ...S.tagLatest }}>
+                        {src.status}
+                      </span>
+                    </div>
+                    {/* `version` already carries its own "v" from InfluxDB
+                        (e.g. "v2.9.1"); the server strips it so this does not
+                        render "vv2.9.1". */}
+                    <div style={S.cardMeta}>
+                      {src.url} &middot; v{src.version}
+                    </div>
                   </div>
                   <div style={S.cardMeta}>
-                    {src.url} &middot; v{src.version}
+                    {selected ? "selected" : "click to select"}
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -1346,6 +1666,7 @@ export default function PluginConfigurationPanel({
           <input
             style={S.input}
             placeholder="http://192.168.1.100:8086"
+            aria-label="Manual InfluxDB URL"
             value={migrationUrl}
             onChange={(e) => setMigrationUrl(e.target.value)}
           />
@@ -1360,6 +1681,209 @@ export default function PluginConfigurationPanel({
               instances.
             </div>
           )}
+
+        {migrationSelected && (
+          <div style={{ marginTop: 14 }}>
+            <div style={S.fieldHelp}>
+              {migrationSelected.type === "influxdb2"
+                ? "InfluxDB 2.x needs an API token with read access to the bucket, and the organisation name."
+                : "InfluxDB 1.x needs a username and password only if the server has authentication enabled."}
+            </div>
+
+            {migrationSelected.type === "influxdb2" ? (
+              <>
+                <div style={S.fieldRow}>
+                  <span style={S.label}>API token</span>
+                  <input
+                    style={S.input}
+                    type="password"
+                    aria-label="InfluxDB API token"
+                    value={migrationToken}
+                    onChange={(e) => setMigrationToken(e.target.value)}
+                  />
+                  <span style={S.hint}>not stored</span>
+                </div>
+                <div style={S.fieldRow}>
+                  <span style={S.label}>Organisation</span>
+                  <input
+                    style={S.input}
+                    aria-label="InfluxDB organisation"
+                    value={migrationOrg}
+                    onChange={(e) => setMigrationOrg(e.target.value)}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={S.fieldRow}>
+                  <span style={S.label}>Username</span>
+                  <input
+                    style={S.input}
+                    aria-label="InfluxDB username"
+                    value={migrationUser}
+                    onChange={(e) => setMigrationUser(e.target.value)}
+                  />
+                  <span style={S.hint}>blank if auth is off</span>
+                </div>
+                <div style={S.fieldRow}>
+                  <span style={S.label}>Password</span>
+                  <input
+                    style={S.input}
+                    type="password"
+                    aria-label="InfluxDB password"
+                    value={migrationPassword}
+                    onChange={(e) => setMigrationPassword(e.target.value)}
+                  />
+                  <span style={S.hint}>not stored</span>
+                </div>
+              </>
+            )}
+
+            <div style={{ ...S.fieldRow, marginTop: 4 }}>
+              <span style={S.label} />
+              <Button
+                busy={migrationLoadingMeta}
+                busyLabel="Loading..."
+                onClick={() => void loadBuckets(migrationSelected)}
+              >
+                {migrationSelected.type === "influxdb2"
+                  ? "List buckets"
+                  : "List databases"}
+              </Button>
+            </div>
+
+            {migrationBuckets && migrationBuckets.length > 0 && (
+              <div style={S.fieldRow}>
+                <span style={S.label}>
+                  {migrationSelected.type === "influxdb2"
+                    ? "Bucket"
+                    : "Database"}
+                </span>
+                <select
+                  style={S.select}
+                  aria-label="InfluxDB bucket or database to import from"
+                  value={migrationBucket}
+                  onChange={(e) => {
+                    setMigrationBucket(e.target.value);
+                    setMigrationMeasurements(null);
+                  }}
+                >
+                  <option value="">Select...</option>
+                  {migrationBuckets.map((b) => (
+                    <option key={b.name} value={b.name}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  busy={migrationLoadingMeta}
+                  busyLabel="..."
+                  onClick={() => void loadMeasurements()}
+                >
+                  Preview paths
+                </Button>
+              </div>
+            )}
+
+            {migrationMeasurements && (
+              <div style={S.fieldHelp}>
+                {migrationMeasurements.length} measurement
+                {migrationMeasurements.length === 1 ? "" : "s"} found
+                {migrationMeasurements.length > 0 && (
+                  <>
+                    {" "}
+                    &mdash; e.g.{" "}
+                    {migrationMeasurements
+                      .slice(0, 3)
+                      .map((m) => m.name)
+                      .join(", ")}
+                    {migrationMeasurements.length > 3 ? ", ..." : ""}
+                  </>
+                )}
+              </div>
+            )}
+
+            <div style={S.fieldRow}>
+              <span style={S.label}>From</span>
+              <input
+                style={S.input}
+                type="datetime-local"
+                aria-label="Import range start"
+                value={migrationFrom}
+                onChange={(e) => setMigrationFrom(e.target.value)}
+              />
+            </div>
+            <div style={S.fieldRow}>
+              <span style={S.label}>To</span>
+              <input
+                style={S.input}
+                type="datetime-local"
+                aria-label="Import range end"
+                value={migrationTo}
+                onChange={(e) => setMigrationTo(e.target.value)}
+              />
+            </div>
+
+            <div style={S.fieldHelp}>
+              Imported rows are tagged <code>source=influxdb-import</code> and
+              written with their original timestamps, so re-running the same
+              range overwrites rather than duplicating.
+            </div>
+
+            <div style={{ ...S.migrationActions, marginTop: 10 }}>
+              <Button
+                variant="primary"
+                busy={migrationStarting}
+                busyLabel="Starting..."
+                disabled={
+                  !migrationBucket ||
+                  !migrationFrom ||
+                  !migrationTo ||
+                  migrationRun?.state === "running"
+                }
+                onClick={startMigration}
+              >
+                Start import
+              </Button>
+              {migrationRun?.state === "running" && (
+                <Button variant="danger" onClick={cancelMigration}>
+                  Cancel
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {migrationRun && (
+          <div style={{ ...S.empty, padding: "12px", textAlign: "left" }}>
+            <div>
+              <strong>
+                {migrationRun.state === "running"
+                  ? "Importing"
+                  : migrationRun.state === "done"
+                    ? "Import complete"
+                    : migrationRun.state === "cancelled"
+                      ? "Import cancelled"
+                      : "Import failed"}
+              </strong>
+              {migrationRun.bucket ? ` from ${migrationRun.bucket}` : ""}
+            </div>
+            <div style={S.cardMeta}>
+              {formatNumber(migrationRun.progress.written)} written,{" "}
+              {formatNumber(migrationRun.progress.skipped)} skipped,{" "}
+              {migrationRun.progress.measurementsDone}/
+              {migrationRun.progress.measurementsTotal} measurements
+              {migrationRun.progress.currentMeasurement
+                ? ` — ${migrationRun.progress.currentMeasurement}`
+                : ""}
+            </div>
+            {migrationRun.error && (
+              <div style={{ ...S.cardMeta, color: "#b91c1c" }}>
+                {migrationRun.error}
+              </div>
+            )}
+          </div>
+        )}
       </CollapsibleSection>
 
       <CollapsibleSection title="Data Export">
