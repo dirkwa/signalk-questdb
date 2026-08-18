@@ -183,6 +183,12 @@ export default (app: App) => {
   // capped QuestDB's requested value. Null until a clamp happens (or on a
   // signalk-container older than 1.18.0, which doesn't emit the event).
   let ulimitClamp: UlimitClamp | null = null;
+  // Set by onContainerWedged: the runtime couldn't stop/remove the container to
+  // apply a change, so signalk-container deferred the recreate (it does NOT
+  // throw). Sticky within a start/update cycle — the container is running the
+  // OLD config/version, so we must not report success or persist a new version
+  // as if the change applied. Cleared at the top of each ensureRunning attempt.
+  let containerWedged: string | null = null;
   // Whether this QuestDB's wal_tables() exposes the errorTag/errorMessage
   // columns (present on current builds, absent on an older pinned version).
   // Probed once via the richer status query and cached so an old build does
@@ -307,6 +313,7 @@ export default (app: App) => {
   // operator see only a silent drift loop in the server log. Requires
   // signalk-container >= 1.29.0; on older versions the callback never fires.
   const onContainerWedged = (event: ContainerWedged): void => {
+    containerWedged = event.reason;
     // publishError → setPluginError already lands in the server log at error
     // level and drives the admin-UI status; matches every other error site.
     publishError(event.reason);
@@ -882,6 +889,7 @@ export default (app: App) => {
         // limit was raised) doesn't leave a stale warning; onUlimitClamped
         // re-sets it if this run clamps again.
         ulimitClamp = null;
+        containerWedged = null;
         await containers.ensureRunning(
           QUESTDB_CONTAINER_NAME,
           containerConfig,
@@ -1291,12 +1299,12 @@ export default (app: App) => {
       }
     }
 
-    // Guarded: if ensureRunning surfaced an error (e.g. a wedged container via
-    // onContainerWedged, which defers rather than throws), keep it on the
-    // status line instead of overwriting it with a false "Recording".
-    // Guarded: if ensureRunning surfaced an error (e.g. a wedged container via
-    // onContainerWedged, which defers rather than throws), keep it on the
-    // status line instead of overwriting it with a false "Recording".
+    // If the container wedged, ensureRunning deferred rather than threw, and the
+    // "Waiting…/Creating tables…" progress lines above have since overwritten
+    // the error onContainerWedged set. Re-assert it as the final status so the
+    // operator sees the remedy, not a false "Recording". publishRecordingStatus
+    // is guarded on pluginErrorActive, so it is a no-op while the error stands.
+    if (containerWedged) publishError(containerWedged);
     publishRecordingStatus(ilpHost, ilpPort);
     // Everything is registered — only now does the plugin count as running.
     // Any earlier return/throw leaves the flag false, so a half-started
@@ -1879,15 +1887,11 @@ export default (app: App) => {
             await containers.pullImage(`questdb/questdb:${newTag}`);
             assertNotStopped();
 
-            if (currentConfig) {
-              currentConfig.questdbVersion = newTag;
-              await new Promise<void>((resolve, reject) => {
-                app.savePluginOptions({ ...currentConfig! }, (err) => {
-                  if (err) reject(err);
-                  else resolve();
-                });
-              });
-            }
+            // NOTE: questdbVersion is persisted only AFTER a confirmed
+            // recreate (below), not here — a wedged container defers the
+            // recreate without throwing, and persisting newTag now would make
+            // the plugin claim a version the still-running old container is not
+            // actually on, surviving restarts.
 
             const updateVolumeSource =
               await resolveQuestdbVolumeSource(containers);
@@ -1918,6 +1922,7 @@ export default (app: App) => {
             // generation one more time.
             assertNotStopped();
             ulimitClamp = null;
+            containerWedged = null;
             containerEpoch++;
             await containers.ensureRunning(
               QUESTDB_CONTAINER_NAME,
@@ -1984,17 +1989,33 @@ export default (app: App) => {
                 assertNotStopped();
               }
             }
+            // Persist the new version only now that the recreate is confirmed
+            // (a wedge deferred it — the old container is still running).
+            if (!containerWedged && currentConfig) {
+              currentConfig.questdbVersion = newTag;
+              await new Promise<void>((resolve, reject) => {
+                app.savePluginOptions({ ...currentConfig! }, (err) => {
+                  if (err) reject(err);
+                  else resolve();
+                });
+              });
+            }
             return { ilpHost, ilpPort };
           });
 
-          // Guarded: a wedge (or any error) surfaced during the update's
-          // ensureRunning must not be hidden by a "Recording {newTag}" line
-          // that also wrongly implies the new tag was applied.
-          if (!pluginErrorActive) {
-            app.setPluginStatus(
-              `Recording to QuestDB ${newTag} at ${ilp.ilpHost}:${ilp.ilpPort}`,
-            );
+          if (containerWedged) {
+            // The recreate was deferred: the container is still on the OLD
+            // version. Do not claim success — report the wedge and its remedy.
+            res.status(409).json({
+              error: "container wedged",
+              message: containerWedged,
+            } satisfies UpdateApplyResponse);
+            return;
           }
+
+          app.setPluginStatus(
+            `Recording to QuestDB ${newTag} at ${ilp.ilpHost}:${ilp.ilpPort}`,
+          );
 
           res.json({
             status: "updated",
