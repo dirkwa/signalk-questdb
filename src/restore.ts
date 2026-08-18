@@ -97,7 +97,16 @@ const MOTION_PATHS = [
  * position and 0 of them carrying a name (issue #127).
  */
 const IDENTITY_PATHS = [
+  // `design.aisShipType` is an OBJECT in Signal K ({id, name}) — Freeboard
+  // colours a target by its `.id`. Like `design.length` it is recorded as its
+  // flattened leaves (`design.aisShipType.id` in the numeric table,
+  // `design.aisShipType.name` in the string table), so restoring only the bare
+  // path brought back nothing and every restored target stayed the default
+  // colour (issue #148). The bare path is kept for databases recorded before
+  // flattening (issue #128) by a source that emitted it as a plain number.
   "design.aisShipType",
+  "design.aisShipType.id",
+  "design.aisShipType.name",
   // `design.length` is an OBJECT in Signal K ({overall, hull}), so it is
   // recorded as its leaves, not under the bare path — which never existed in
   // the table and so restored nothing. Both spellings are listed: the leaf is

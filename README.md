@@ -194,8 +194,10 @@ before names arrive. The chart fills in gradually instead of showing the traffic
 that was there a moment ago.
 
 With **Restore vessels on startup** enabled, the plugin replays each vessel's
-last recorded position (plus course, speed, heading and identity) from QuestDB
-as soon as it connects, so the chart is populated immediately.
+last recorded position (plus course, speed, heading and identity — name,
+dimensions and AIS ship type) from QuestDB as soon as it connects, so the chart
+is populated immediately, with each target drawn in its ship-type colour rather
+than the default.
 
 **A restored position is where a vessel _was_, not where it is now.** Nothing is
 dead-reckoned forward. The plugin presents these values as the history they are
