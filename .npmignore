@@ -1,4 +1,8 @@
 src/
+# Compiled tests. `npm test` runs them from dist/test/ in the WORKING TREE,
+# which .npmignore does not touch — this only keeps them out of the published
+# tarball, where they were ~30% of the unpacked size and nothing imports them.
+dist/test/
 dist-panel-test/
 .github/
 .mf/
