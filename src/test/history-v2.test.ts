@@ -790,10 +790,17 @@ describe("history-v2 sourceRef filtering", () => {
       ],
     } as any);
 
-    assert.equal(result.values[0].sourceRef, "gps.main");
+    // signalk-server #2817 renamed the RESPONSE-side field to `$source`
+    // while the request-side PathSpec kept `sourceRef`. Emitting the old key
+    // left consumers unable to tell the columns apart.
+    assert.equal(result.values[0].$source, "gps.main");
     assert.ok(
-      !("sourceRef" in result.values[1]),
-      "an unfiltered spec must not grow a sourceRef",
+      !("$source" in result.values[1]),
+      "an unfiltered spec must not grow a $source",
+    );
+    assert.ok(
+      !("sourceRef" in result.values[0]),
+      "the pre-#2817 key must not linger alongside $source",
     );
   });
 
@@ -851,6 +858,668 @@ describe("history-v2 sourceRef filtering", () => {
           },
         ],
       } as any),
+    );
+  });
+});
+
+/** Mock whose responses depend on the SQL, so DISTINCT can be answered. */
+function makeSourceAwareClient(
+  captured: CapturedQuery[],
+  sourcesByTable: Record<string, (string | null)[]>,
+  dataRows: [string, unknown][] = [],
+) {
+  return {
+    exec: async (sql: string) => {
+      captured.push({ sql });
+      if (/SELECT DISTINCT source FROM (\w+)/.test(sql)) {
+        const table = /FROM (\w+)/.exec(sql)![1];
+        const list = sourcesByTable[table];
+        if (list === undefined)
+          throw new Error(`table does not exist: ${table}`);
+        return {
+          columns: [],
+          dataset: list.map((s) => [s]),
+          count: list.length,
+          timestamp: 0,
+        };
+      }
+      return {
+        columns: [],
+        dataset: dataRows.map(([ts, v]) => [ts, v]),
+        count: dataRows.length,
+        timestamp: 0,
+      };
+    },
+  } as any;
+}
+
+describe("history-v2 sourcePolicy=all", () => {
+  const RANGE = {
+    from: { toString: () => "2024-01-01T00:00:00Z" },
+    to: { toString: () => "2024-01-01T01:00:00Z" },
+  };
+  const SPEC = {
+    path: "navigation.speedOverGround",
+    aggregate: "average",
+    parameter: [],
+  };
+
+  it("is inert until the operator enables it", async () => {
+    const captured: CapturedQuery[] = [];
+    // Third argument omitted = disabled, which is the shipped default.
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: ["gps.main", "gps.aux"] }),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 1, "must not expand while disabled");
+    assert.ok(!("$source" in result.values[0]));
+    assert.ok(
+      !captured.some((c) => /SELECT DISTINCT source/.test(c.sql)),
+      "a disabled provider must not even probe for sources",
+    );
+  });
+
+  it("expands one path into one column per source when enabled", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {
+        signalk: ["gps.aux", "gps.main"],
+        signalk_str: [],
+      }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.deepEqual(
+      result.values.map((v) => v.$source),
+      ["gps.aux", "gps.main"],
+      "one column per source, named sources sorted for stable order",
+    );
+    // Each column must be FILTERED to its own source, or every column would
+    // carry identical merged data under different labels.
+    assert.ok(captured.some((c) => /source = 'gps.main'/.test(c.sql)));
+    assert.ok(captured.some((c) => /source = 'gps.aux'/.test(c.sql)));
+  });
+
+  // The data array must be as wide as `values`. Assembling rows against the
+  // REQUESTED spec count instead of the expanded column count leaves every
+  // expanded column without a slot — the metadata promises N series and the
+  // rows carry one.
+  it("gives every expanded column its own slot in each data row", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(
+        captured,
+        { signalk: ["gps.aux", "gps.main"], signalk_str: [] },
+        [
+          ["2024-01-01T00:00:00.000Z", 1.5],
+          ["2024-01-01T00:00:01.000Z", 2.5],
+        ],
+      ),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 2);
+    assert.ok(result.data.length > 0, "expected data rows");
+    for (const row of result.data) {
+      assert.equal(
+        row.length - 1,
+        result.values.length,
+        `row has ${row.length - 1} value slots for ${result.values.length} columns`,
+      );
+    }
+  });
+
+  it("leaves an explicit sourceRef as a filter, not an expansion", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: ["gps.main", "gps.aux"] }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [{ ...SPEC, sourceRef: "gps.main" }],
+    } as any);
+
+    assert.equal(result.values.length, 1);
+    assert.equal(result.values[0].$source, "gps.main");
+    assert.ok(
+      !captured.some((c) => /SELECT DISTINCT source/.test(c.sql)),
+      "an explicit source needs no discovery",
+    );
+  });
+
+  it("does nothing without the policy, even when enabled", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: ["gps.main", "gps.aux"] }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 1);
+    assert.ok(!("$source" in result.values[0]));
+  });
+
+  it("treats an unrecognised policy as absent", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: ["gps.main", "gps.aux"] }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "none",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 1, "only 'all' expands");
+    assert.ok(!("$source" in result.values[0]));
+    assert.ok(
+      !captured.some((c) => /SELECT DISTINCT source/.test(c.sql)),
+      "an unknown policy must not probe for sources",
+    );
+  });
+
+  // The per-path cap alone is not enough: many paths at many sources each is
+  // hundreds of queries from one request.
+  it("refuses a request whose total expansion is too wide", async () => {
+    const captured: CapturedQuery[] = [];
+    const eight = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: eight, signalk_str: [] }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    // 9 paths x 8 sources = 72 columns, past the 64 request ceiling.
+    const specs = Array.from({ length: 9 }, (_, i) => ({
+      path: `nav.p${i}`,
+      aggregate: "average",
+      parameter: [],
+    }));
+
+    await assert.rejects(
+      () =>
+        provider.getValues({
+          ...RANGE,
+          sourcePolicy: "all",
+          pathSpecs: specs,
+        } as any),
+      /expands these paths into 72 columns/,
+    );
+  });
+
+  // Discovery is a query per path per table, so a request far past the
+  // ceiling must be rejected BEFORE issuing hundreds of DISTINCT probes.
+  it("stops probing once the column budget is blown", async () => {
+    const captured: CapturedQuery[] = [];
+    const eight = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: eight, signalk_str: [] }),
+      SELF_CONTEXT,
+      true,
+    );
+    const specs = Array.from({ length: 100 }, (_, i) => ({
+      path: `nav.p${i}`,
+      aggregate: "average",
+      parameter: [],
+    }));
+
+    await assert.rejects(
+      () =>
+        provider.getValues({
+          ...RANGE,
+          sourcePolicy: "all",
+          pathSpecs: specs,
+        } as any),
+      /more than 64 columns/,
+    );
+
+    const probes = captured.filter((c) =>
+      /SELECT DISTINCT source/.test(c.sql),
+    ).length;
+    // 100 paths x 2 tables would be 200 if discovery ran to completion.
+    assert.ok(
+      probes < 40,
+      `issued ${probes} discovery probes before giving up`,
+    );
+  });
+
+  // The two value tables migrate independently, so `signalk` can have a
+  // `source` column while `signalk_str` does not. Expansion is driven by
+  // whichever table answered and then applied to both, so the string fallback
+  // carried `AND source = '...'` into a table with no such column and failed
+  // the WHOLE request — verified against a live QuestDB.
+  it("degrades the string fallback when only signalk_str lacks source", async () => {
+    const warnings: string[] = [];
+    const captured: CapturedQuery[] = [];
+    const client = {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        if (/DISTINCT source FROM signalk_str/.test(sql)) {
+          throw new Error("Invalid column: source");
+        }
+        if (/DISTINCT source FROM signalk/.test(sql)) {
+          return {
+            columns: [],
+            dataset: [["gps.main"]],
+            count: 1,
+            timestamp: 0,
+          };
+        }
+        // The numeric table holds nothing, forcing the string fallback.
+        if (/FROM signalk WHERE/.test(sql)) {
+          return { columns: [], dataset: [], count: 0, timestamp: 0 };
+        }
+        // The string table rejects any query carrying a source predicate.
+        if (/FROM signalk_str/.test(sql) && /source/.test(sql)) {
+          throw new Error("Invalid column: source");
+        }
+        return {
+          columns: [],
+          dataset: [["2024-01-01T00:00:00.000Z", "docked", null]],
+          count: 1,
+          timestamp: 0,
+        };
+      },
+    } as any;
+
+    const provider = createHistoryProviderV2(client, SELF_CONTEXT, true, (m) =>
+      warnings.push(m),
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [
+        { path: "navigation.state", aggregate: "last", parameter: [] },
+      ],
+    } as any);
+
+    // The request succeeds rather than failing outright...
+    assert.equal(result.values.length, 1);
+    assert.deepEqual(result.data, [["2024-01-01T00:00:00.000Z", "docked"]]);
+    // ...and the column withdraws its $source claim, because the rows it
+    // returned were never filtered by source.
+    assert.ok(
+      !("$source" in result.values[0]),
+      "unfiltered rows must not be labelled as one source's",
+    );
+    assert.ok(
+      warnings.some((w) => /signalk_str has no 'source'/.test(w)),
+      "the degradation must be reported",
+    );
+  });
+
+  it("gives unattributed rows their own column, ordered last", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {
+        signalk: [null, "gps.main"],
+        signalk_str: [],
+      }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 2);
+    assert.equal(result.values[0].$source, "gps.main");
+    assert.ok(
+      !("$source" in result.values[1]),
+      "the unattributed column carries no source claim",
+    );
+    // The unattributed column must select `source IS NULL`, NOT run unfiltered.
+    // An unfiltered query returns EVERY source's rows, so the "no source"
+    // column silently duplicates all the others — verified against a live
+    // QuestDB, where it returned 60 rows instead of its own 20.
+    const dataQueries = captured.filter(
+      (c) => !/DISTINCT source/.test(c.sql) && /FROM signalk\b/.test(c.sql),
+    );
+    assert.ok(
+      dataQueries.some((c) => /AND source IS NULL/.test(c.sql)),
+      "the unattributed column must filter on source IS NULL",
+    );
+    assert.equal(
+      dataQueries.filter(
+        (c) =>
+          !/AND source = /.test(c.sql) && !/AND source IS NULL/.test(c.sql),
+      ).length,
+      0,
+      "no expanded column may run without a source predicate",
+    );
+    assert.ok(
+      !dataQueries.some((c) => /source = 'null'/.test(c.sql)),
+      "a null source must never become the literal string 'null'",
+    );
+  });
+
+  it("falls back to a single column when nothing was recorded in range", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: [], signalk_str: [] }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 1, "the path must not vanish");
+    assert.ok(!("$source" in result.values[0]));
+  });
+
+  // A legacy table with no `source` column must not make expansion quietly
+  // do nothing: the request still succeeds with one merged column, but the
+  // operator is told why, naming the column and the table.
+  it("warns, rather than silently degrading, on a missing source column", async () => {
+    const warnings: string[] = [];
+    const client = {
+      exec: async (sql: string) => {
+        if (/DISTINCT source/.test(sql)) {
+          throw new Error("Invalid column: source");
+        }
+        return { columns: [], dataset: [], count: 0, timestamp: 0 };
+      },
+    } as any;
+    const provider = createHistoryProviderV2(client, SELF_CONTEXT, true, (m) =>
+      warnings.push(m),
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 1, "still answers, unexpanded");
+    assert.ok(warnings.length > 0, "the degradation must not be silent");
+    assert.match(warnings[0], /source/);
+    assert.match(warnings[0], /signalk/, "the warning names the table");
+  });
+
+  // A timeout or 5xx is NOT "no sources". Reporting it as an empty result
+  // would hand back a plausible single column built on a failure nobody saw.
+  it("propagates a real query failure instead of reporting no sources", async () => {
+    const client = {
+      exec: async (sql: string) => {
+        if (/DISTINCT source/.test(sql)) {
+          throw new Error("connection reset by peer");
+        }
+        return { columns: [], dataset: [], count: 0, timestamp: 0 };
+      },
+    } as any;
+    const provider = createHistoryProviderV2(client, SELF_CONTEXT, true);
+
+    await assert.rejects(
+      () =>
+        provider.getValues({
+          ...RANGE,
+          sourcePolicy: "all",
+          pathSpecs: [SPEC],
+        } as any),
+      /connection reset/,
+    );
+  });
+
+  // A table that does not exist yet (no string values recorded) is normal,
+  // not a schema fault, and must not produce a warning.
+  it("stays quiet when a value table simply does not exist", async () => {
+    const warnings: string[] = [];
+    const client = {
+      exec: async (sql: string) => {
+        if (/DISTINCT source FROM signalk_str/.test(sql)) {
+          throw new Error("table does not exist [table=signalk_str]");
+        }
+        if (/DISTINCT source/.test(sql)) {
+          return {
+            columns: [],
+            dataset: [["gps.main"]],
+            count: 1,
+            timestamp: 0,
+          };
+        }
+        return { columns: [], dataset: [], count: 0, timestamp: 0 };
+      },
+    } as any;
+    const provider = createHistoryProviderV2(client, SELF_CONTEXT, true, (m) =>
+      warnings.push(m),
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values[0].$source, "gps.main");
+    assert.equal(warnings.length, 0, "an absent table is not a fault");
+  });
+
+  // A STORED sourceRef need not satisfy the identifier guard — "tcp://gw:2000"
+  // is an ordinary Signal K source containing characters the guard rejects.
+  // Letting it reach the query builder throws and takes the WHOLE request
+  // down, so expansion would break a query that works today.
+  it("skips a source whose name cannot be used as a filter", async () => {
+    const warnings: string[] = [];
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {
+        signalk: ["gps.main", "tcp://gw:2000"],
+        signalk_str: [],
+      }),
+      SELF_CONTEXT,
+      true,
+      (m) => warnings.push(m),
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.deepEqual(
+      result.values.map((v) => v.$source),
+      ["gps.main"],
+      "the usable source still expands",
+    );
+    assert.ok(
+      warnings.some((w) => w.includes("tcp://gw:2000")),
+      "the skipped source must be reported",
+    );
+  });
+
+  it("keeps the path as one column when every source is unusable", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {
+        signalk: ["tcp://a", "tcp://b"],
+        signalk_str: [],
+      }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 1, "the path must not vanish");
+    assert.ok(!("$source" in result.values[0]));
+  });
+
+  // The bucket cap only bites when a resolution was named. An unresolved
+  // request runs one raw query per source with nothing else bounding it.
+  it("caps how many columns one path may expand into", async () => {
+    const warnings: string[] = [];
+    const captured: CapturedQuery[] = [];
+    const many = Array.from(
+      { length: 40 },
+      (_, i) => `src${String(i).padStart(2, "0")}`,
+    );
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, { signalk: many, signalk_str: [] }),
+      SELF_CONTEXT,
+      true,
+      (m) => warnings.push(m),
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 16, `got ${result.values.length}`);
+    assert.ok(
+      warnings.some((w) => /40 sources/.test(w)),
+      "truncation must be reported, not silent",
+    );
+    // Deterministic: the FIRST 16 sorted, not an arbitrary 16.
+    assert.equal(result.values[0].$source, "src00");
+    assert.equal(result.values[15].$source, "src15");
+  });
+
+  it("survives a database where no value table exists yet", async () => {
+    const captured: CapturedQuery[] = [];
+    // No table answers DISTINCT: the mock throws for both.
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {}),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [SPEC],
+    } as any);
+
+    assert.equal(result.values.length, 1);
+    assert.ok(!("$source" in result.values[0]));
+  });
+
+  it("consults the string table so boolean paths expand too", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {
+        signalk: [],
+        signalk_str: ["switch.a"],
+      }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [
+        {
+          path: "electrical.switches.nav.state",
+          aggregate: "last",
+          parameter: [],
+        },
+      ],
+    } as any);
+
+    assert.equal(result.values[0].$source, "switch.a");
+  });
+
+  it("counts EXPANDED columns against the sample-bucket cap", async () => {
+    // Four sources over a range that is just under the cap for ONE column.
+    // Counting requested paths instead of columns would run at 4x the ceiling.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {
+        signalk: ["a", "b", "c", "d"],
+        signalk_str: [],
+      }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    await assert.rejects(
+      () =>
+        provider.getValues({
+          from: { toString: () => "2024-01-01T00:00:00Z" },
+          // 400_000s at 1s = 400k buckets per series; 4 sources fall back too,
+          // so 8 queries x 400k = 3.2M, past the 1M cap.
+          to: { toString: () => "2024-01-05T15:06:40Z" },
+          resolution: 1,
+          sourcePolicy: "all",
+          pathSpecs: [SPEC],
+        } as any),
+      /sample buckets/,
+    );
+  });
+
+  it("position expands from its own table", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeSourceAwareClient(captured, {
+        signalk_position: ["gps.main", "gps.aux"],
+      }),
+      SELF_CONTEXT,
+      true,
+    );
+
+    const result = await provider.getValues({
+      ...RANGE,
+      sourcePolicy: "all",
+      pathSpecs: [
+        { path: "navigation.position", aggregate: "first", parameter: [] },
+      ],
+    } as any);
+
+    assert.deepEqual(
+      result.values.map((v) => v.$source),
+      ["gps.aux", "gps.main"],
+    );
+    assert.ok(
+      captured.some((c) => /DISTINCT source FROM signalk_position/.test(c.sql)),
+      "position must be probed in its own table, not signalk",
     );
   });
 });

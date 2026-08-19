@@ -15,6 +15,18 @@ export interface QuestDBResult {
   timestamp: number;
 }
 
+/**
+ * Non-throwing form of the identifier guard.
+ *
+ * Callers that must SKIP an unusable value rather than fail the request use
+ * this instead of catching validateIdentifier — sharing the one pattern keeps
+ * the two from drifting apart, which would let a value pass the check and
+ * then throw at the point of use.
+ */
+export function isSafeIdentifier(value: string): boolean {
+  return SAFE_IDENTIFIER.test(value);
+}
+
 export function validateIdentifier(value: string): string {
   if (!SAFE_IDENTIFIER.test(value)) {
     throw new Error(`Invalid identifier: ${value}`);

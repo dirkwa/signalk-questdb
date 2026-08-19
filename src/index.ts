@@ -1001,7 +1001,12 @@ export default (app: App) => {
       return;
     }
 
-    const v2Provider = createHistoryProviderV2(queryClient, app.selfContext);
+    const v2Provider = createHistoryProviderV2(
+      queryClient,
+      app.selfContext,
+      config.historySourcePolicyAll ?? false,
+      (msg) => app.debug(msg),
+    );
     app.registerHistoryApiProvider(v2Provider);
 
     const v1Provider = createHistoryProviderV1(

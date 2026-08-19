@@ -108,6 +108,13 @@ export const ConfigSchema = Type.Object({
       "Only replay values recorded within this many minutes. Matches Freeboard's default AIS expiry (9 minutes), so a restored target is one that would still have been on the chart. Raising this puts progressively staler positions on the chart.",
   }),
 
+  historySourcePolicyAll: Type.Boolean({
+    default: false,
+    title: "Allow sourcePolicy=all in the History API",
+    description:
+      "Let History API callers pass sourcePolicy=all to get one column per recording source instead of all sources merged into one series. Off by default because it multiplies the work a single request can ask for: a path recorded by four receivers becomes four queries and four columns, which on a Pi-class host turns a cheap request into an expensive one. Requests that name a source explicitly (paths=<path>|<sourceRef>) are unaffected and keep working either way.",
+  }),
+
   enableConsole: Type.Boolean({
     default: true,
     title: "QuestDB console webapp",
