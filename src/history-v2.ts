@@ -1,9 +1,16 @@
 import {
   QueryClient,
+  isSafeIdentifier,
   validateIdentifier,
   validateTimestamp,
 } from "./query-client.js";
+import type { QuestDBResult } from "./query-client.js";
 import { resolveTimeRange, ResolvedRange } from "./time-range.js";
+import {
+  isMissingKindColumn,
+  isMissingSourceColumn,
+  isMissingTable,
+} from "./schema-errors.js";
 
 interface PathSpec {
   path: string;
@@ -13,6 +20,15 @@ interface PathSpec {
   // (signalk-server #2737): restrict the series to rows recorded from that
   // source. Absent = all sources mixed, the pre-source behaviour.
   sourceRef?: string;
+  // Set only by sourcePolicy=all expansion, for the column that carries rows
+  // whose `source` is NULL (recorded before the column existed, or from a
+  // delta with no sourceRef).
+  //
+  // This is NOT the same as "no filter". Leaving such a column unfiltered
+  // returns EVERY source's rows, so the unattributed column silently
+  // duplicated all the others under a "no source" label — verified against a
+  // live QuestDB, where it returned 60 rows instead of its own 20.
+  unattributed?: boolean;
 }
 
 interface ValuesRequest {
@@ -25,13 +41,32 @@ interface ValuesRequest {
   duration?: unknown;
   context?: string;
   resolution?: number;
+  // signalk-server #2817. Only "all" is defined; the server rejects anything
+  // else before the request reaches a provider, so an unknown value here is
+  // treated the same as absent rather than guessed at.
+  sourcePolicy?: string;
   pathSpecs: PathSpec[];
+}
+
+/**
+ * One column of the response.
+ *
+ * The metadata key is `$source`, not `sourceRef` — signalk-server #2817
+ * renamed it on the RESPONSE side while `PathSpec.sourceRef` (the request
+ * side) kept its name. The two are deliberately different words for the same
+ * thing, and nothing validates the response, so emitting the old key simply
+ * left every consumer unable to tell the columns apart.
+ */
+interface ValueColumn {
+  path: string;
+  method: string;
+  $source?: string;
 }
 
 interface ValuesResponse {
   context: string;
   range: { from: string; to: string };
-  values: { path: string; method: string; sourceRef?: string }[];
+  values: ValueColumn[];
   data: [string, ...unknown[]][];
 }
 
@@ -116,8 +151,17 @@ function buildRangeWhere(range: ResolvedRange, context?: string): string {
 // predate the `source` column (external QuestDB the migration could not
 // touch): returning all sources when one was asked for would silently
 // reintroduce exactly the mixed-source ambiguity the filter exists to remove.
-function buildSourceWhere(sourceRef?: string): string {
-  return sourceRef ? ` AND source = '${validateIdentifier(sourceRef)}'` : "";
+function buildSourceWhere(spec: {
+  sourceRef?: string;
+  unattributed?: boolean;
+}): string {
+  if (spec.sourceRef) {
+    return ` AND source = '${validateIdentifier(spec.sourceRef)}'`;
+  }
+  // `source IS NULL` selects ONLY the unattributed rows. Returning "" here
+  // would select every source instead — see PathSpec.unattributed.
+  if (spec.unattributed) return " AND source IS NULL";
+  return "";
 }
 
 /**
@@ -148,6 +192,18 @@ function normalizeContext(context: string, selfContext: string): string {
 // sane chart while keeping the worst case bounded.
 const MAX_SAMPLE_BUCKETS = 1_000_000;
 
+// Upper bound on columns ONE path may expand into under sourcePolicy=all.
+// The bucket cap above only applies to requests that named a resolution, so
+// these are the only things bounding an unresolved expansion.
+const MAX_EXPANDED_SOURCES = 16;
+
+// Upper bound on the columns a whole REQUEST may expand into. The per-path
+// cap alone is not enough: twenty paths at sixteen sources each is 320
+// columns and 320 queries from one HTTP request. Exceeding this fails the
+// request rather than truncating it — silently returning some of the asked-for
+// series would be worse than saying the request is too broad.
+const MAX_EXPANDED_COLUMNS = 64;
+
 // Effective SAMPLE BY period: QuestDB rejects `SAMPLE BY 0s`, so fractional
 // resolutions (e.g. 0.5) must clamp up to 1s instead of flooring to zero.
 function effectiveResolution(resolution: number): number {
@@ -157,61 +213,295 @@ function effectiveResolution(resolution: number): number {
 export function createHistoryProviderV2(
   queryClient: QueryClient,
   selfContext: string,
+  // Opt-in, default off. Expansion multiplies one requested path into one
+  // query and one column PER recording source, so a request that was cheap
+  // becomes N times the work — on a Pi-class host that is the difference
+  // between a responsive chart and a stalled one. Callers that name a source
+  // explicitly are unaffected either way.
+  sourcePolicyAllEnabled = false,
+  // Degrading must be visible. Defaults to a no-op so existing callers and
+  // tests need no change.
+  debug: (msg: string) => void = () => {},
 ) {
-  // Read a path's rows from signalk_str. Numeric aggregates do not apply to
-  // text, so a downsampled request takes one representative value per bucket
-  // (last = the state in force at the bucket's end, which is what a state
-  // channel means) instead of averaging. Values are returned verbatim:
-  // booleans were stored as "true"/"false", so a consumer can tell them apart
-  // from real numbers, and Grafana value mappings work directly.
+  /**
+   * Distinct sources that recorded `path` inside the range.
+   *
+   * All three tables are consulted because a path lives in whichever one
+   * matches its value type — numeric in `signalk`, text/boolean in
+   * `signalk_str`, and navigation.position in its own table — and the caller
+   * has no way to know which before querying. Asking only the numeric table
+   * would expand a boolean channel into nothing and silently collapse it back
+   * to one merged column.
+   *
+   * Returns `null` for rows whose `source` is unset (recorded before the
+   * column existed, or from a delta carrying no sourceRef): that is a real
+   * series, distinct from any named source, and gets its own column.
+   *
+   * A database whose tables predate the `source` column has no such column to
+   * select, so the query errors; that is reported as "no sources", which
+   * leaves the path as a single unexpanded column rather than failing the
+   * whole request.
+   */
+  async function distinctSources(
+    path: string,
+    range: ResolvedRange,
+    safeContext: string,
+  ): Promise<(string | null)[]> {
+    const safePath = validateIdentifier(path);
+    const rangeWhere = buildRangeWhere(range, safeContext);
+    const tables =
+      path === "navigation.position"
+        ? [`SELECT DISTINCT source FROM signalk_position WHERE ${rangeWhere}`]
+        : [
+            `SELECT DISTINCT source FROM signalk WHERE ${rangeWhere} AND path = '${safePath}'`,
+            `SELECT DISTINCT source FROM signalk_str WHERE ${rangeWhere} AND path = '${safePath}'`,
+          ];
+
+    const found = new Set<string | null>();
+    for (const sql of tables) {
+      try {
+        const result = await queryClient.exec(sql);
+        for (const row of result.dataset) {
+          const value = row[0];
+          found.add(typeof value === "string" ? value : null);
+        }
+      } catch (err) {
+        const table = /FROM (\w+)/.exec(sql)?.[1] ?? "unknown";
+        if (isMissingSourceColumn(err)) {
+          // A legacy table predating the `source` migration. Real for
+          // databases the plugin did not create, so the request still
+          // succeeds with one unexpanded column — but SAYING SO matters:
+          // silently returning one column makes sourcePolicy=all look like
+          // it did nothing, which is indistinguishable from a path that
+          // genuinely has one source.
+          debug(
+            `sourcePolicy=all: ${table} has no 'source' column, so ` +
+              `${path} cannot be split by source — returning one merged ` +
+              `column. Re-create or migrate the table to enable expansion.`,
+          );
+          continue;
+        }
+        if (isMissingTable(err)) {
+          // Nothing recorded of this value type yet. Not a fault, and the
+          // other table may still answer.
+          continue;
+        }
+        // A timeout, a 5xx, a dropped connection: NOT "no sources". Reporting
+        // those as an empty result would hand the caller a plausible-looking
+        // single column built on a failure nobody saw.
+        throw err;
+      }
+    }
+
+    // Named sources first and sorted, so column order is stable across
+    // requests — a caller charting several receivers should not see the
+    // series swap places between refreshes. The unattributed column goes
+    // last, where it reads as the leftover it is.
+    const named = [...found].filter((s): s is string => s !== null).sort();
+    const all: (string | null)[] = found.has(null) ? [...named, null] : named;
+
+    // Hard ceiling on fan-out. The sample-bucket cap only bites when the
+    // caller asked for a resolution; an unresolved request runs one raw query
+    // per source with no cap at all, so a path that accumulated dozens of
+    // sourceRefs (a bus with many transmitters, or churn in generated refs)
+    // would schedule dozens of queries from a single HTTP request.
+    if (all.length > MAX_EXPANDED_SOURCES) {
+      debug(
+        `sourcePolicy=all: ${path} has ${all.length} sources in range; ` +
+          `expanding the first ${MAX_EXPANDED_SOURCES} (sorted) only.`,
+      );
+      return all.slice(0, MAX_EXPANDED_SOURCES);
+    }
+    return all;
+  }
+
+  /**
+   * Read a path's rows from `signalk_str`.
+   *
+   * Numeric aggregates do not apply to text, so a downsampled request takes
+   * one representative value per bucket (`last` = the state in force at the
+   * bucket's end, which is what a state channel means) instead of averaging.
+   * Values are returned verbatim: booleans were stored as "true"/"false", so
+   * a consumer can tell them apart from real numbers, and Grafana value
+   * mappings work directly.
+   *
+   * Returns the rows plus whether the source predicate had to be dropped.
+   * The two value tables migrate independently, so `signalk` can have a
+   * `source` column while `signalk_str` does not — and under sourcePolicy=all
+   * the expansion is driven by whichever table answered, then applied to
+   * both. Without this the fallback query carried `AND source = '...'` into a
+   * table with no such column and failed the WHOLE request with
+   * "Invalid column: source" (verified against a live QuestDB). The caller
+   * uses `sourceDropped` to withdraw the column's `$source` claim, because
+   * rows that were never filtered by source must not be labelled as one
+   * source's.
+   */
   async function readStringRows(
     where: string,
     resolution?: number,
-  ): Promise<[string, unknown][]> {
+  ): Promise<{ rows: [string, unknown][]; sourceDropped: boolean }> {
     // `value_kind` marks rows that were recorded as booleans, so v2 replays
     // them as real booleans exactly like v1 — otherwise the same path would
     // read `true` through one API and `"true"` through the other. Untagged
     // rows (plain text, and everything written before the column existed)
     // stay strings; the text is never guessed at.
-    const sql = (withKind: boolean) => {
+    const sql = (withKind: boolean, withSource: boolean) => {
       const kind = withKind ? "value_kind" : "NULL";
+      // Strip the source predicate for the no-source retry. It is always the
+      // trailing ` AND source = '...'` / ` AND source IS NULL` that
+      // buildSourceWhere appended, so removing it leaves the range, context
+      // and path filters intact.
+      const clause = withSource
+        ? where
+        : where.replace(/ AND source (?:= '[^']*'|IS NULL)/g, "");
       return resolution && resolution > 0
-        ? `SELECT ts, last(value_str) as value_str, last(${kind}) as value_kind FROM signalk_str WHERE ${where} SAMPLE BY ${effectiveResolution(resolution)}s FILL(NULL) ORDER BY ts`
-        : `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${where} ORDER BY ts LIMIT 10000`;
+        ? `SELECT ts, last(value_str) as value_str, last(${kind}) as value_kind FROM signalk_str WHERE ${clause} SAMPLE BY ${effectiveResolution(resolution)}s FILL(NULL) ORDER BY ts`
+        : `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${clause} ORDER BY ts LIMIT 10000`;
     };
     // A read racing ensureTables()'s migration — or an external QuestDB the
-    // plugin does not own — must degrade to text, not fail the request.
-    const result = await queryClient.exec(sql(true)).catch((err) => {
-      if (!/Invalid column:\s*value_kind/i.test(String(err))) throw err;
-      return queryClient.exec(sql(false));
-    });
-    return result.dataset.map((row) => [
-      row[0] as string,
-      row[2] === "boolean" ? row[1] === "true" : row[1],
-    ]);
+    // plugin does not own — must degrade, not fail the request. Two columns
+    // can be missing independently: `value_kind` (degrade to text) and
+    // `source` (degrade to unfiltered, and say so).
+    let sourceDropped = false;
+    const run = async (
+      withKind: boolean,
+      withSource: boolean,
+    ): Promise<QuestDBResult> => {
+      try {
+        return await queryClient.exec(sql(withKind, withSource));
+      } catch (err) {
+        if (withKind && isMissingKindColumn(err)) return run(false, withSource);
+        if (withSource && isMissingSourceColumn(err)) {
+          sourceDropped = true;
+          debug(
+            `signalk_str has no 'source' column, so this path cannot be ` +
+              `filtered by source there — returning its rows unfiltered and ` +
+              `dropping the source attribution for that column.`,
+          );
+          return run(withKind, false);
+        }
+        throw err;
+      }
+    };
+    const result = await run(true, true);
+    return {
+      rows: result.dataset.map((row: unknown[]) => [
+        row[0] as string,
+        row[2] === "boolean" ? row[1] === "true" : row[1],
+      ]),
+      sourceDropped,
+    };
   }
 
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
     const range = resolveTimeRange(query as any);
 
-    // Only specs that actually run a SAMPLE BY query fabricate buckets:
+    // Two gates, both required. The caller asks with sourcePolicy=all; the
+    // operator has to have allowed it. An unknown policy string is treated as
+    // absent — the server validates the value before a provider ever sees it,
+    // so guessing at anything else here would only invent behaviour.
+    const expandBySource =
+      sourcePolicyAllEnabled && query.sourcePolicy === "all";
+
+    const requestedContext = query.context ?? "vessels.self";
+    const storedContext = normalizeContext(requestedContext, selfContext);
+    const safeContext = validateIdentifier(storedContext);
+
+    // Expand each spec into the COLUMNS it will produce. Under
+    // sourcePolicy=all a path with no explicit sourceRef becomes one column
+    // per distinct source that actually recorded it in range; everything else
+    // stays a single column. Doing this before the query loop is what lets
+    // the loop, the bucket budget and the row assembly all agree on how many
+    // columns exist — the pre-#2817 code could assume one column per spec.
+    const columns: PathSpec[] = [];
+    for (const spec of query.pathSpecs) {
+      if (!expandBySource || spec.sourceRef) {
+        // An explicit sourceRef stays a FILTER and takes precedence over the
+        // policy, per the upstream contract.
+        columns.push(spec);
+        continue;
+      }
+      // Checked BEFORE the probe, not only after the loop: discovery is a
+      // query per path per table, so a request far past the ceiling would
+      // otherwise issue hundreds of DISTINCT probes and only then be told it
+      // was too broad. Stopping here makes the reported count a lower bound,
+      // which the message says.
+      if (columns.length > MAX_EXPANDED_COLUMNS) {
+        throw new Error(
+          `sourcePolicy=all expands these paths into more than ` +
+            `${MAX_EXPANDED_COLUMNS} columns — request fewer paths, or name ` +
+            `the sources explicitly with paths=<path>|<sourceRef>`,
+        );
+      }
+      const sources = await distinctSources(spec.path, range, safeContext);
+      if (sources.length === 0) {
+        // Nothing recorded in range, or a database with no `source` column:
+        // keep the unexpanded column so the caller still gets the series
+        // (empty, or mixed-source on a pre-source database) instead of the
+        // path silently vanishing from the response.
+        columns.push(spec);
+        continue;
+      }
+      const before = columns.length;
+      for (const source of sources) {
+        // `null` source = rows recorded before the column existed, or by a
+        // delta that carried no sourceRef. They are a real series and get
+        // their own unattributed column rather than being dropped.
+        if (source === null) {
+          columns.push({ ...spec, unattributed: true });
+          continue;
+        }
+        // A STORED sourceRef is not guaranteed to satisfy the identifier
+        // guard — a delta can carry something like "tcp://gw:2000", which is
+        // a perfectly ordinary Signal K source but contains characters the
+        // guard rejects. Letting it reach buildSourceWhere throws and takes
+        // the WHOLE request down, so expansion would turn a query that works
+        // today into a hard failure. Skip the column and say so instead.
+        if (!isSafeIdentifier(source)) {
+          debug(
+            `sourcePolicy=all: skipping source '${source}' for ${spec.path} — ` +
+              `it contains characters that cannot be used in a query filter.`,
+          );
+          continue;
+        }
+        columns.push({ ...spec, sourceRef: source });
+      }
+      // Every source was unusable: keep the path as one merged column rather
+      // than dropping it from the response entirely.
+      if (columns.length === before) columns.push(spec);
+    }
+
+    if (columns.length > MAX_EXPANDED_COLUMNS) {
+      throw new Error(
+        `sourcePolicy=all expands these paths into ${columns.length} columns ` +
+          `(max ${MAX_EXPANDED_COLUMNS}) — request fewer paths, or name the ` +
+          `sources explicitly with paths=<path>|<sourceRef>`,
+      );
+    }
+
+    // The bucket budget is checked HERE, after expansion, not before it.
+    // Under sourcePolicy=all one requested path becomes one SAMPLE BY query
+    // per source, so counting requested paths would let a four-receiver path
+    // run at four times the ceiling this cap exists to enforce — precisely
+    // the case the cap is for.
+    //
+    // Only columns that actually run a SAMPLE BY query fabricate buckets:
     // client-side aggregates (sma/ema/middle_index) read raw rows under a
-    // LIMIT and must not trip the cap. Each qualifying spec issues its own
-    // SAMPLE BY, so the fabricated total scales with their count.
+    // LIMIT and must not trip the cap.
     //
     // A non-numeric path costs TWO such queries: the numeric one comes back
     // empty and the string-table fallback repeats it against signalk_str.
     // Which paths those are is only known after querying, so the budget
-    // assumes the worst case — every sampled spec falling back — rather than
-    // letting a request built entirely of boolean/string paths quietly run at
-    // twice the ceiling this cap exists to enforce on Pi-class hosts.
-    const sampledSpecs = query.pathSpecs.filter(
+    // assumes the worst case — every sampled column falling back — rather
+    // than letting a request built entirely of boolean/string paths quietly
+    // run at twice the ceiling.
+    const sampledSpecs = columns.filter(
       (spec) =>
         spec.path === "navigation.position" ||
         !needsClientSideAggregation(spec.aggregate),
     ).length;
     // navigation.position is served by its own table and never falls back.
-    const fallbackCapableSpecs = query.pathSpecs.filter(
+    const fallbackCapableSpecs = columns.filter(
       (spec) =>
         spec.path !== "navigation.position" &&
         !needsClientSideAggregation(spec.aggregate),
@@ -234,27 +524,25 @@ export function createHistoryProviderV2(
       }
     }
 
-    const requestedContext = query.context ?? "vessels.self";
-    const storedContext = normalizeContext(requestedContext, selfContext);
-    const safeContext = validateIdentifier(storedContext);
-
-    const valuesList: { path: string; method: string; sourceRef?: string }[] =
-      [];
-    // Keyed by SPEC INDEX, not path: sourceRef filtering makes the same path
-    // twice in one request meaningful (one column per receiver), and a
-    // path-keyed map would let the second spec's rows overwrite the first's.
+    const valuesList: ValueColumn[] = [];
+    // Keyed by COLUMN INDEX, not path: source filtering and source expansion
+    // both make the same path appear more than once in one request (one
+    // column per receiver), and a path-keyed map would let the second
+    // column's rows overwrite the first's.
     const columnData: Map<number, [string, unknown][]> = new Map();
 
-    for (const [specIndex, spec] of query.pathSpecs.entries()) {
+    for (const [specIndex, spec] of columns.entries()) {
       const safePath = validateIdentifier(spec.path);
-      const entry: { path: string; method: string; sourceRef?: string } = {
+      const entry: ValueColumn = {
         path: spec.path,
         method: spec.aggregate,
       };
-      if (spec.sourceRef) entry.sourceRef = spec.sourceRef;
+      // Only source-specific columns carry `$source`. An unexpanded column is
+      // "all sources merged", which is not the same claim as "this source".
+      if (spec.sourceRef) entry.$source = spec.sourceRef;
       valuesList.push(entry);
 
-      const sourceWhere = buildSourceWhere(spec.sourceRef);
+      const sourceWhere = buildSourceWhere(spec);
       const isPosition = spec.path === "navigation.position";
       const table = isPosition ? "signalk_position" : "signalk";
 
@@ -339,10 +627,15 @@ export function createHistoryProviderV2(
         if (query.resolution && query.resolution > 0) {
           valuesList[specIndex].method = "last";
         }
-        columnData.set(
-          specIndex,
-          await readStringRows(where, query.resolution),
-        );
+        const strResult = await readStringRows(where, query.resolution);
+        if (strResult.sourceDropped) {
+          // The rows came back unfiltered because signalk_str has no `source`
+          // column. They are every source's rows, so the column must stop
+          // claiming to be one source's — labelling unfiltered data with a
+          // $source would be a lie the caller cannot detect.
+          delete valuesList[specIndex].$source;
+        }
+        columnData.set(specIndex, strResult.rows);
         continue;
       }
 
@@ -368,7 +661,7 @@ export function createHistoryProviderV2(
 
     const data: [string, ...unknown[]][] = sortedTimestamps.map((ts) => {
       const row: [string, ...unknown[]] = [ts];
-      for (let i = 0; i < query.pathSpecs.length; i++) {
+      for (let i = 0; i < columns.length; i++) {
         const m = indexMaps.get(i);
         row.push(m?.get(ts) ?? null);
       }

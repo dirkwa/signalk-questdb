@@ -95,6 +95,59 @@ GET /signalk/v2/api/history/values?paths=navigation.position|gps.main,navigation
 
 Without a sourceRef a path returns all sources mixed, as before.
 
+> **Breaking change in the v2 values response.** The per-column source is
+> reported as `$source`, not `sourceRef`. That is the key
+> [signalk-server#2817](https://github.com/SignalK/signalk-server/pull/2817)
+> settled on — its own contract test asserts `$source` — and it matches what
+> v1 playback has always emitted. It applies to every source-bearing column,
+> including the explicit `path|sourceRef` filter that shipped in 2.0.1, so a
+> consumer reading `sourceRef` from a v2 response must be updated. The
+> REQUEST side is unchanged: `paths=<path>|<sourceRef>` still uses that name.
+
+#### sourcePolicy=all
+
+`sourcePolicy=all`
+([signalk-server#2817](https://github.com/SignalK/signalk-server/pull/2817))
+asks for every source separated without naming them up front. Each path that
+does not already specify a source is expanded into one column per source that
+actually recorded it in range, with the source in the `$source` field of the
+column's `values` entry:
+
+```http
+GET /signalk/v2/api/history/values?paths=navigation.speedOverGround&duration=PT1H&sourcePolicy=all
+```
+
+```jsonc
+"values": [
+  { "path": "navigation.speedOverGround", "method": "average", "$source": "gps.aux"  },
+  { "path": "navigation.speedOverGround", "method": "average", "$source": "gps.main" },
+  { "path": "navigation.speedOverGround", "method": "average" }  // unattributed rows
+]
+```
+
+Named sources come first, sorted, so column order is stable between requests.
+Rows whose source is unset — recorded before the `source` column existed, or
+from a delta that carried none — form their own trailing column with no
+`$source` claim.
+
+**Off by default**, behind the plugin setting that allows the policy. Expansion multiplies the work one request can ask for: a path
+recorded by four receivers becomes four queries and four columns, which on a
+Pi-class host turns a cheap request into an expensive one. The sample-bucket
+cap counts expanded columns, so a resolution that is fine unexpanded may be
+rejected once expanded — use a coarser resolution or a shorter range.
+
+Two ceilings bound the fan-out. A single path expands into a limited number of
+columns; if more sources recorded it in range, the first named sources in
+sorted order are returned and the rest are dropped, which is reported in the
+plugin debug log only. A whole request is bounded too, and one that exceeds
+that limit is rejected outright rather than truncated — returning some of the
+asked-for series without saying so would be worse than refusing a request that
+is too broad. The error names the limit that was hit.
+
+An explicit `path|sourceRef` stays a filter and takes precedence over the
+policy, matching the upstream contract. Requests that name their sources are
+unaffected by the setting either way.
+
 ### v1 (WebSocket playback)
 
 Registered via `app.registerHistoryProvider()`. Supports playback at configurable speed multipliers using chunked reads from QuestDB. Replayed updates carry the recorded sourceRef as `$source`, one update per source, so consumers see the same attribution the live stream had.

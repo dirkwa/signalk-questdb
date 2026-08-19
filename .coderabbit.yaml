@@ -91,7 +91,7 @@ reviews:
           defaultSamplingRate)` BEFORE building the ILP line. Flag any
           path that builds the ILP string before throttling.
         - `ILPWriter` (`src/ilp-writer.ts`) buffers and flushes every
-          500ms or 1000 lines. Don't add per-write socket flushes.
+          5000ms or 1000 lines. Don't add per-write socket flushes.
 
         ## Config schema is the source of truth
 
@@ -211,8 +211,9 @@ reviews:
         - The single-worker QuestDB env vars
           (`QDB_SHARED_WORKER_COUNT=1`, etc.) in `src/index.ts` — tuned
           for Pi/Cerbo, do not "fix" by raising.
-        - The 500ms / 1000-line ILP flush thresholds in
-          `src/ilp-writer.ts` — picked deliberately.
+        - The 5000ms default / 1000-line ILP flush thresholds in
+          `src/ilp-writer.ts` — the default is deliberate, and the interval
+          is operator-configurable (`ilpFlushIntervalMs`, 500-300000).
         - Resource caps applied via signalk-container's
           `ContainerResourceLimits` (memory + cpus) — the defaults of
           `768m` / `1.5 cpus` are deliberate for the typical Signal K

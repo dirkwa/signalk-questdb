@@ -112,6 +112,10 @@ export default function PluginConfigurationPanel({
   const [enableConsole, setEnableConsole] = useState(
     cfg.enableConsole !== false,
   );
+  // Opt-in, so a missing key means off — matching the schema default.
+  const [historySourcePolicyAll, setHistorySourcePolicyAll] = useState(
+    cfg.historySourcePolicyAll === true,
+  );
   const [restoreMaxAgeMinutes, setRestoreMaxAgeMinutes] = useState(
     (cfg.restoreMaxAgeMinutes ?? 0) > 0 ? cfg.restoreMaxAgeMinutes! : 9,
   );
@@ -738,6 +742,7 @@ export default function PluginConfigurationPanel({
       recordSelf,
       recordOthers,
       restoreOnStart,
+      historySourcePolicyAll,
       enableConsole,
       restoreMaxAgeMinutes,
       retentionDays,
@@ -1399,6 +1404,23 @@ export default function PluginConfigurationPanel({
         <span style={S.hint}>
           replay each vessel&apos;s last recorded position after a restart, so
           AIS targets appear at once instead of only when they next transmit
+        </span>
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Allow sourcePolicy=all</span>
+        <input
+          type="checkbox"
+          style={S.checkbox}
+          aria-label="Allow sourcePolicy=all in the History API"
+          checked={historySourcePolicyAll}
+          onChange={(e) => setHistorySourcePolicyAll(e.target.checked)}
+        />
+        <span style={S.hint}>
+          let History API callers split a path into one column per recording
+          source. Off by default: a path recorded by four receivers becomes four
+          queries and four columns, which is markedly more work on a Pi-class
+          host. Requests that name a source explicitly are unaffected
         </span>
       </div>
 
