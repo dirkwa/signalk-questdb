@@ -1,4 +1,5 @@
 import { QueryClient, validateTimestamp } from "./query-client.js";
+import { isMissingKindColumn, isMissingSourceColumn } from "./schema-errors.js";
 
 interface HistoryOptions {
   startTime: Date;
@@ -82,21 +83,6 @@ function unionValueRowsSQL(
     `${numBranch(where, withSource)} UNION ALL ` +
     `${strBranch(where, withKind, withSource)} UNION ALL ` +
     `${posBranch(where, withSource)} ${orderAndLimit}`
-  );
-}
-
-// True for the error QuestDB returns when value_kind has not been added yet.
-function isMissingKindColumn(err: unknown): boolean {
-  return /Invalid column:\s*value_kind/i.test(
-    err instanceof Error ? err.message : String(err),
-  );
-}
-
-// Same, for the source column (a later migration than value_kind, so each
-// can be missing independently of the other).
-function isMissingSourceColumn(err: unknown): boolean {
-  return /Invalid column:\s*source/i.test(
-    err instanceof Error ? err.message : String(err),
   );
 }
 
@@ -259,12 +245,27 @@ export function createHistoryProviderV1(
       try {
         return await queryClient.exec(build(state.withKind, state.withSource));
       } catch (err) {
+        // Each degradation is announced ONCE per state object, not per query:
+        // the retry is deliberate and keeps playback working, but it silently
+        // changes what the caller gets back, and "playback works but the data
+        // looks wrong" is far harder to diagnose than a line in the log.
         if (state.withKind && isMissingKindColumn(err)) {
           state.withKind = false;
+          debug(
+            "history v1: signalk_str has no 'value_kind' column, so values " +
+              'recorded as booleans replay as the strings "true"/"false" — ' +
+              "their original type is not recoverable. Re-create or migrate " +
+              "the table to restore boolean replay.",
+          );
           continue;
         }
         if (state.withSource && isMissingSourceColumn(err)) {
           state.withSource = false;
+          debug(
+            "history v1: tables have no 'source' column, so replayed updates " +
+              "carry no $source attribution. Re-create or migrate the tables " +
+              "to restore it.",
+          );
           continue;
         }
         throw err;
