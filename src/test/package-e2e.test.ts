@@ -409,6 +409,15 @@ describe("published package layout", () => {
     }
   });
 
+  it("keeps compiled tests out of the package", () => {
+    // Not a correctness risk — nothing imports them — but dist/test/ was
+    // ~30% of the unpacked size until 2.1.0. Asserted so the exclusion
+    // cannot be quietly undone by a later ignore-file edit, which is the
+    // same failure mode as the .mf/ case below.
+    const tests = publishedFiles().filter((p) => p.startsWith("dist/test/"));
+    assert.deepEqual(tests, [], `compiled tests would be published: ${tests}`);
+  });
+
   it("keeps local build artifacts out of the package", () => {
     // .mf/ is federation's diagnostics dir; it shipped once already because
     // .gitignore does not govern npm.
