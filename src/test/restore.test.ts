@@ -598,6 +598,61 @@ describe("identity is restored over a longer window than motion (issue #127)", (
     });
   });
 
+  it("restores AIS ship type from its flattened leaves (issue #148)", () => {
+    // design.aisShipType is an object {id, name} recorded as leaves. Freeboard
+    // colours a target by .id; before #148 the bare path was the only one in
+    // the identity set, so nothing came back and every target kept the default
+    // colour. Both leaves are static identity, so they restore over the long
+    // window even when older than the motion window.
+    const { promise, deltas } = run([
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.aisShipType.id", AIS, "36", "number"] as Row,
+      // Real data tags aisShipType.name with a null value_kind (it predates or
+      // sits outside the identity writer); the decoder's default case restores
+      // it as the plain string, and it is NOT the synthetic empty-path name.
+      [
+        ago(40 * 60_000),
+        "design.aisShipType.name",
+        AIS,
+        "Sailing",
+        null,
+      ] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 1);
+      assert.equal(
+        result.skippedStale,
+        0,
+        "the ship-type leaves must use the identity window, not the motion one",
+      );
+      const idVal = valueAt(deltas[0], "design.aisShipType.id");
+      const nameVal = valueAt(deltas[0], "design.aisShipType.name");
+      assert.equal(idVal?.value, 36, "the .id leaf drives Freeboard's colour");
+      assert.equal(nameVal?.value, "Sailing");
+    });
+  });
+
+  it("restores the ship-type id even when only the .id leaf is present", () => {
+    // The id is what colours a target; the .name leaf is cosmetic. A vessel
+    // whose static report gave an id but no readable name must still come back
+    // coloured, so the id-alone path — the actual payload of #148 — is covered
+    // on its own, not only alongside .name.
+    const { promise, deltas } = run([
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.aisShipType.id", AIS, "70", "number"] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 1);
+      assert.equal(result.skippedStale, 0);
+      const idVal = valueAt(deltas[0], "design.aisShipType.id");
+      assert.equal(idVal?.value, 70, "a cargo ship must colour from .id alone");
+      // No name leaf → no name value; the target still draws in its colour.
+      assert.equal(valueAt(deltas[0], "design.aisShipType.name"), undefined);
+    });
+  });
+
   it("still refuses motion older than the short window", () => {
     // The widened identity window must not leak into position: a stale fix
     // draws a target somewhere it demonstrably is not.
