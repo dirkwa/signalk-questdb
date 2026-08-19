@@ -182,3 +182,72 @@ export interface MigrationSource {
 export interface MigrationDetectResponse extends ApiError {
   sources: MigrationSource[];
 }
+
+/** One InfluxDB container of series: a 2.x bucket or a 1.x database. */
+export interface MigrationBucket {
+  /** Bucket name (2.x) or database name (1.x) — what the import reads from. */
+  name: string;
+  /** 2.x bucket id, absent for 1.x. Only `name` is used in queries. */
+  id?: string;
+  /** Retention in seconds, 0 meaning infinite. Advisory, shown in the UI. */
+  retentionSeconds?: number;
+}
+
+/** POST /api/migration/buckets — credentials travel in the body. */
+export interface MigrationBucketsResponse extends ApiError {
+  buckets: MigrationBucket[];
+}
+
+/**
+ * How one InfluxDB measurement maps onto the plugin's tables. The importer
+ * decides this per measurement from the field types it actually sees, so a
+ * measurement carrying both numbers and strings lands in both tables rather
+ * than being dropped.
+ */
+export interface MigrationMeasurement {
+  name: string;
+  /** Field keys seen on this measurement. */
+  fields: string[];
+}
+
+/** POST /api/migration/measurements — credentials travel in the body. */
+export interface MigrationMeasurementsResponse extends ApiError {
+  measurements: MigrationMeasurement[];
+}
+
+/** Per-run counters, also the shape the panel renders as progress. */
+export interface MigrationProgress {
+  /** Rows read from InfluxDB. */
+  read: number;
+  /** Rows handed to the ILP writer (numeric + string + position). */
+  written: number;
+  /** Rows read but not written — unmappable value types, blank paths. */
+  skipped: number;
+  /** Measurements fully drained so far. */
+  measurementsDone: number;
+  /** Total measurements this run will visit. */
+  measurementsTotal: number;
+  /** Measurement currently being read, for the status line. */
+  currentMeasurement?: string;
+  /** Window start currently being read, ISO — lets the user see it advance. */
+  currentWindowStart?: string;
+}
+
+export type MigrationRunState = "running" | "done" | "failed" | "cancelled";
+
+/** GET /api/migration/status, and the body of POST /api/migration/start. */
+export interface MigrationStatusResponse extends ApiError {
+  /** Absent when no run has ever been started this process lifetime. */
+  run?: {
+    id: string;
+    state: MigrationRunState;
+    /** Source URL and bucket, echoed so the panel can label the run. */
+    url: string;
+    bucket: string;
+    startedAt: string;
+    finishedAt?: string;
+    progress: MigrationProgress;
+    /** Set when state is "failed". */
+    error?: string;
+  };
+}

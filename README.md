@@ -18,7 +18,7 @@ Stores all vessel data in QuestDB running as a managed container (via [signalk-c
 - **On-disk compression** -- LZ4 (fast) or ZSTD (smaller) via QuestDB WAL segment compression
 - **Parquet export** -- native QuestDB Parquet export with configurable compression
 - **CSV export** -- download historical data via REST endpoint
-- **InfluxDB migration** -- auto-detect InfluxDB 1.x/2.x on localhost or remote URL
+- **InfluxDB migration** -- detect InfluxDB 1.x/2.x, browse its buckets and measurements, and import history into QuestDB with original timestamps
 - **One-click updates** -- check for new QuestDB releases and update from the config panel
 - **Console webapp** -- QuestDB's own SQL console embedded in the Signal K admin UI (admin only)
 - **Config panel** -- status dashboard with row counts, version picker, update check, collapsible compression/migration/export sections
@@ -36,7 +36,7 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 - **Recording** -- record self, record AIS targets, startup restore, console webapp, retention days
 - **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns
 - **Compression** (collapsible) -- LZ4/ZSTD codec selection for on-disk storage
-- **InfluxDB Migration** (collapsible) -- auto-detect with manual URL for remote instances
+- **InfluxDB Migration** (collapsible) -- detect or enter a URL, pick a bucket/database and time range, then run the import with live progress
 - **Data Export** (collapsible) -- date range picker, Parquet/CSV format, download button
 - **Danger zone** (collapsible) -- "Remove container & all data" to fully reset QuestDB (deletes data Signal K's plugin-uninstall can't, on rootless Podman)
 
@@ -112,7 +112,12 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | GET    | `/update/check`                          | Compare running version against latest release                                           |
 | POST   | `/update/apply`                          | Pull latest image, recreate container, reconnect                                         |
 | POST   | `/purge-data`                            | Remove the QuestDB container and delete all its data (rootless-Podman-safe)              |
-| GET    | `/migration/detect`                      | Auto-detect InfluxDB (supports `?url=` for remote)                                       |
+| GET    | `/migration/detect`                      | Detect InfluxDB (supports `?url=` for remote)                                            |
+| POST   | `/migration/buckets`                     | List buckets (2.x) or databases (1.x); credentials in the body, never the query string   |
+| POST   | `/migration/measurements`                | List measurements and their field keys in a bucket/database                              |
+| POST   | `/migration/start`                       | Start an import; returns immediately, progress via `/migration/status`                   |
+| GET    | `/migration/status`                      | Progress and state of the current/last import                                            |
+| POST   | `/migration/cancel`                      | Cancel the running import                                                                |
 | GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)               |
 | GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                   |
 | GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet. Optional half-open `[from, to)` range for slicing into shards |
@@ -126,6 +131,41 @@ wants to slice it into kopia-dedup-friendly shards. Allowed tables:
 - Both `from` and `to` are **optional but must be set together**: omit both for a full-table export, or pass both as ISO 8601 timestamps for a windowed export. Half-open `[from, to)` interval — no row appears in two adjacent windows.
 - Repeated query params (`?from=A&from=B`) and empty strings (`?from=`) are rejected with HTTP 400 — silently downgrading to a full-table export would hide bugs in the caller.
 - Output format and compression follow the plugin's `compression` config (LZ4_RAW or ZSTD), same as `/export`.
+
+## Migrating from InfluxDB
+
+The **InfluxDB Migration** section of the config panel copies history out of an
+existing InfluxDB into QuestDB. It supports both InfluxDB 1.x (InfluxQL) and
+2.x (Flux).
+
+1. **Detect** finds an InfluxDB on `localhost:8086`, or enter a URL for a
+   remote one (loopback and private-network addresses only).
+2. Select the detected instance, supply credentials — an API token and
+   organisation for 2.x, or username/password for 1.x if authentication is
+   enabled — and list its buckets/databases. Credentials are used for the
+   import only, are never written to the plugin's settings, and travel in the
+   request body rather than the query string (Signal K logs full request URLs).
+3. Pick a bucket/database and a time range, then **Start import**. Progress is
+   polled while it runs and the import can be cancelled at any point.
+
+How the data maps:
+
+- A measurement with the conventional `value` field becomes the Signal K path
+  of the same name; a measurement with several named fields becomes
+  `measurement.field` paths, so two fields cannot overwrite each other.
+- Numbers go to `signalk`, strings and booleans to `signalk_str` (booleans
+  tagged `value_kind=boolean`), and `latitude`/`longitude` field pairs are
+  recombined into `signalk_position`.
+- Rows keep their **original nanosecond timestamps**, so imported history sorts
+  and aggregates alongside live data.
+- Every imported row is tagged `source=influxdb-import`, which makes it
+  distinguishable from live recording — and because the tables deduplicate on
+  `(ts, path, context, source)`, **re-running the same range overwrites rather
+  than duplicating**. An interrupted import can simply be run again.
+
+Anything that cannot be mapped (a gap, an unsupported value type, a latitude
+with no matching longitude) is counted in the run's `skipped` total rather than
+being dropped silently.
 
 ## Configuration
 

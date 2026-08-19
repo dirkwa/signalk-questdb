@@ -33,11 +33,29 @@ const UNHEALTHY_AFTER_FLAPS = 5;
 const MAX_BUFFER_LINES = 100_000;
 
 function escapeTag(s: string): string {
-  return s.replace(/[,= \n\\]/g, (c) => `\\${c}`);
+  // \r is escaped alongside \n for the same reason: ILP is a line protocol,
+  // and a bare carriage return in a tag corrupts the row on the wire. The
+  // escape is the two-character form so the value round-trips as text rather
+  // than as a control character.
+  return s.replace(/[,= \n\r\\]/g, (c) => {
+    if (c === "\n") return "\\n";
+    if (c === "\r") return "\\r";
+    return `\\${c}`;
+  });
 }
 
 function escapeFieldString(s: string): string {
-  return s.replace(/["\\]/g, (c) => `\\${c}`);
+  // Newlines and carriage returns MUST be encoded, not passed through. ILP is
+  // a line protocol: a raw \n inside a quoted value splits the row into two
+  // malformed lines and QuestDB silently stores NEITHER — verified against a
+  // live instance, which recorded 0 rows for such a write. Signal K string
+  // values do carry newlines (notification messages, free-text fields), so
+  // this is reachable, and the failure is invisible: no error, no row.
+  return s.replace(/[\\"\n\r]/g, (c) => {
+    if (c === "\n") return "\\n";
+    if (c === "\r") return "\\r";
+    return `\\${c}`;
+  });
 }
 
 export class ILPWriter {
@@ -57,7 +75,7 @@ export class ILPWriter {
   // Last timestamp handed out, in nanoseconds. Rows are stamped at write time
   // with the server clock (see the delta handler), but `Date` is only
   // millisecond-resolution while the `signalk`/`signalk_str` tables dedup on
-  // KEYS(ts, path, context). Two writes for the same path within one
+  // KEYS(ts, path, context, source). Two writes for the same path within one
   // millisecond would collide and the later would upsert over the earlier —
   // silent data loss for unthrottled (samplingRate 0) or bursty paths. QuestDB
   // stores microsecond resolution, so advancing this counter by at least 1µs
@@ -280,6 +298,84 @@ export class ILPWriter {
     return this.lastNanos;
   }
 
+  // Backfill variants (`*AtNanos`) take the source system's own nanosecond
+  // timestamp verbatim instead of deriving one from the server clock.
+  //
+  // The live `write*` path stamps rows as they arrive and uses `lastNanos` to
+  // keep every row distinct. Backfill cannot use that: historical rows must
+  // land at their ORIGINAL instant, and they arrive out of order relative to
+  // whatever the live feed is writing concurrently, so a monotonic ratchet
+  // would shift them. Passing a `Date` is not enough either — `Date` is
+  // millisecond-resolution, while InfluxDB stores nanoseconds and the
+  // signalk/signalk_str tables dedup on KEYS(ts, path, context, source). Two
+  // source points 200µs apart would truncate to the same millisecond and the
+  // second would silently UPSERT over the first. Taking the caller's bigint
+  // preserves the sub-millisecond spread that keeps them distinct rows.
+  //
+  // These deliberately do NOT touch `lastNanos`: a backfill of last year's
+  // data must not drag the live writer's floor backwards (it only ratchets
+  // up, so an old timestamp would be ignored anyway) nor push it forward.
+  writeAtNanos(
+    path: string,
+    context: string,
+    value: number,
+    tsNanos: bigint,
+    source?: string,
+  ): void {
+    const sourceTag = source ? `,source=${escapeTag(source)}` : "";
+    this.enqueue(
+      `signalk,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag} value=${value} ${tsNanos}\n`,
+    );
+  }
+
+  writeStringAtNanos(
+    path: string,
+    context: string,
+    value: string,
+    tsNanos: bigint,
+    kind?: "boolean" | "identity",
+    source?: string,
+  ): void {
+    const sourceTag = source ? `,source=${escapeTag(source)}` : "";
+    const kindTag = kind ? `,value_kind=${escapeTag(kind)}` : "";
+    this.enqueue(
+      `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag}${kindTag} value_str="${escapeFieldString(value)}" ${tsNanos}\n`,
+    );
+  }
+
+  writePositionAtNanos(
+    context: string,
+    position: { latitude: number; longitude: number },
+    tsNanos: bigint,
+    source?: string,
+  ): void {
+    const sourceTag = source ? `,source=${escapeTag(source)}` : "";
+    this.enqueue(
+      `signalk_position,context=${escapeTag(context)}${sourceTag} lat=${position.latitude},lon=${position.longitude} ${tsNanos}\n`,
+    );
+  }
+
+  /**
+   * Roughly how much is still in flight, so a bulk importer can apply
+   * backpressure instead of queueing an entire InfluxDB into memory.
+   *
+   * Counts BOTH the unflushed lines and what is still sitting inside the
+   * socket. flush() clears `buffer` even when `socket.write()` returns false
+   * (the data is handed to the kernel queue, not yet on the wire), so counting
+   * only `buffer` would report an idle writer while the socket backs up — and
+   * the importer would keep reading until MAX_BUFFER_LINES started dropping
+   * the OLDEST lines, silently losing the history being copied.
+   *
+   * The socket side is an estimate: `writableLength` is bytes, converted at a
+   * nominal line size. The importer only needs an order of magnitude to decide
+   * whether to pause, not an exact count.
+   */
+  get pendingLines(): number {
+    const NOMINAL_LINE_BYTES = 80;
+    const queued = this.socket?.writableLength ?? 0;
+    return this.buffer.length + Math.ceil(queued / NOMINAL_LINE_BYTES);
+  }
+
   // `source` is the delta's sourceRef, a tag (SYMBOL) like the other
   // dimensions. Omitted when the delta carried none, leaving the column null —
   // exactly how rows written before the column existed read back.
@@ -319,7 +415,7 @@ export class ILPWriter {
   }
 
   // signalk_position has no path column — it holds navigation.position rows
-  // exclusively (the caller enforces that), keyed on ts+context.
+  // exclusively (the caller enforces that), keyed on KEYS(ts, context, source).
   writePosition(
     context: string,
     position: { latitude: number; longitude: number },

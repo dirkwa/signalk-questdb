@@ -25,6 +25,13 @@ import { createConsoleProxy } from "./console-proxy.js";
 import { buildFullExportWhere } from "./full-export-range.js";
 import { detectInflux, validateInfluxUrl } from "./influx-detect.js";
 import {
+  listBuckets,
+  listMeasurements,
+  runMigration,
+  MigrationRun,
+} from "./migration.js";
+import type { InfluxAuth, MigrationRequest } from "./migration.js";
+import {
   WalMonitor,
   buildPendingSegmentsSQL,
   computeSkipPlan,
@@ -48,6 +55,9 @@ import { nofileClampSatisfied, readMaxMapCount } from "./host-limits.js";
 import type {
   DbStatus,
   MigrationDetectResponse,
+  MigrationBucketsResponse,
+  MigrationMeasurementsResponse,
+  MigrationStatusResponse,
   QuestdbVersion,
   RestoreStatus,
   ResumeWalResponse,
@@ -171,6 +181,13 @@ function buildResourceLimits(config: Config): ContainerResourceLimits {
 
 export default (app: App) => {
   let writer: ILPWriter | null = null;
+  // The most recent (or currently running) InfluxDB import. Deliberately
+  // in-memory and single-slot: an import is an operator-driven one-off, and
+  // surviving a plugin restart would mean persisting a half-finished run with
+  // no writer to resume it onto. A restart therefore forgets it, and re-running
+  // is safe because imported rows upsert on (ts, path, context, source).
+  let activeMigration: MigrationRun | null = null;
+  let migrationCounter = 0;
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
   let schemaHealTimer: NodeJS.Timeout | null = null;
@@ -1475,6 +1492,15 @@ export default (app: App) => {
       // (e.g. a switch to external/unmanaged mode that never calls ensureRunning).
       ulimitClamp = null;
 
+      // Stop any import before the writer goes away: runMigration holds a
+      // direct reference to it, so a run left going would keep enqueueing
+      // lines onto a disconnected writer for as long as its read loop lasts.
+      // The flag is checked between windows and between rows, so this takes
+      // effect within one window rather than at the end of the whole import.
+      if (activeMigration && activeMigration.state === "running") {
+        activeMigration.cancel();
+      }
+
       if (writer) {
         await writer.disconnect();
         writer = null;
@@ -2493,10 +2519,41 @@ export default (app: App) => {
         }
       });
 
+      // Strip the class down to the wire shape. `MigrationRun` carries a
+      // `cancel()` method and a private flag that must not be serialised.
+      const migrationRunView = (run: MigrationRun) => ({
+        id: run.id,
+        state: run.state,
+        url: run.url,
+        bucket: run.bucket,
+        startedAt: run.startedAt,
+        finishedAt: run.finishedAt,
+        progress: { ...run.progress },
+        error: run.error,
+      });
+
+      // Auth travels in the request BODY rather than plugin config: the token
+      // is only needed for the duration of an import and storing it in the
+      // plugin's settings file would persist a credential the user never
+      // asked us to keep. Never the query string — Signal K logs full request
+      // URLs (morgan "combined"), so a token there reaches the access log.
+      const readAuth = (
+        src: Record<string, unknown>,
+      ): InfluxAuth | undefined => {
+        const token = typeof src.token === "string" ? src.token : undefined;
+        const username =
+          typeof src.username === "string" ? src.username : undefined;
+        const password =
+          typeof src.password === "string" ? src.password : undefined;
+        const org = typeof src.org === "string" ? src.org : undefined;
+        if (!token && !username && !org) return undefined;
+        return { token, username, password, org };
+      };
+
       router.get("/api/migration/detect", async (req, res) => {
-        // `?url=a&url=b` arrives as an ARRAY, not a string — the cast this
-        // replaces would have handed a non-string to validateInfluxUrl and
-        // thrown inside the handler rather than answering 400.
+        // `?url=a&url=b` arrives as an ARRAY, not a string — a cast here
+        // would hand a non-string to validateInfluxUrl and throw inside the
+        // handler rather than answering 400.
         const requestedUrl = req.query.url;
         if (requestedUrl !== undefined && typeof requestedUrl !== "string") {
           res.status(400).json({
@@ -2524,6 +2581,244 @@ export default (app: App) => {
             sources: [],
           } satisfies MigrationDetectResponse);
         }
+      });
+
+      // POST, not GET, purely because of the credentials. Signal K mounts
+      // morgan("combined"), which writes the full request URL — query string
+      // included — to the access log, and browsers keep it in history. An
+      // InfluxDB API token in a query parameter therefore ends up in both.
+      // Discovery is a read, but the token has to travel in the body.
+      router.post("/api/migration/buckets", async (req, res) => {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const baseUrl = validateInfluxUrl(
+          typeof body.url === "string" ? body.url : "http://localhost:8086",
+        );
+        if (!baseUrl) {
+          res.status(400).json({
+            error: "Invalid URL",
+            buckets: [],
+          } satisfies MigrationBucketsResponse);
+          return;
+        }
+        try {
+          const buckets = await listBuckets({
+            url: baseUrl,
+            type: typeof body.type === "string" ? body.type : "influxdb2",
+            auth: readAuth(body),
+          });
+          res.json({ buckets } satisfies MigrationBucketsResponse);
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            buckets: [],
+          } satisfies MigrationBucketsResponse);
+        }
+      });
+
+      // POST for the same reason as /buckets: the token must not reach the
+      // access log or the browser's history via the query string.
+      router.post("/api/migration/measurements", async (req, res) => {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const baseUrl = validateInfluxUrl(
+          typeof body.url === "string" ? body.url : "http://localhost:8086",
+        );
+        const bucket = typeof body.bucket === "string" ? body.bucket : "";
+        if (!baseUrl || !bucket) {
+          res.status(400).json({
+            error: "Missing or invalid url/bucket",
+            measurements: [],
+          } satisfies MigrationMeasurementsResponse);
+          return;
+        }
+        try {
+          const measurements = await listMeasurements({
+            url: baseUrl,
+            type: typeof body.type === "string" ? body.type : "influxdb2",
+            bucket,
+            auth: readAuth(body),
+          });
+          res.json({ measurements } satisfies MigrationMeasurementsResponse);
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            measurements: [],
+          } satisfies MigrationMeasurementsResponse);
+        }
+      });
+
+      router.post("/api/migration/start", async (req, res) => {
+        // One import at a time. Two concurrent runs would interleave on the
+        // single ILP writer and race each other for its buffer, and there is
+        // no sane way to show two progress bars against one writer.
+        if (activeMigration && activeMigration.state === "running") {
+          res.status(409).json({
+            error: "A migration is already running",
+            run: migrationRunView(activeMigration),
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        if (!writer) {
+          res.status(503).json({
+            error: "QuestDB writer not connected",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const baseUrl = validateInfluxUrl(
+          typeof body.url === "string" ? body.url : "http://localhost:8086",
+        );
+        const bucket = typeof body.bucket === "string" ? body.bucket : "";
+        if (!baseUrl || !bucket) {
+          res.status(400).json({
+            error: "Missing or invalid url/bucket",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        const from = typeof body.from === "string" ? body.from : "";
+        const to = typeof body.to === "string" ? body.to : "";
+        if (
+          !from ||
+          !to ||
+          Number.isNaN(Date.parse(from)) ||
+          Number.isNaN(Date.parse(to))
+        ) {
+          res.status(400).json({
+            error: "Missing or invalid from/to",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        // An inverted range is rejected here rather than left to fail inside
+        // the run: the caller gets a 400 it can act on, instead of a 200
+        // followed by a run that reports "failed" a moment later.
+        if (Date.parse(to) <= Date.parse(from)) {
+          res.status(400).json({
+            error: "`to` must be after `from`",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+
+        // "self" and "vessels.self" both mean this vessel; anything else must
+        // be a fully-qualified Signal K context (vessels.urn:mrn:..., or
+        // atons./aircraft./sar. for other targets).
+        //
+        // The own vessel is stored as the LITERAL string "self", not as
+        // `vessels.<uuid>` — that is what the live recorder writes (see the
+        // `isSelf ? "self" : context` in the delta handler) and what both
+        // history providers normalise incoming contexts to. Importing under
+        // the expanded uuid would file the history in a context no query ever
+        // looks at: the rows would be there and the API would return nothing.
+        const rawContext =
+          typeof body.context === "string" ? body.context.trim() : "";
+        let importContext: string;
+        if (
+          !rawContext ||
+          rawContext === "self" ||
+          rawContext === "vessels.self" ||
+          rawContext === `vessels.${app.selfId}`
+        ) {
+          importContext = "self";
+        } else if (
+          /^(vessels|atons|aircraft|sar)\.[A-Za-z0-9:._-]+$/.test(rawContext)
+        ) {
+          importContext = rawContext;
+        } else {
+          res.status(400).json({
+            error:
+              "Invalid context: expected `self` or a Signal K context such as `vessels.urn:mrn:imo:mmsi:123456789`",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+
+        // Kept deliberately narrow: a label is a short identifier, not free
+        // text. Anything else falls back to the default.
+        const rawLabel =
+          typeof body.sourceLabel === "string" ? body.sourceLabel.trim() : "";
+        const migrationSourceLabel =
+          rawLabel && /^[A-Za-z0-9._:-]{1,64}$/.test(rawLabel)
+            ? rawLabel
+            : "influxdb-import";
+
+        const request: MigrationRequest = {
+          url: baseUrl,
+          type: typeof body.type === "string" ? body.type : "influxdb2",
+          bucket,
+          auth: readAuth(body),
+          from,
+          to,
+          // Default to the server's own vessel: that is what a boat migrating
+          // its own history means by "my data". A supplied context is checked
+          // against the Signal K shape rather than passed through — it becomes
+          // a SYMBOL value on every imported row and is what the history API
+          // queries by, so a malformed one writes history nothing can read.
+          context: importContext,
+          measurements: Array.isArray(body.measurements)
+            ? (body.measurements as unknown[]).filter(
+                (m): m is string => typeof m === "string",
+              )
+            : undefined,
+          // The label is written as the `source` tag on every imported row,
+          // which is both a dedup key component and how an operator tells
+          // imported history from live recording. A blank or whitespace-only
+          // value would leave the tag off entirely (making imported rows
+          // indistinguishable from recorded ones, and changing the dedup
+          // key so a re-run duplicates instead of upserting), so it falls
+          // back to the default rather than being trusted as given.
+          sourceLabel: migrationSourceLabel,
+        };
+
+        // The id only has to be unique within this process, where the counter
+        // already guarantees it; the timestamp just makes logs readable.
+        const run = new MigrationRun(
+          `mig-${Date.now()}-${++migrationCounter}`,
+          baseUrl,
+          bucket,
+        );
+        activeMigration = run;
+        const startedWriter = writer;
+        // Deliberately not awaited: an import runs for minutes to hours, so
+        // the HTTP call returns immediately and the panel polls /status.
+        void runMigration(request, startedWriter, run, {
+          debug: (msg) => app.debug(msg),
+        })
+          .catch((err: unknown) => {
+            // runMigration traps its own failures, but a few statements run
+            // BEFORE its try block (auth header construction). A rejection
+            // from there would be an unhandled promise rejection on a
+            // deliberately un-awaited call — fatal to the Signal K process
+            // under Node's default policy — and would leave the run stuck
+            // reading "running" forever.
+            run.state = "failed";
+            run.error = err instanceof Error ? err.message : String(err);
+            run.finishedAt = new Date().toISOString();
+          })
+          .finally(() => {
+            app.debug(
+              `migration ${run.id} ${run.state}: ${run.progress.written} written, ${run.progress.skipped} skipped`,
+            );
+          });
+        res.json({
+          run: migrationRunView(run),
+        } satisfies MigrationStatusResponse);
+      });
+
+      router.get("/api/migration/status", (_req, res) => {
+        res.json({
+          run: activeMigration ? migrationRunView(activeMigration) : undefined,
+        } satisfies MigrationStatusResponse);
+      });
+
+      router.post("/api/migration/cancel", (_req, res) => {
+        if (!activeMigration || activeMigration.state !== "running") {
+          res.status(409).json({
+            error: "No migration running",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        activeMigration.cancel();
+        res.json({
+          run: migrationRunView(activeMigration),
+        } satisfies MigrationStatusResponse);
       });
 
       router.get("/api/export", async (req, res) => {
