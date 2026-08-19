@@ -9,6 +9,7 @@ Stores all vessel data in QuestDB running as a managed container (via [signalk-c
 - **Automatic container management** -- QuestDB runs in Podman/Docker, managed by signalk-container
 - **ILP ingestion** -- writes via InfluxDB Line Protocol over raw TCP (no client library needed)
 - **v2 History API** -- `getValues`, `getPaths`, `getContexts` with all aggregate methods
+- **Source-aware history** -- read one source's rows with `path|sourceRef`, or split a path into one column per recording source with `sourcePolicy=all` (opt-in)
 - **v1 Legacy API** -- `hasAnyData`, `streamHistory`, `getHistory` for WebSocket playback
 - **Path filtering** -- include/exclude paths with glob patterns
 - **Sampling rates** -- per-path throttling to control write volume
@@ -34,6 +35,7 @@ The plugin embeds a React config panel in the Signal K Admin UI showing:
 - **Image Version** -- dropdown with latest, pre-releases, and last 3 stable releases
 - **Connection** -- managed container toggle, host/ports, PostgreSQL port for Grafana
 - **Recording** -- record self, record AIS targets, startup restore, console webapp, retention days
+- **History** -- allow `sourcePolicy=all`, letting callers split a path by recording source
 - **Path filtering** (collapsible) -- exclude or include-only paths with glob patterns
 - **Compression** (collapsible) -- LZ4/ZSTD codec selection for on-disk storage
 - **InfluxDB Migration** (collapsible) -- detect or enter a URL, pick a bucket/database and time range, then run the import with live progress
@@ -239,6 +241,7 @@ being dropped silently.
 | Restore vessels on startup | `false`      | Replay each vessel's last recorded position after a restart (see Startup restore)                     |
 | Restore max age (minutes)  | `9`          | Only replay values recorded within this window                                                        |
 | QuestDB console webapp     | `true`       | Serve QuestDB's console in the Signal K admin UI, admin only (see Console webapp)                     |
+| Allow `sourcePolicy=all`   | `false`      | Let History API callers split a path into one column per source (see History API)                     |
 | Retention (days)           | `0`          | Auto-delete old partitions (0 = keep forever)                                                         |
 | Path filter mode           | `exclude`    | `exclude` matching paths, or `include` only matching paths                                            |
 | Path filter paths          | _(empty)_    | Glob patterns, one per line (e.g. `notifications.*`); empty = record everything, which is the default |
@@ -428,6 +431,54 @@ Right after installing or updating the plugin, the admin UI can show
 It is installed — the browser tab is still running the admin UI it loaded
 before the update, which looks for the panel bundle it knew then. A hard
 refresh of the tab (Shift-Reload) fixes it.
+
+### "Cannot apply a change: the QuestDB container cannot be stopped or removed"
+
+The plugin needed to recreate the QuestDB container to apply a change — a new
+image tag, a network or resource setting, a raised file-descriptor limit — but
+the container runtime refused to stop or remove the running container. The
+recreate is **deferred, not abandoned**: QuestDB keeps running and keeps
+recording, on its **previous** configuration. The plugin reports the error
+rather than a "Recording" status, because the change you asked for has not
+been applied and reporting success would be a lie.
+
+The usual cause on rootless Podman is an orphaned user namespace left behind
+when the Podman service restarted underneath a running container. The error
+text carries the specific remedy; the general one is to clear the stale
+namespace and remove the container so the plugin can recreate it:
+
+```bash
+podman system migrate                     # re-attaches orphaned user namespaces
+podman ps -a | grep questdb               # find the managed container's name
+podman rm -f <name-from-above>
+```
+
+Run all three as the **same OS user that owns the container**. Rootless and
+rootful Podman keep separate container stores, so running them as root (or as
+another user) will not find, and will not remove, a rootless container.
+
+Look the name up rather than assuming it: the plugin's container is
+`signalk-questdb` behind a prefix that defaults to `sk-` but is configurable
+(`SIGNALK_CONTAINER_NAMESPACE`), so it is not always `sk-signalk-questdb`.
+
+Then disable and re-enable the plugin, or restart Signal K. The plugin
+recreates the container with the settings that were pending. Recorded data
+lives in a bind mount under Signal K's data directory, not inside the
+container, so removing the container does not touch it.
+
+**Do not** mask `podman.socket` to work around this. That socket is how the
+plugin reaches Podman at all, so masking it turns a deferred recreate into a
+container the plugin cannot manage in any way. (`podman.service` is the unit
+the socket activates, and masking that has the same effect.) If the socket
+itself is unhealthy, restart it rather than masking it:
+
+```bash
+systemctl --user restart podman.socket
+```
+
+This error is reported by signalk-container 1.29.0 or later. On older
+versions the wedge still happens, but appears only as a repeating drift
+message in the Signal K server log with no plugin error to go with it.
 
 ### "QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory"
 
