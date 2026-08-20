@@ -196,54 +196,43 @@ export async function listMeasurements(
 ): Promise<MigrationMeasurement[]> {
   const headers = authHeaders(req.type, req.auth);
   if (req.type === "influxdb2") {
-    // One request for every (measurement, field) pair in the bucket.
+    // `schema.measurements()` reads InfluxDB's SCHEMA, not its points.
     //
-    // schema.fieldKeys() looks like the obvious call but returns only a bare
-    // `_value` column with no `_measurement` — verified against a live 2.9.1 —
-    // so the pairing is lost and every measurement reads as having no fields.
-    // Grouping by both columns and regrouping keeps them together.
+    // The obvious-looking alternative — from(bucket) |> range(start: 0) |>
+    // keep([_measurement, _field]) |> distinct — returns the same names but
+    // gets them by READING EVERY POINT IN THE BUCKET first. `keep` and
+    // `distinct` shrink the RESULT, not the scan. Measured on 2.9.1: 0.15s
+    // at 1.2M points, 0.50s at 4.8M — linear in point count — while
+    // schema.measurements() stayed at ~8ms for both. On a year of boat data
+    // (a user reported ~40 GB on a Pi 5) the scan blew the query timeout, so
+    // the import failed at discovery having read nothing: "0 written,
+    // 0 skipped, 0/0 measurements".
     //
-    // The unbounded `range(start: 0)` scans the whole bucket, but `keep` drops
-    // everything except the two schema columns before `distinct` collapses
-    // them, so what comes back is one row per pair, not one per point.
-    const flux = `from(bucket: ${JSON.stringify(req.bucket)})
-  |> range(start: 0)
-  |> keep(columns: ["_measurement", "_field"])
-  |> group(columns: ["_measurement", "_field"])
-  |> distinct(column: "_field")
-  |> group()
-  |> keep(columns: ["_measurement", "_value"])`;
+    // Field keys are deliberately NOT fetched. Nothing consumes them: the
+    // import maps this to `.name`, and the panel renders only names. Pairing
+    // fields to measurements needs either the full scan above or one request
+    // per measurement, and neither is worth paying for a value no one reads.
+    // `start` is pinned to the epoch rather than left to the default.
+    // schema.measurements() takes a time range, and its default is a
+    // documented-as-changeable window (historically -30d in the Flux
+    // stdlib). A 2.9.1 instance returns everything either way — verified
+    // with a measurement 200 days old — but relying on that would mean an
+    // import silently skipping a boat's older history on some other
+    // version, which is precisely the class of failure this commit fixes.
+    const flux = `import "influxdata/influxdb/schema"
+schema.measurements(bucket: ${JSON.stringify(req.bucket)}, start: 1970-01-01T00:00:00Z)`;
     const rows = await runFlux(req, flux, headers, fetchImpl);
-    const byMeasurement = new Map<string, Set<string>>();
-    for (const row of rows) {
-      const m = row.values["_measurement"];
-      const f = row.values["_value"];
-      if (!m) continue;
-      if (!byMeasurement.has(m)) byMeasurement.set(m, new Set());
-      if (f) byMeasurement.get(m)!.add(f);
-    }
-    // An empty result means the bucket has no data in it at all (the pair
-    // query is driven by points, not by schema metadata). Fall back to the
-    // schema listing so an empty-but-existing measurement still appears.
-    if (byMeasurement.size === 0) {
-      const flux2 = `import "influxdata/influxdb/schema"
-schema.measurements(bucket: ${JSON.stringify(req.bucket)})`;
-      const ms = await runFlux(req, flux2, headers, fetchImpl);
-      return ms
-        .map((r) => r.values["_value"])
-        .filter((v): v is string => !!v)
-        .map((name) => ({ name, fields: [] }));
-    }
-    return [...byMeasurement.entries()].map(([name, fields]) => ({
-      name,
-      fields: [...fields],
-    }));
+    return rows
+      .map((r) => r.values["_value"])
+      .filter((v): v is string => !!v)
+      .map((name) => ({ name, fields: [] }));
   }
 
   // SHOW FIELD KEYS returns one series PER MEASUREMENT, each named after it,
-  // so a single request yields the same (measurement, fields) pairing the 2.x
-  // branch builds — rather than listing names with an always-empty `fields`
-  // that the response contract declares as populated.
+  // so a single request yields both the names and their field keys. Unlike
+  // Flux's schema functions this is metadata, not a point scan — measured at
+  // 0.024s over 800k points — so 1.x gets the pairing for free and keeps it.
+  // (The 2.x branch above deliberately returns an empty `fields`; see there.)
   const url = `${req.url}/query?db=${encodeURIComponent(req.bucket)}&q=${encodeURIComponent(
     "SHOW FIELD KEYS",
   )}`;
@@ -615,6 +604,17 @@ export async function runMigration(
       measurements = (await listMeasurements(req, fetchImpl)).map(
         (m) => m.name,
       );
+      // Nothing to import is worth SAYING. A run that ends "done, 0 written,
+      // 0/0 measurements" is visually identical to the discovery failure this
+      // module was just fixed for, so an operator who picked the wrong bucket
+      // — or whose token cannot see its contents — would read a silent
+      // success and have no idea why nothing arrived.
+      if (measurements.length === 0) {
+        throw new Error(
+          `No measurements found in "${req.bucket}". The bucket may be empty, ` +
+            `or the token may not have read access to it.`,
+        );
+      }
     }
     run.progress.measurementsTotal = measurements.length;
 
