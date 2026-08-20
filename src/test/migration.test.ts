@@ -3,6 +3,7 @@ import assert from "node:assert";
 import {
   coerceValue,
   listBuckets,
+  listMeasurements,
   mergePositionRows,
   parseAnnotatedCsv,
   rfc3339ToNanos,
@@ -406,6 +407,104 @@ describe("bucket listing", () => {
       () => listBuckets({ url: "http://x", type: "influxdb1" }, fakeFetch),
       /authorization failed/,
     );
+  });
+});
+
+describe("measurement discovery", () => {
+  // A user with ~1 year of data on a Pi 5 hit "The operation was aborted due
+  // to a timeout" with "0 written, 0/0 measurements" — the import died at
+  // discovery having read nothing. The cause was a Flux query that reached
+  // for the points (`from(bucket) |> range(start: 0) |> keep(...)`) to derive
+  // names that InfluxDB already keeps as schema. `keep`/`distinct` shrink the
+  // RESULT, not the scan: measured on 2.9.1, 0.15s at 1.2M points and 0.50s
+  // at 4.8M, while schema.measurements() stayed ~8ms for both.
+  test("2.x discovery reads the schema, never the points", async () => {
+    let sent = "";
+    const fakeFetch = (async (_url: string | URL, init?: RequestInit) => {
+      sent = String(init?.body ?? "");
+      return new Response(
+        [
+          "#datatype,string,long,string",
+          ",result,table,_value",
+          ",,0,navigation.speedOverGround",
+        ].join("\n"),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const out = await listMeasurements(
+      { url: "http://x", type: "influxdb2", bucket: "b" },
+      fakeFetch,
+    );
+
+    assert.deepEqual(
+      out.map((m) => m.name),
+      ["navigation.speedOverGround"],
+    );
+    assert.match(sent, /schema\.measurements/);
+    // Pinned to the epoch: the default range is a changeable window, and
+    // inheriting it would silently hide a boat's older history.
+    assert.match(sent, /start:\s*1970-01-01T00:00:00Z/);
+    // The two markers of a point scan. Either one reintroduces a query whose
+    // cost grows with the bucket's size instead of its schema.
+    assert.ok(
+      !/from\(bucket:/.test(sent),
+      `discovery must not read points: ${sent}`,
+    );
+    assert.ok(
+      !/range\(/.test(sent),
+      `discovery must not range over the data: ${sent}`,
+    );
+  });
+
+  // A blank name would become `path = ''` in the per-window read — a filter
+  // matching nothing, so the column would import as silently empty.
+  test("blank measurement names are dropped, not queried", async () => {
+    const fakeFetch = (async () =>
+      new Response(
+        [
+          "#datatype,string,long,string",
+          ",result,table,_value",
+          ",,0,",
+          ",,0,navigation.speedOverGround",
+        ].join("\n"),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+
+    const out = await listMeasurements(
+      { url: "http://x", type: "influxdb2", bucket: "b" },
+      fakeFetch,
+    );
+    assert.deepEqual(
+      out.map((m) => m.name),
+      ["navigation.speedOverGround"],
+    );
+  });
+
+  test("2.x discovery costs exactly one request", async () => {
+    let calls = 0;
+    const fakeFetch = (async () => {
+      calls++;
+      return new Response(
+        [
+          "#datatype,string,long,string",
+          ",result,table,_value",
+          ",,0,a",
+          ",,0,b",
+          ",,0,c",
+        ].join("\n"),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const out = await listMeasurements(
+      { url: "http://x", type: "influxdb2", bucket: "b" },
+      fakeFetch,
+    );
+    assert.equal(out.length, 3);
+    // Not one per measurement: schema.measurementFieldKeys would pair fields
+    // to names but costs a round trip each, and nothing consumes `fields`.
+    assert.equal(calls, 1, `expected 1 request, made ${calls}`);
   });
 });
 
@@ -1081,6 +1180,75 @@ describe("import run", () => {
       },
     );
     assert.strictEqual(run.state, "done");
+  });
+
+  // "done, 0 written, 0/0 measurements" is visually identical to the
+  // discovery failure this module was fixed for. An operator who picked the
+  // wrong bucket would read a silent success.
+  test("an empty bucket fails the run with a reason, not a clean 0/0", async () => {
+    const fakeFetch = (async () =>
+      new Response(
+        ["#datatype,string,long,string", ",result,table,_value"].join("\n"),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tempty", "http://x", "boatdata");
+    await runMigration(
+      {
+        url: "http://x",
+        type: "influxdb2",
+        bucket: "boatdata",
+        from: "2024-03-01T00:00:00Z",
+        to: "2024-03-02T00:00:00Z",
+        context: "vessels.self",
+      },
+      writer,
+      run,
+      { fetchImpl: fakeFetch },
+    );
+
+    assert.strictEqual(run.state, "failed");
+    assert.match(run.error ?? "", /No measurements found in "boatdata"/);
+    assert.match(run.error ?? "", /empty|read access/);
+  });
+
+  // An explicit measurement list must still bypass discovery entirely.
+  test("an explicit measurement list skips the empty-bucket check", async () => {
+    let discoveryCalls = 0;
+    const fakeFetch = (async (_u: string | URL, init?: RequestInit) => {
+      if (/schema\.measurements/.test(String(init?.body ?? "")))
+        discoveryCalls++;
+      return new Response(
+        [
+          "#datatype,string,long,dateTime:RFC3339,double,string",
+          ",result,table,_time,_value,_field",
+          ",,0,2024-03-01T12:00:00Z,1.5,value",
+        ].join("\n"),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("texplicit", "http://x", "b");
+    await runMigration(
+      {
+        url: "http://x",
+        type: "influxdb2",
+        bucket: "b",
+        from: "2024-03-01T00:00:00Z",
+        to: "2024-03-02T00:00:00Z",
+        context: "vessels.self",
+        measurements: ["navigation.speedOverGround"],
+      },
+      writer,
+      run,
+      { fetchImpl: fakeFetch },
+    );
+
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(discoveryCalls, 0, "discovery must be skipped");
+    assert.strictEqual(run.progress.written, 1);
   });
 
   test("cancelling stops the run and reports it as cancelled", async () => {
