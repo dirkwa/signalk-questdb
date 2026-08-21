@@ -122,6 +122,74 @@ describe("ILPWriter", () => {
     );
   });
 
+  // A bulk import keeps the socket saturated for minutes. `once("drain")` per
+  // backpressured flush accumulates — none are removed until a drain actually
+  // fires — and Node warned "MaxListenersExceededWarning: 11 drain listeners
+  // added to [Socket]" during a 65M-row import against real data.
+  it("registers exactly one drain listener while backpressured", async () => {
+    // A server that never reads keeps the socket permanently backpressured.
+    // The accepted socket is kept so teardown can close it: server.close()
+    // waits for live connections, and this one is deliberately never drained.
+    let accepted: net.Socket | null = null;
+    const server = net.createServer((socket) => {
+      accepted = socket;
+      socket.pause();
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    // Everything after listen() is inside the try: a rejected connect(), or a
+    // throw during setup, must still reach the teardown below — otherwise the
+    // stalled server and its never-draining connection leak and hang the run.
+    let writer: ILPWriter | null = null;
+    let socket: net.Socket | null = null;
+    try {
+      writer = new ILPWriter("127.0.0.1", port, undefined, {
+        flushIntervalMs: 10,
+      });
+      await writer.connect();
+
+      // Enough volume to actually saturate the socket: the kernel absorbs
+      // several MB before `write()` starts returning false, so a smaller batch
+      // never reaches the backpressure path this guards.
+      const ts = new Date("2024-06-15T12:00:00.000Z");
+      for (let i = 0; i < 400_000; i++) {
+        writer.write("navigation.speedOverGround", "self", i, ts);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      socket = (writer as unknown as { socket: net.Socket | null }).socket;
+      const listeners = socket ? socket.listenerCount("drain") : 0;
+      const queued = socket?.writableLength ?? 0;
+
+      // Guard the guard: if nothing was queued the socket never backpressured
+      // and the listener assertion would pass vacuously.
+      assert.ok(queued > 0, "expected the socket to be backpressured");
+      // Exactly one, not "at most": zero would mean the listener was never
+      // registered, so the writer would never learn the socket had drained.
+      assert.strictEqual(
+        listeners,
+        1,
+        `expected one drain listener, found ${listeners}`,
+      );
+    } finally {
+      // No graceful end(): the server never reads, so disconnect()'s flush
+      // would wait forever. `stopped` also stops the close handler scheduling
+      // a reconnect that would outlive the test, and the accepted socket is
+      // destroyed because server.close() waits on live connections.
+      if (writer) {
+        (writer as unknown as { stopped: boolean }).stopped = true;
+      }
+      socket?.destroy();
+      (accepted as net.Socket | null)?.destroy();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
   it("tags booleans with value_kind and leaves text untagged", async () => {
     // value_kind is what keeps a recorded boolean distinguishable from a
     // path whose text value is literally "true". Text must stay untagged so
