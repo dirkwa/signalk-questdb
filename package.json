@@ -10,7 +10,7 @@
     "signalk-category-database"
   ],
   "signalk": {
-    "displayName": "QuestDB History",
+    "displayName": "QuestDB ORIGINAL",
     "appIcon": "app-icon.svg",
     "screenshots": [
       "./doc/screenshots/signalk-questdb-1.png"
