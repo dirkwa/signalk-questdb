@@ -384,7 +384,7 @@ export class WalMonitor {
               `fails again at txn ${table.writerTxn + 1}. The segment data ` +
               `at the stall point is likely unreadable (corrupt, typically ` +
               `after an unclean shutdown). A bounded skip is required: open ` +
-              `the QuestDB History plugin panel to repair.`,
+              `the QuestDB ORIGINAL plugin panel to repair.`,
           );
         } else {
           // The resume REQUEST failed (busy writer, transport error) or was

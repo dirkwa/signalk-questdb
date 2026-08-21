@@ -1282,7 +1282,7 @@ export default (app: App) => {
           anyAutoResumeFailed
             ? `QuestDB history recording is stalled: ${summary}. Automatic ` +
                 `resume failed — the data at the stall point is likely ` +
-                `unreadable. Open the QuestDB History plugin panel to repair.`
+                `unreadable. Open the QuestDB ORIGINAL plugin panel to repair.`
             : `QuestDB history recording is stalled: ${summary}. Automatic ` +
                 `recovery is being attempted.`,
           key,
@@ -1429,7 +1429,7 @@ export default (app: App) => {
 
   const plugin = {
     id: "signalk-questdb",
-    name: "QuestDB History",
+    name: "QuestDB ORIGINAL",
 
     schema: ConfigSchema,
 
