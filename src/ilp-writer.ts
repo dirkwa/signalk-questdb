@@ -98,6 +98,9 @@ export class ILPWriter {
   private totalDroppedLines = 0;
   private readonly maxBufferLines: number;
   private unhealthy = false;
+  // True between a backpressured write and the socket's next drain. Guards
+  // against stacking one drain listener per flush while the socket is full.
+  private awaitingDrain = false;
   private debug: (msg: string) => void;
   private onUnhealthy: (msg: string) => void;
   private onHealthy: () => void;
@@ -191,6 +194,9 @@ export class ILPWriter {
         this.connected = false;
         this.connecting = false;
         this.connectedAt = 0;
+        // The next socket starts un-backpressured, so a stale flag here would
+        // permanently suppress the drain listener on it.
+        this.awaitingDrain = false;
         this.stopStabilityTimer();
         this.stopFlushTimer();
         if (this.stopped) return;
@@ -489,8 +495,17 @@ export class ILPWriter {
         this.debug(`ILP write failed, re-queued batch: ${err.message}`);
       }
     });
-    if (!canWrite) {
+    if (!canWrite && !this.awaitingDrain) {
+      // ONE listener at a time. `once` still accumulates while the socket
+      // stays backpressured: each flush that returns false adds another, and
+      // none are removed until a drain finally fires. A bulk import keeps the
+      // socket saturated for minutes, so they pile up — Node warned
+      // "MaxListenersExceededWarning: 11 drain listeners added to [Socket]"
+      // during a 65M-row import. Harmless in effect (they only log) but it is
+      // a real leak, and it masks the warning's value for genuine ones.
+      this.awaitingDrain = true;
       this.socket.once("drain", () => {
+        this.awaitingDrain = false;
         this.debug("ILP socket drained, resuming writes");
       });
     }
@@ -530,6 +545,7 @@ export class ILPWriter {
         this.socket?.destroy();
         this.socket = null;
         this.connected = false;
+        this.awaitingDrain = false;
         resolve();
       });
     });
