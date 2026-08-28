@@ -633,6 +633,39 @@ describe("identity is restored over a longer window than motion (issue #127)", (
     });
   });
 
+  it("restores a ship type older than 24 hours (issue #163)", () => {
+    // The reported symptom was every AIS target drawing default purple even
+    // after #148 added the leaves. A vessel moored nearby broadcasts position
+    // every few seconds but its STATIC report only occasionally, so its type
+    // can easily be older than a day while its fix is seconds old: it came
+    // back drawn but uncoloured. Measured on a live install, 24h reached 190
+    // of 415 vessels holding a type and 7d reached 312.
+    const { promise, deltas } = run([
+      position(AIS, 60_000),
+      [
+        ago(3 * 24 * 60 * 60_000),
+        "design.aisShipType.id",
+        AIS,
+        "70",
+        "number",
+      ] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 1);
+      assert.equal(
+        result.skippedStale,
+        0,
+        "a 3-day-old ship type must survive the row-level age check too",
+      );
+      assert.equal(
+        valueAt(deltas[0], "design.aisShipType.id")?.value,
+        70,
+        "a ship type older than 24h must still colour the target",
+      );
+    });
+  });
+
   it("restores the ship-type id even when only the .id leaf is present", () => {
     // The id is what colours a target; the .name leaf is cosmetic. A vessel
     // whose static report gave an id but no readable name must still come back
@@ -686,7 +719,7 @@ describe("identity is restored over a longer window than motion (issue #127)", (
 
     return promise.then(() => {
       const sql = captured[0].sql;
-      // Motion is bounded at 9 minutes, identity at a flat 24 hours.
+      // Motion is bounded at 9 minutes, identity at a flat 7 days.
       // Asserting the literal timestamps keeps the two windows from silently
       // collapsing back into one.
       assert.ok(
@@ -694,7 +727,7 @@ describe("identity is restored over a longer window than motion (issue #127)", (
         "motion window missing from SQL",
       );
       assert.ok(
-        sql.includes(ago(24 * 60 * 60_000)),
+        sql.includes(ago(7 * 24 * 60 * 60_000)),
         "identity window missing from SQL",
       );
       // Position has no path column and is motion by definition.

@@ -129,23 +129,35 @@ const IDENTITY_PATHS = [
 /**
  * How far back identity is looked up, independent of the motion window.
  *
- * A fixed 24 hours rather than a multiple of `maxAgeMs`: identity has nothing
- * to do with how fresh a fix must be, so scaling it off that window made the
- * default (9 min x 40 = 6h) too short on a quiet day. Measured on a live
- * install, 6 hours reached exactly ONE named vessel while 24 hours reached
- * 192.
+ * Fixed rather than a multiple of `maxAgeMs`: identity has nothing to do with
+ * how fresh a fix must be, so scaling it off that window made the default
+ * (9 min x 40 = 6h) too short on a quiet day. Measured on a live install,
+ * 6 hours reached exactly ONE named vessel; 24 hours reached 192.
+ *
+ * Seven days, not 24 hours, because 24h was still short for ship type
+ * (issue #163). A vessel moored nearby broadcasts its position every few
+ * seconds but its STATIC report — the one carrying ship type — only while
+ * something prompts it; a target seen daily can easily have a type older than
+ * a day. It comes back drawn but uncoloured, which is what "all targets are
+ * default purple" looks like. Measured on the same install: of 415 vessels
+ * holding a ship type, 24h reached 190 and 7d reached 312.
  *
  * There is no staleness risk to trade against. An MMSI is a unique, durable
  * identifier — over a week of real AIS traffic here, not one vessel broadcast
- * a different name — so an older name is not a wronger name. And the cost is
- * flat: `LATEST ON` collapses to one row per (path, context), so widening the
- * window changes which row is newest, not how many come back. 24h returned
- * 192 rows against 6h's 1.
+ * a different name or type — so an older identity is not a wronger one.
+ *
+ * The cost is NOT flat, which an earlier version of this comment claimed.
+ * `LATEST ON` does collapse to one row per (path, context), so the row count
+ * plateaus (547 at 24h, 899 at 7d, 1250 at 30d). But the SCAN grows: on a
+ * 155M-row table this query warms to ~100ms at 24h, ~3s at 7d and ~6-9s at
+ * 30d. Since it runs once at plugin start, 7d buys most of the coverage for a
+ * few seconds; 30d would reach every vessel but pay several times over for
+ * the last quarter of them.
  *
  * A vessel is still only restored if it has a RECENT position, so this cannot
  * resurrect anything; it only labels what motion already brought back.
  */
-const IDENTITY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const IDENTITY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * True for a path fetched over the long identity window. The row-level age
