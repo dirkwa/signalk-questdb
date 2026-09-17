@@ -1,3 +1,4 @@
+import path from "node:path";
 import { IRouter } from "express";
 import { waitForContainerManager } from "signalk-container-helper";
 import type {
@@ -25,12 +26,19 @@ import { createConsoleProxy } from "./console-proxy.js";
 import { buildFullExportWhere } from "./full-export-range.js";
 import { detectInflux, validateInfluxUrl } from "./influx-detect.js";
 import {
+  DEFAULT_WINDOW_MS,
   listBuckets,
   listMeasurements,
   runMigration,
   MigrationRun,
 } from "./migration.js";
 import type { InfluxAuth, MigrationRequest } from "./migration.js";
+import {
+  FileCheckpointStore,
+  migrationIdentity,
+  sameIdentity,
+} from "./migration-checkpoint.js";
+import type { MigrationCheckpoint } from "./migration-checkpoint.js";
 import {
   WalMonitor,
   buildPendingSegmentsSQL,
@@ -56,6 +64,7 @@ import type {
   DbStatus,
   MigrationDetectResponse,
   MigrationBucketsResponse,
+  MigrationInterrupted,
   MigrationMeasurementsResponse,
   MigrationStatusResponse,
   QuestdbVersion,
@@ -2535,6 +2544,27 @@ export default (app: App) => {
         finishedAt: run.finishedAt,
         progress: { ...run.progress },
         error: run.error,
+        resumedFrom: run.resumedFrom,
+      });
+
+      // One import runs at a time, so one checkpoint is all there is to keep.
+      const checkpoints = new FileCheckpointStore(
+        path.join(app.getDataDirPath(), "influx-import-checkpoint.json"),
+      );
+
+      const interruptedView = (
+        cp: MigrationCheckpoint,
+      ): MigrationInterrupted => ({
+        url: cp.identity.url,
+        type: cp.identity.type,
+        bucket: cp.identity.bucket,
+        from: cp.identity.from,
+        to: cp.identity.to,
+        measurement: cp.current?.measurement,
+        windowStart:
+          cp.current && new Date(cp.current.windowStart).toISOString(),
+        measurementsDone: cp.done.length,
+        updatedAt: cp.updatedAt,
       });
 
       // Auth travels in the request BODY rather than plugin config: the token
@@ -2669,7 +2699,31 @@ export default (app: App) => {
           return;
         }
 
-        const body = (req.body ?? {}) as Record<string, unknown>;
+        const posted = (req.body ?? {}) as Record<string, unknown>;
+        const stored = await checkpoints.load();
+
+        // Resuming takes the import's parameters from the checkpoint and only
+        // the credentials from the request: after a restart the panel no
+        // longer knows what range was entered, and credentials are never
+        // stored. The stored parameters then go through the same validation
+        // as posted ones — the file is on disk and could have been edited.
+        let body = posted;
+        if (posted.resume === true) {
+          if (!stored) {
+            res.status(409).json({
+              error: "There is no interrupted import to resume",
+            } satisfies MigrationStatusResponse);
+            return;
+          }
+          body = {
+            ...stored.identity,
+            token: posted.token,
+            username: posted.username,
+            password: posted.password,
+            org: posted.org,
+          };
+        }
+
         const baseUrl = validateInfluxUrl(
           typeof body.url === "string" ? body.url : "http://localhost:8086",
         );
@@ -2774,6 +2828,44 @@ export default (app: App) => {
 
         // The id only has to be unique within this process, where the counter
         // already guarantees it; the timestamp just makes logs readable.
+        // The same import started again continues, whether it was asked to or
+        // not: the rows upsert, so the result is the same and only the time
+        // differs. A different import replaces the old checkpoint, and it is
+        // removed now rather than when the new run first saves — otherwise a
+        // new run that stopped early would offer to resume the old one.
+        const resumeFrom =
+          stored &&
+          sameIdentity(
+            stored.identity,
+            migrationIdentity(request, DEFAULT_WINDOW_MS),
+          )
+            ? stored
+            : undefined;
+        if (stored && !resumeFrom) {
+          // Not worth refusing the import over: the new run overwrites the
+          // file with its own first position anyway.
+          await checkpoints.clear().catch((err: unknown) => {
+            app.debug(
+              `migration: old checkpoint not removed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
+
+        // The await above yielded; another start may have got in.
+        if (activeMigration && activeMigration.state === "running") {
+          res.status(409).json({
+            error: "A migration is already running",
+            run: migrationRunView(activeMigration),
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        if (!writer) {
+          res.status(503).json({
+            error: "QuestDB writer not connected",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+
         const run = new MigrationRun(
           `mig-${Date.now()}-${++migrationCounter}`,
           baseUrl,
@@ -2785,6 +2877,8 @@ export default (app: App) => {
         // the HTTP call returns immediately and the panel polls /status.
         void runMigration(request, startedWriter, run, {
           debug: (msg) => app.debug(msg),
+          checkpoints,
+          resumeFrom,
         })
           .catch((err: unknown) => {
             // runMigration traps its own failures, but a few statements run
@@ -2807,7 +2901,38 @@ export default (app: App) => {
         } satisfies MigrationStatusResponse);
       });
 
-      router.get("/api/migration/status", (_req, res) => {
+      router.get("/api/migration/status", async (_req, res) => {
+        // Not while a run is active: its checkpoint is that run's own, and
+        // offering to resume an import that is still going makes no sense.
+        const stored =
+          activeMigration?.state === "running"
+            ? null
+            : await checkpoints.load();
+        res.json({
+          run: activeMigration ? migrationRunView(activeMigration) : undefined,
+          interrupted: stored ? interruptedView(stored) : undefined,
+        } satisfies MigrationStatusResponse);
+      });
+
+      // Start over: forget the stopped import, so the next start is a new one.
+      router.post("/api/migration/discard", async (_req, res) => {
+        if (activeMigration && activeMigration.state === "running") {
+          res.status(409).json({
+            error: "A migration is running",
+            run: migrationRunView(activeMigration),
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        try {
+          await checkpoints.clear();
+        } catch (err) {
+          // Said, not swallowed: the position is still there, and the next
+          // start of the same import would continue from it.
+          res.status(500).json({
+            error: `Could not remove the saved position: ${err instanceof Error ? err.message : String(err)}`,
+          } satisfies MigrationStatusResponse);
+          return;
+        }
         res.json({
           run: activeMigration ? migrationRunView(activeMigration) : undefined,
         } satisfies MigrationStatusResponse);

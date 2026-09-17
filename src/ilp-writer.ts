@@ -96,6 +96,8 @@ export class ILPWriter {
   // is at least counted.
   private droppedLines = 0;
   private totalDroppedLines = 0;
+  private totalEnqueuedLines = 0;
+  private totalSettledLines = 0;
   private readonly maxBufferLines: number;
   private unhealthy = false;
   // True between a backpressured write and the socket's next drain. Guards
@@ -437,6 +439,7 @@ export class ILPWriter {
 
   private enqueue(line: string): void {
     this.buffer.push(line);
+    this.totalEnqueuedLines++;
     this.enforceBufferCap();
     if (this.buffer.length >= FLUSH_BATCH_SIZE) {
       this.flush();
@@ -475,6 +478,27 @@ export class ILPWriter {
     return this.totalDroppedLines;
   }
 
+  /**
+   * Every line ever enqueued, monotonic: a line's place in the sequence. With
+   * the two counters below it tells a caller whether what it wrote up to some
+   * point has left this process. Lines leave in the order they came, so once
+   * `settledLineCount + droppedLineCount` reaches the `enqueuedLineCount` it
+   * noted then, nothing enqueued before that point is still waiting here.
+   */
+  get enqueuedLineCount(): number {
+    return this.totalEnqueuedLines;
+  }
+
+  /**
+   * Lines the socket has accepted, monotonic and exact — counted when the
+   * write completes, not when it is issued, and never for a batch that failed
+   * and was re-queued. Unlike `pendingLines`, which estimates the socket's
+   * share from a byte count and is only good for deciding whether to pause.
+   */
+  get settledLineCount(): number {
+    return this.totalSettledLines;
+  }
+
   private flush(): void {
     if (!this.connected || !this.socket || this.buffer.length === 0) return;
 
@@ -493,7 +517,9 @@ export class ILPWriter {
       if (err) {
         this.requeueFront(lines);
         this.debug(`ILP write failed, re-queued batch: ${err.message}`);
+        return;
       }
+      this.totalSettledLines += lines.length;
     });
     if (!canWrite && !this.awaitingDrain) {
       // ONE listener at a time. `once` still accumulates while the socket

@@ -170,9 +170,10 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | GET    | `/migration/detect`                      | Detect InfluxDB (supports `?url=` for remote)                                            |
 | POST   | `/migration/buckets`                     | List buckets (2.x) or databases (1.x); credentials in the body, never the query string   |
 | POST   | `/migration/measurements`                | List measurements and their field keys in a bucket/database                              |
-| POST   | `/migration/start`                       | Start an import; returns immediately, progress via `/migration/status`                   |
-| GET    | `/migration/status`                      | Progress and state of the current/last import                                            |
-| POST   | `/migration/cancel`                      | Cancel the running import                                                                |
+| POST   | `/migration/start`                       | Start an import, or continue a stopped one with `{"resume": true}`; returns immediately  |
+| GET    | `/migration/status`                      | Progress and state of the current/last import, and any stopped import that can resume    |
+| POST   | `/migration/cancel`                      | Cancel the running import; its position is kept                                          |
+| POST   | `/migration/discard`                     | Forget a stopped import's saved position, so the next start begins again                 |
 | GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)               |
 | GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                   |
 | GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet. Optional half-open `[from, to)` range for slicing into shards |
@@ -224,7 +225,24 @@ How the data maps:
 - Every imported row is tagged `source=influxdb-import`, which makes it
   distinguishable from live recording — and because the tables deduplicate on
   `(ts, path, context, source)`, **re-running the same range overwrites rather
-  than duplicating**. An interrupted import can simply be run again.
+  than duplicating**.
+
+### Resuming an interrupted import
+
+A large import runs for hours. If it stops part-way — cancelled, failed, or the
+Signal K server restarted — the panel shows what was interrupted and offers
+**Resume import**, which continues from the saved position instead of starting
+again at the first measurement. It needs only the credentials, if InfluxDB asks
+for any: the source and range are remembered, credentials never are. Starting
+the identical import again the ordinary way continues it too. **Discard saved
+position** starts over.
+
+The saved position deliberately trails the import by about a minute, and is
+only advanced once the rows behind it have left the plugin. It can therefore
+never be ahead of what QuestDB actually holds, even after a power cut; the cost
+is that a resumed import repeats up to a minute or so of work, which the
+deduplication above makes harmless. An import shorter than that saves nothing,
+and is simply run again.
 
 Anything that cannot be mapped (a gap, an unsupported value type, a `jsonValue`
 that is not valid JSON, a latitude with no matching longitude) is counted in the

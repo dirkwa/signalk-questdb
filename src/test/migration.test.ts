@@ -13,6 +13,11 @@ import {
   runMigration,
   type SourceRow,
 } from "../migration.js";
+import {
+  migrationIdentity,
+  type CheckpointStore,
+  type MigrationCheckpoint,
+} from "../migration-checkpoint.js";
 
 /** Minimal stand-in for the ILP writer, recording what would be written. */
 class FakeWriter {
@@ -2007,5 +2012,320 @@ describe("streamed reads", () => {
 
     assert.strictEqual(run.state, "failed");
     assert.match(run.error ?? "", /database not found/);
+  });
+});
+
+/** A writer whose lines leave at once, as a healthy QuestDB's do. */
+class SettledWriter extends FakeWriter {
+  override get pendingLines(): number {
+    return 0;
+  }
+  get enqueuedLineCount(): number {
+    return this.numbers.length + this.strings.length + this.positions.length;
+  }
+  get settledLineCount(): number {
+    return this.enqueuedLineCount;
+  }
+}
+
+class MemoryCheckpoints implements CheckpointStore {
+  current: MigrationCheckpoint | null = null;
+  saves = 0;
+  async save(cp: MigrationCheckpoint) {
+    this.current = cp;
+    this.saves++;
+  }
+  async clear() {
+    this.current = null;
+  }
+}
+
+/**
+ * A 1.x source holding one point per measurement per day, the value naming its
+ * day. `failAt` makes one window's request fail, the way an import dies.
+ */
+function dailySource(failAt?: { measurement: string; day: number }) {
+  const t0 = Date.parse("2024-03-01T00:00:00Z");
+  const requests: { measurement: string; day: number }[] = [];
+  const fetchImpl = (async (input: string) => {
+    const q = new URL(input).searchParams.get("q") ?? "";
+    const measurement = /FROM "([^"]+)"/.exec(q)?.[1] ?? "";
+    const startNs = BigInt(/time >= (\d+)/.exec(q)?.[1] ?? "0");
+    const day = Number((startNs / 1_000_000n - BigInt(t0)) / 86_400_000n);
+    requests.push({ measurement, day });
+    if (failAt && failAt.measurement === measurement && failAt.day === day) {
+      return new Response("engine: shard closed", { status: 500 });
+    }
+    const body = {
+      results: [
+        {
+          series: [
+            {
+              name: measurement,
+              columns: ["time", "value"],
+              values: [[String(startNs + 1n), day]],
+            },
+          ],
+        },
+      ],
+    };
+    // The timestamp is a string above only to survive JSON; send it bare.
+    return new Response(
+      JSON.stringify(body).replace(/"(\d{19})"/, "$1") + "\n",
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+  return { fetchImpl, requests };
+}
+
+const resumeRequest = () => ({
+  url: "http://x",
+  type: "influxdb1",
+  bucket: "db",
+  from: "2024-03-01T00:00:00Z",
+  to: "2024-03-05T00:00:00Z",
+  context: "self",
+  measurements: ["a", "b", "c"],
+});
+
+describe("resuming an import", () => {
+  // The property the whole feature exists for. An import that dies part-way
+  // and is resumed must end with every row written — none skipped because a
+  // checkpoint claimed it, and the finished part not read again.
+  test("an import that dies and is resumed ends with every row written", async () => {
+    const checkpoints = new MemoryCheckpoints();
+    const writer = new SettledWriter();
+
+    const first = dailySource({ measurement: "b", day: 2 });
+    const run1 = new MigrationRun("r1", "http://x", "db");
+    await runMigration(resumeRequest(), writer, run1, {
+      fetchImpl: first.fetchImpl,
+      checkpoints,
+      checkpointLagMs: 0,
+    });
+    assert.strictEqual(run1.state, "failed");
+    assert.ok(checkpoints.current, "nothing was saved to resume from");
+
+    const second = dailySource();
+    const run2 = new MigrationRun("r2", "http://x", "db");
+    await runMigration(resumeRequest(), writer, run2, {
+      fetchImpl: second.fetchImpl,
+      checkpoints,
+      resumeFrom: checkpoints.current,
+      checkpointLagMs: 0,
+    });
+    assert.strictEqual(run2.state, "done");
+
+    const written = new Set(writer.numbers.map((n) => `${n.path}:${n.value}`));
+    for (const m of ["a", "b", "c"]) {
+      for (let day = 0; day < 4; day++) {
+        assert.ok(
+          written.has(`${m}:${day}`),
+          `${m} day ${day} was never written`,
+        );
+      }
+    }
+    // The finished measurement is not read again.
+    assert.ok(
+      !second.requests.some((r) => r.measurement === "a"),
+      "a finished measurement was read again",
+    );
+    assert.ok(
+      second.requests.length < 12,
+      "the resumed run read everything again",
+    );
+    // Finished: nothing left to resume.
+    assert.strictEqual(checkpoints.current, null);
+  });
+
+  test("a resumed run starts at the saved window and carries the totals", async () => {
+    const source = dailySource();
+    const run = new MigrationRun("r", "http://x", "db");
+    const resumeFrom: MigrationCheckpoint = {
+      version: 1,
+      identity: migrationIdentity(resumeRequest(), 86_400_000),
+      done: ["a"],
+      current: {
+        measurement: "b",
+        windowStart: Date.parse("2024-03-03T00:00:00Z"),
+      },
+      progress: { read: 600, written: 590, skipped: 10 },
+      updatedAt: "2024-06-01T00:00:00.000Z",
+    };
+    await runMigration(resumeRequest(), new SettledWriter(), run, {
+      fetchImpl: source.fetchImpl,
+      resumeFrom,
+    });
+
+    assert.strictEqual(run.state, "done");
+    assert.deepStrictEqual(source.requests, [
+      { measurement: "b", day: 2 },
+      { measurement: "b", day: 3 },
+      { measurement: "c", day: 0 },
+      { measurement: "c", day: 1 },
+      { measurement: "c", day: 2 },
+      { measurement: "c", day: 3 },
+    ]);
+    assert.strictEqual(run.progress.read, 606);
+    assert.strictEqual(run.progress.written, 596);
+    assert.strictEqual(run.progress.skipped, 10);
+    assert.strictEqual(run.progress.measurementsDone, 3);
+    assert.deepStrictEqual(run.resumedFrom, {
+      measurement: "b",
+      windowStart: "2024-03-03T00:00:00.000Z",
+    });
+  });
+
+  // The HTTP handler starts a run without awaiting it and answers at once. A
+  // run that only learns it was resumed after measurement discovery — a
+  // network round trip — would be reported as a fresh one, at zero.
+  test("a resumed run says so before anything is awaited", () => {
+    const run = new MigrationRun("r", "http://x", "db");
+    const pending = runMigration(
+      { ...resumeRequest(), measurements: undefined },
+      new SettledWriter(),
+      run,
+      {
+        fetchImpl: (() => new Promise(() => {})) as unknown as typeof fetch,
+        resumeFrom: {
+          version: 1,
+          identity: migrationIdentity(
+            { ...resumeRequest(), measurements: undefined },
+            86_400_000,
+          ),
+          done: ["a"],
+          current: {
+            measurement: "b",
+            windowStart: Date.parse("2024-03-03T00:00:00Z"),
+          },
+          progress: { read: 600, written: 590, skipped: 10 },
+          updatedAt: "2024-06-01T00:00:00.000Z",
+        },
+      },
+    );
+    void pending;
+    assert.strictEqual(run.resumedFrom?.measurement, "b");
+    assert.strictEqual(run.progress.written, 590);
+  });
+
+  // A position belongs to one import. Applied to another range it would skip
+  // windows that range has never imported.
+  test("a checkpoint of a different import is ignored", async () => {
+    const source = dailySource();
+    const run = new MigrationRun("r", "http://x", "db");
+    await runMigration(resumeRequest(), new SettledWriter(), run, {
+      fetchImpl: source.fetchImpl,
+      resumeFrom: {
+        version: 1,
+        identity: migrationIdentity(
+          { ...resumeRequest(), to: "2024-03-09T00:00:00Z" },
+          86_400_000,
+        ),
+        done: ["a", "b"],
+        progress: { read: 1, written: 1, skipped: 0 },
+        updatedAt: "2024-06-01T00:00:00.000Z",
+      },
+    });
+    assert.strictEqual(source.requests.length, 12);
+    assert.strictEqual(run.resumedFrom, undefined);
+    assert.strictEqual(run.progress.written, 12);
+  });
+
+  test("a saved window that is not one of this run's is not trusted", async () => {
+    for (const windowStart of [
+      Date.parse("2024-03-02T06:00:00Z"), // off the grid
+      Date.parse("2024-02-20T00:00:00Z"), // before the range
+      Date.parse("2024-03-05T00:00:00Z"), // at its end
+    ]) {
+      const source = dailySource();
+      await runMigration(
+        { ...resumeRequest(), measurements: ["a"] },
+        new SettledWriter(),
+        new MigrationRun("r", "http://x", "db"),
+        {
+          fetchImpl: source.fetchImpl,
+          resumeFrom: {
+            version: 1,
+            identity: migrationIdentity(
+              { ...resumeRequest(), measurements: ["a"] },
+              86_400_000,
+            ),
+            done: [],
+            current: { measurement: "a", windowStart },
+            progress: { read: 0, written: 0, skipped: 0 },
+            updatedAt: "2024-06-01T00:00:00.000Z",
+          },
+        },
+      );
+      assert.deepStrictEqual(
+        source.requests.map((r) => r.day),
+        [0, 1, 2, 3],
+        new Date(windowStart).toISOString(),
+      );
+    }
+  });
+
+  // A window the user cancelled out of was not imported. Saving a position
+  // past it would make the resumed run skip the rest of it.
+  test("a cancelled window is not saved as done", async () => {
+    const checkpoints = new MemoryCheckpoints();
+    const source = dailySource();
+    const run = new MigrationRun("r", "http://x", "db");
+    const writer = new SettledWriter();
+    const write = writer.writeAtNanos.bind(writer);
+    writer.writeAtNanos = (...args) => {
+      write(...args);
+      // Third row: measurement "a", its day-2 window.
+      if (writer.numbers.length === 3) run.cancel();
+    };
+    await runMigration(resumeRequest(), writer, run, {
+      fetchImpl: source.fetchImpl,
+      checkpoints,
+      checkpointLagMs: 0,
+    });
+
+    assert.strictEqual(run.state, "cancelled");
+    // Kept, so the import can be continued.
+    assert.ok(checkpoints.current);
+    assert.deepStrictEqual(checkpoints.current.done, []);
+    assert.ok(
+      (checkpoints.current.current?.windowStart ?? 0) <=
+        Date.parse("2024-03-03T00:00:00Z"),
+      "the saved position is past the window that was cancelled",
+    );
+    assert.strictEqual(run.progress.measurementsDone, 0);
+  });
+
+  test("a checkpoint that cannot be written does not fail the import", async () => {
+    const failing: CheckpointStore = {
+      save: async () => {
+        throw new Error("ENOSPC: no space left on device");
+      },
+      clear: async () => {
+        throw new Error("EACCES");
+      },
+    };
+    const run = new MigrationRun("r", "http://x", "db");
+    await runMigration(resumeRequest(), new SettledWriter(), run, {
+      fetchImpl: dailySource().fetchImpl,
+      checkpoints: failing,
+      checkpointLagMs: 0,
+    });
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(run.progress.written, 12);
+  });
+
+  // With the real lag a short import never saves anything — and must still
+  // finish cleanly, leaving nothing behind.
+  test("an import shorter than the lag saves nothing and leaves nothing", async () => {
+    const checkpoints = new MemoryCheckpoints();
+    const run = new MigrationRun("r", "http://x", "db");
+    await runMigration(resumeRequest(), new SettledWriter(), run, {
+      fetchImpl: dailySource().fetchImpl,
+      checkpoints,
+    });
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(checkpoints.saves, 0);
+    assert.strictEqual(checkpoints.current, null);
   });
 });

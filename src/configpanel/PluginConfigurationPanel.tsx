@@ -29,7 +29,9 @@ import {
 } from "signalk-container-helper/ui";
 import { S } from "./styles.js";
 import {
+  formatDateTime,
   toMigrationBuckets,
+  toMigrationInterrupted,
   toMigrationRange,
   toMigrationMeasurements,
   toMigrationSources,
@@ -207,6 +209,9 @@ export default function PluginConfigurationPanel({
     MigrationStatusResponse["run"] | null
   >(null);
   const [migrationStarting, setMigrationStarting] = useState(false);
+  const [migrationInterrupted, setMigrationInterrupted] = useState<
+    MigrationStatusResponse["interrupted"] | null
+  >(null);
   const [actionStatus, setActionStatus] = useState("");
   const [statusError, setStatusError] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -612,6 +617,7 @@ export default function PluginConfigurationPanel({
       const body = await res.json().catch(() => null);
       if (res.ok) {
         setMigrationRun(toMigrationStatus(body) ?? null);
+        setMigrationInterrupted(null);
       } else {
         setActionStatus(
           (body as ApiError | null)?.error ?? "Could not start migration.",
@@ -623,6 +629,61 @@ export default function PluginConfigurationPanel({
       setStatusError(true);
     }
     setMigrationStarting(false);
+  };
+
+  // Continue the stopped import. The server holds its source and range; only
+  // the credentials come from here, because they are never stored.
+  const resumeMigration = async () => {
+    setMigrationStarting(true);
+    // Usually pressed straight after the "server restarted" error appeared,
+    // which would otherwise stay on screen above a healthy running import.
+    setActionStatus("");
+    setStatusError(false);
+    try {
+      const res = await fetch("/plugins/signalk-questdb/api/migration/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resume: true, ...migrationAuthBody() }),
+      });
+      const body = await res.json().catch(() => null);
+      if (res.ok) {
+        setMigrationRun(toMigrationStatus(body) ?? null);
+        setMigrationInterrupted(null);
+      } else {
+        setActionStatus(
+          (body as ApiError | null)?.error ?? "Could not resume the import.",
+        );
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus("Could not resume the import: " + errorMessage(e));
+      setStatusError(true);
+    }
+    setMigrationStarting(false);
+  };
+
+  const discardMigration = async () => {
+    setActionStatus("");
+    setStatusError(false);
+    try {
+      const res = await fetch(
+        "/plugins/signalk-questdb/api/migration/discard",
+        { method: "POST" },
+      );
+      if (res.ok) {
+        setMigrationInterrupted(null);
+      } else {
+        const body = await res.json().catch(() => null);
+        setActionStatus(
+          (body as ApiError | null)?.error ??
+            "Could not discard the saved position.",
+        );
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus("Could not discard: " + errorMessage(e));
+      setStatusError(true);
+    }
   };
 
   const cancelMigration = async () => {
@@ -654,15 +715,23 @@ export default function PluginConfigurationPanel({
         if (!cancelled) {
           if (run) {
             setMigrationRun(run);
+            // The server offers one only once the run has stopped, so this
+            // picks the notice up on the very poll that sees it stop.
+            setMigrationInterrupted(toMigrationInterrupted(body) ?? null);
           } else if (res.ok) {
-            // A 200 carrying no run means the server genuinely has none —
-            // the plugin restarted, taking the in-memory run with it. Keeping
-            // the last snapshot on screen would leave "Importing" frozen at
-            // stale counters, polling forever against a run that no longer
-            // exists. Say so instead.
+            // A 200 carrying no run means the server genuinely has none. The
+            // run lives in the plugin's memory and survives the plugin being
+            // stopped, so it is only gone if the whole Signal K server
+            // restarted. Keeping the last snapshot on screen would leave
+            // "Importing" frozen at stale counters, polling forever against a
+            // run that no longer exists. Say so instead.
+            const interrupted = toMigrationInterrupted(body) ?? null;
             setMigrationRun(null);
+            setMigrationInterrupted(interrupted);
             setActionStatus(
-              "The import stopped because the plugin restarted. Re-run it to continue — already-imported rows are not duplicated.",
+              interrupted
+                ? "The import stopped because the Signal K server restarted. It can be resumed from its saved position below."
+                : "The import stopped because the Signal K server restarted before a position was saved. Start it again — already-imported rows are not duplicated.",
             );
             setStatusError(true);
           }
@@ -691,8 +760,11 @@ export default function PluginConfigurationPanel({
         const res = await fetch(
           "/plugins/signalk-questdb/api/migration/status",
         );
-        const run = toMigrationStatus(await res.json().catch(() => null));
-        if (!cancelled && run) setMigrationRun(run);
+        const body = await res.json().catch(() => null);
+        const run = toMigrationStatus(body);
+        if (cancelled) return;
+        if (run) setMigrationRun(run);
+        setMigrationInterrupted(toMigrationInterrupted(body) ?? null);
       } catch {
         // No run, or the endpoint is unavailable; nothing to restore.
       }
@@ -1568,6 +1640,52 @@ export default function PluginConfigurationPanel({
       </CollapsibleSection>
 
       <CollapsibleSection title="InfluxDB Migration">
+        {migrationInterrupted && migrationRun?.state !== "running" && (
+          <div
+            style={{
+              ...S.empty,
+              padding: "12px",
+              textAlign: "left",
+              marginBottom: 12,
+            }}
+          >
+            <div>
+              <strong>An import was interrupted</strong>
+              {` — ${migrationInterrupted.bucket} from ${migrationInterrupted.url}`}
+            </div>
+            <div style={S.cardMeta}>
+              {formatDateTime(migrationInterrupted.from)} to{" "}
+              {formatDateTime(migrationInterrupted.to)}.{" "}
+              {migrationInterrupted.measurementsDone} measurements finished
+              {migrationInterrupted.measurement
+                ? `, stopped in ${migrationInterrupted.measurement}` +
+                  (migrationInterrupted.windowStart
+                    ? ` at ${formatDateTime(migrationInterrupted.windowStart)}`
+                    : "")
+                : ""}
+              . Position saved {formatDateTime(migrationInterrupted.updatedAt)}.
+            </div>
+            <div style={S.fieldHelp}>
+              Resuming continues from the saved position; rows already imported
+              are not duplicated. If InfluxDB needs credentials, select the
+              instance and enter them first — they are never stored.
+            </div>
+            <div style={{ ...S.migrationActions, marginTop: 10 }}>
+              <Button
+                variant="primary"
+                busy={migrationStarting}
+                busyLabel="Resuming..."
+                onClick={resumeMigration}
+              >
+                Resume import
+              </Button>
+              <Button variant="danger" onClick={discardMigration}>
+                Discard saved position
+              </Button>
+            </div>
+          </div>
+        )}
+
         <div
           style={{
             display: "flex",
@@ -1890,6 +2008,18 @@ export default function PluginConfigurationPanel({
               </strong>
               {migrationRun.bucket ? ` from ${migrationRun.bucket}` : ""}
             </div>
+            {migrationRun.resumedFrom && (
+              <div style={S.cardMeta}>
+                Resumed
+                {migrationRun.resumedFrom.measurement
+                  ? ` in ${migrationRun.resumedFrom.measurement}` +
+                    (migrationRun.resumedFrom.windowStart
+                      ? ` at ${formatDateTime(migrationRun.resumedFrom.windowStart)}`
+                      : "")
+                  : " from the saved position"}
+                ; the totals include the earlier run.
+              </div>
+            )}
             <div style={S.cardMeta}>
               {formatNumber(migrationRun.progress.written)} written,{" "}
               {formatNumber(migrationRun.progress.skipped)} skipped,{" "}

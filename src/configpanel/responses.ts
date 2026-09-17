@@ -109,6 +109,12 @@ export function toMigrationStatus(
     startedAt: str(run.startedAt) ?? "",
     finishedAt: str(run.finishedAt),
     error: str(run.error),
+    resumedFrom: isRecord(run.resumedFrom)
+      ? {
+          measurement: str(run.resumedFrom.measurement),
+          windowStart: str(run.resumedFrom.windowStart),
+        }
+      : undefined,
     progress: {
       read: num(p.read),
       written: num(p.written),
@@ -118,6 +124,53 @@ export function toMigrationStatus(
       currentMeasurement: str(p.currentMeasurement),
       currentWindowStart: str(p.currentWindowStart),
     },
+  };
+}
+
+/**
+ * An ISO instant from the server, in the reader's own locale and time zone.
+ * Anything that is not a date is shown as it came rather than as
+ * "Invalid Date".
+ */
+export function formatDateTime(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+/**
+ * The stopped import a status response offers to continue, if any.
+ *
+ * Everything the notice prints is required: a partial one would render as
+ * "import of undefined", so a body missing any of it yields no notice at all.
+ */
+export function toMigrationInterrupted(
+  body: unknown,
+): MigrationStatusResponse["interrupted"] | undefined {
+  const i = isRecord(body) ? body.interrupted : undefined;
+  if (!isRecord(i)) return undefined;
+  if (
+    typeof i.url !== "string" ||
+    typeof i.type !== "string" ||
+    typeof i.bucket !== "string" ||
+    typeof i.from !== "string" ||
+    typeof i.to !== "string" ||
+    typeof i.updatedAt !== "string"
+  )
+    return undefined;
+  return {
+    url: i.url,
+    type: i.type,
+    bucket: i.bucket,
+    from: i.from,
+    to: i.to,
+    updatedAt: i.updatedAt,
+    measurementsDone:
+      typeof i.measurementsDone === "number" &&
+      Number.isFinite(i.measurementsDone)
+        ? i.measurementsDone
+        : 0,
+    measurement: typeof i.measurement === "string" ? i.measurement : undefined,
+    windowStart: typeof i.windowStart === "string" ? i.windowStart : undefined,
   };
 }
 

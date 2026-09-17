@@ -17,10 +17,20 @@
 
 import type { ILPWriter } from "./ilp-writer.js";
 import { routeDeltaValue, flattenObjectValue } from "./delta-routing.js";
+import {
+  CheckpointTracker,
+  migrationIdentity,
+  sameIdentity,
+} from "./migration-checkpoint.js";
+import type {
+  CheckpointStore,
+  MigrationCheckpoint,
+} from "./migration-checkpoint.js";
 import type {
   MigrationBucket,
   MigrationMeasurement,
   MigrationProgress,
+  MigrationResumePoint,
   MigrationRunState,
 } from "./api-contract.js";
 
@@ -722,6 +732,7 @@ export interface MigrationRunHandle {
   finishedAt?: string;
   progress: MigrationProgress;
   error?: string;
+  resumedFrom?: MigrationResumePoint;
   cancel(): void;
 }
 
@@ -734,6 +745,7 @@ export class MigrationRun implements MigrationRunHandle {
   startedAt = new Date().toISOString();
   finishedAt?: string;
   error?: string;
+  resumedFrom?: MigrationResumePoint;
   progress: MigrationProgress = {
     read: 0,
     written: 0,
@@ -773,7 +785,11 @@ export async function runMigration(
     | "writeStringAtNanos"
     | "writePositionAtNanos"
     | "pendingLines"
-  > & { readonly droppedLineCount?: number },
+  > & {
+    readonly droppedLineCount?: number;
+    readonly enqueuedLineCount?: number;
+    readonly settledLineCount?: number;
+  },
   run: MigrationRun,
   deps: {
     fetchImpl?: typeof fetch;
@@ -782,6 +798,16 @@ export async function runMigration(
     sleep?: (ms: number) => Promise<void>;
     /** Injected so tests don't wait out a real stalled read. */
     readIdleTimeoutMs?: number;
+    /** Where the import's position is kept, so a later run can resume it. */
+    checkpoints?: CheckpointStore;
+    /**
+     * A checkpoint to continue from. Only honoured if it belongs to this same
+     * import — anything else is ignored and the run starts from the beginning.
+     */
+    resumeFrom?: MigrationCheckpoint;
+    /** Injected so tests don't wait out the real checkpoint lag. */
+    checkpointLagMs?: number;
+    now?: () => number;
   } = {},
 ): Promise<void> {
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -817,6 +843,27 @@ export async function runMigration(
       throw new Error("`to` must be after `from`");
     }
 
+    // Before the first await, so a caller that started this run without
+    // awaiting it — the HTTP handler — already sees it as resumed, with the
+    // earlier totals, in the response it sends straight away.
+    const now = deps.now ?? Date.now;
+    const identity = migrationIdentity(req, windowMs);
+    const resume =
+      deps.resumeFrom && sameIdentity(deps.resumeFrom.identity, identity)
+        ? deps.resumeFrom
+        : undefined;
+    const done = new Set(resume?.done ?? []);
+    if (resume) {
+      run.progress.read = resume.progress.read;
+      run.progress.written = resume.progress.written;
+      run.progress.skipped = resume.progress.skipped;
+      run.resumedFrom = {
+        measurement: resume.current?.measurement,
+        windowStart:
+          resume.current && new Date(resume.current.windowStart).toISOString(),
+      };
+    }
+
     let measurements = req.measurements ?? [];
     if (measurements.length === 0) {
       measurements = (await listMeasurements(req, fetchImpl)).map(
@@ -835,6 +882,39 @@ export async function runMigration(
       }
     }
     run.progress.measurementsTotal = measurements.length;
+
+    const tracker = deps.checkpoints
+      ? new CheckpointTracker(
+          deps.checkpoints,
+          writer,
+          deps.checkpointLagMs,
+          now,
+        )
+      : undefined;
+    // A checkpoint that cannot be written costs a later resume, nothing more.
+    // It must not cost the import that is running.
+    const offerCheckpoint = async (
+      current?: MigrationCheckpoint["current"],
+    ): Promise<void> => {
+      try {
+        await tracker?.offer(() => ({
+          version: 1,
+          identity,
+          done: [...done],
+          current,
+          progress: {
+            read: run.progress.read,
+            written: run.progress.written,
+            skipped: run.progress.skipped,
+          },
+          updatedAt: new Date(now()).toISOString(),
+        }));
+      } catch (err) {
+        debug(
+          `migration: checkpoint not written: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
 
     // Wait for the writer to fall back to the resume mark.
     //
@@ -861,9 +941,30 @@ export async function runMigration(
 
     for (const measurement of measurements) {
       if (run.isCancelled) break;
+      if (done.has(measurement)) {
+        run.progress.measurementsDone++;
+        continue;
+      }
       run.progress.currentMeasurement = measurement;
 
-      for (let start = fromMs; start < toMs; start += windowMs) {
+      // Only a start this run would itself arrive at: anything else in the
+      // file is not a position of this import, and the measurement is read
+      // from its beginning instead.
+      let firstStart = fromMs;
+      const resumeAt =
+        resume?.current?.measurement === measurement
+          ? resume.current.windowStart
+          : undefined;
+      if (
+        resumeAt !== undefined &&
+        resumeAt > fromMs &&
+        resumeAt < toMs &&
+        (resumeAt - fromMs) % windowMs === 0
+      ) {
+        firstStart = resumeAt;
+      }
+
+      for (let start = firstStart; start < toMs; start += windowMs) {
         if (run.isCancelled) break;
         const end = Math.min(start + windowMs, toMs);
         run.progress.currentWindowStart = new Date(start).toISOString();
@@ -920,9 +1021,21 @@ export async function runMigration(
             else run.progress.skipped++;
           }
         }
-      }
 
+        // A window left early is not an imported window.
+        if (run.isCancelled) break;
+        if (start + windowMs < toMs) {
+          await offerCheckpoint({
+            measurement,
+            windowStart: start + windowMs,
+          });
+        }
+      }
+      if (run.isCancelled) break;
+
+      done.add(measurement);
       run.progress.measurementsDone++;
+      await offerCheckpoint();
       debug(
         `migration: ${measurement} done (${run.progress.written} written, ${run.progress.skipped} skipped)`,
       );
@@ -942,6 +1055,15 @@ export async function runMigration(
     }
 
     run.state = run.isCancelled ? "cancelled" : "done";
+    // Nothing left to resume. Kept on a cancel or a failure, which is exactly
+    // when a later run wants it.
+    if (run.state === "done") {
+      await deps.checkpoints?.clear().catch((err: unknown) => {
+        debug(
+          `migration: finished checkpoint not removed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
   } catch (err) {
     run.state = "failed";
     run.error = err instanceof Error ? err.message : String(err);
