@@ -206,11 +206,16 @@ existing InfluxDB into QuestDB. It supports both InfluxDB 1.x (InfluxQL) and
 How the data maps:
 
 - A measurement with the conventional `value` field becomes the Signal K path
-  of the same name; a measurement with several named fields becomes
-  `measurement.field` paths, so two fields cannot overwrite each other.
+  of the same name. So do the typed fields signalk-to-influxdb 1.x writes
+  (`stringValue`, `boolValue`, `jsonValue`). A measurement with any other named
+  fields becomes `measurement.field` paths, so two fields cannot overwrite each
+  other.
 - Numbers go to `signalk`, strings and booleans to `signalk_str` (booleans
-  tagged `value_kind=boolean`), and `latitude`/`longitude` field pairs are
-  recombined into `signalk_position`.
+  tagged `value_kind=boolean`). A `jsonValue` is decoded first: an object is
+  recorded as its scalar leaves, the same as live data.
+- Positions go to `signalk_position`, whether stored as a `jsonValue`
+  (signalk-to-influxdb 1.x) or as a `lat`/`lon` or `latitude`/`longitude` field
+  pair (signalk-to-influxdb2).
 - Rows keep their **original nanosecond timestamps**, so imported history sorts
   and aggregates alongside live data.
 - Every imported row is tagged `source=influxdb-import`, which makes it
@@ -218,8 +223,9 @@ How the data maps:
   `(ts, path, context, source)`, **re-running the same range overwrites rather
   than duplicating**. An interrupted import can simply be run again.
 
-Anything that cannot be mapped (a gap, an unsupported value type, a latitude
-with no matching longitude) is counted in the run's `skipped` total rather than
+Anything that cannot be mapped (a gap, an unsupported value type, a `jsonValue`
+that is not valid JSON, a latitude with no matching longitude) is counted in the
+run's `skipped` total rather than
 being dropped silently.
 
 ## Configuration

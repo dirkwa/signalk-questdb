@@ -467,17 +467,74 @@ export function rfc3339ToNanos(value: string): bigint | null {
 }
 
 /**
+ * The field signalk-to-influxdb 1.x uses for a value that is neither a number,
+ * a string nor a boolean: the value itself, JSON-encoded. `navigation.position`
+ * is always stored this way; `lat`/`lon` fields exist only when that plugin's
+ * `separateLatLon` option is on, which it is not by default.
+ */
+const JSON_VALUE_FIELD = "jsonValue";
+
+/**
+ * Field names that hold the value of the measurement's own path.
+ *
+ * signalk-to-influxdb2 writes every value to `value`. signalk-to-influxdb 1.x
+ * picks the field by the value's type — `value` for numbers, then
+ * `stringValue`, `boolValue` and `jsonValue` — because an InfluxDB 1.x field
+ * cannot change type once it has been written.
+ */
+const PATH_VALUE_FIELDS: ReadonlySet<string> = new Set([
+  "value",
+  "",
+  "_value",
+  "stringValue",
+  "boolValue",
+  JSON_VALUE_FIELD,
+]);
+
+/**
  * The Signal K path a measurement+field pair represents.
  *
- * signalk-to-influxdb writes the path as the measurement name and the value in
- * a field called `value`. Anything else (a measurement with several named
- * fields) is a non-Signal K schema, so the field name is appended to keep the
- * two apart instead of overwriting one with the other.
+ * The Signal K InfluxDB plugins write the path as the measurement name and the
+ * value in one of PATH_VALUE_FIELDS. Anything else (a measurement with several
+ * named fields) is a non-Signal K schema, so the field name is appended to keep
+ * the two apart instead of overwriting one with the other.
  */
 export function toSignalKPath(measurement: string, field: string): string {
-  if (field === "value" || field === "" || field === "_value")
-    return measurement;
+  if (PATH_VALUE_FIELDS.has(field)) return measurement;
   return `${measurement}.${field}`;
+}
+
+/**
+ * Decode `jsonValue` fields back into the values they encode.
+ *
+ * Left as the string it arrives as, a position would be recorded in
+ * `signalk_str` as text and `signalk_position` would stay empty. Decoded, it
+ * routes exactly like the live value did: a position to the position table,
+ * any other object to its scalar leaves.
+ *
+ * A value that does not parse cannot be represented, so it is dropped — and
+ * reported, so it lands in the run's skipped total.
+ */
+export function decodeJsonValueRows(rows: SourceRow[]): {
+  rows: SourceRow[];
+  dropped: number;
+} {
+  if (!rows.some((row) => row.field === JSON_VALUE_FIELD))
+    return { rows, dropped: 0 };
+  let dropped = 0;
+  const decoded: SourceRow[] = [];
+  for (const row of rows) {
+    if (row.field !== JSON_VALUE_FIELD || typeof row.value !== "string") {
+      decoded.push(row);
+      continue;
+    }
+    try {
+      decoded.push({ ...row, value: JSON.parse(row.value) as unknown });
+    } catch {
+      dropped++;
+    }
+  }
+  return { rows: decoded, dropped };
 }
 
 /** Coerce an InfluxDB field value (always text over CSV) to a JS value. */
@@ -879,8 +936,12 @@ async function readWindowFlux(
       value: coerceValue(rec.values["_value"] ?? "", rec.types["_value"]),
     });
   }
-  const merged = mergePositionRows(measurement, rows);
-  return { rows: merged.rows, dropped: merged.dropped + unusable };
+  const decoded = decodeJsonValueRows(rows);
+  const merged = mergePositionRows(measurement, decoded.rows);
+  return {
+    rows: merged.rows,
+    dropped: merged.dropped + decoded.dropped + unusable,
+  };
 }
 
 /** Read one time window of a measurement from InfluxDB 1.x. */
@@ -966,18 +1027,24 @@ async function readWindowInfluxQl(
       }
     }
   }
-  const merged = mergePositionRows(measurement, rows);
-  return { rows: merged.rows, dropped: merged.dropped + unusable };
+  const decoded = decodeJsonValueRows(rows);
+  const merged = mergePositionRows(measurement, decoded.rows);
+  return {
+    rows: merged.rows,
+    dropped: merged.dropped + decoded.dropped + unusable,
+  };
 }
 
 /**
  * Recombine latitude/longitude fields of a position measurement into one
  * object value at the same instant.
  *
- * The Signal K InfluxDB plugins store navigation.position as two fields
- * (`latitude`/`longitude`, or `lat`/`lon`). Left as-is they would import as
- * two numeric paths and the position history would be unusable — QuestDB keeps
- * positions in their own table.
+ * signalk-to-influxdb2 stores navigation.position as two fields (`lat`/`lon`),
+ * as does signalk-to-influxdb 1.x with `separateLatLon` on. Left as-is they
+ * would import as two numeric paths and the position history would be unusable
+ * — QuestDB keeps positions in their own table. The 1.x default encoding, a
+ * single `jsonValue`, is already whole by the time it gets here (see
+ * decodeJsonValueRows).
  */
 export function mergePositionRows(
   measurement: string,
@@ -988,9 +1055,21 @@ export function mergePositionRows(
   const lonKeys = new Set(["longitude", "lon", "lng"]);
   const byTime = new Map<string, { lat?: number; lon?: number }>();
   const passthrough: SourceRow[] = [];
+  // Instants that already carry a whole position. signalk-to-influxdb 1.x with
+  // `separateLatLon` on writes `jsonValue` AND `lat`/`lon` for the same fix, so
+  // the pair is a second copy of a row that is already going to be written.
+  const wholePositionTimes = new Set<string>();
   for (const row of rows) {
     const key = row.tsNanos.toString();
-    if (latKeys.has(row.field) && typeof row.value === "number") {
+    // Routed on the mapped path, as writeRow does, so a row is only counted as
+    // a whole position here if it is going to be written as one.
+    if (
+      routeDeltaValue(toSignalKPath(measurement, row.field), row.value) ===
+      "position"
+    ) {
+      wholePositionTimes.add(key);
+      passthrough.push(row);
+    } else if (latKeys.has(row.field) && typeof row.value === "number") {
       if (!byTime.has(key)) byTime.set(key, {});
       byTime.get(key)!.lat = row.value;
     } else if (lonKeys.has(row.field) && typeof row.value === "number") {
@@ -1003,6 +1082,7 @@ export function mergePositionRows(
   const merged: SourceRow[] = [];
   let dropped = 0;
   for (const [key, { lat, lon }] of byTime) {
+    if (wholePositionTimes.has(key)) continue;
     // A half-pair (lat with no lon at the same instant) is not a position.
     // Emitting it as a bare number would be worse than skipping it, so it is
     // dropped — and REPORTED, so it lands in the run's skipped total instead
