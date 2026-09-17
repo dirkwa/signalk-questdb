@@ -12,7 +12,7 @@
 // after a crash, make the resumed run skip rows that were never stored — a
 // silent hole in the history. CheckpointTracker is the guard against that.
 
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import type { MigrationRequest } from "./migration.js";
 
@@ -119,20 +119,61 @@ export class FileCheckpointStore implements CheckpointStore {
   }
 
   /**
-   * Written beside the target and renamed over it, so a crash mid-write leaves
-   * the previous checkpoint rather than a truncated one.
+   * Written beside the target, synced, and renamed over it, so a crash or a
+   * power cut leaves either the previous checkpoint or the new one — never a
+   * truncated one. The directory is synced too, so the rename itself is on
+   * disk; where a directory cannot be opened for that, the rename is left to
+   * the file system's own ordering.
    */
   async save(checkpoint: MigrationCheckpoint): Promise<void> {
-    await mkdir(path.dirname(this.file), { recursive: true });
+    const dir = path.dirname(this.file);
+    await mkdir(dir, { recursive: true });
     const tmp = `${this.file}.tmp`;
-    await writeFile(tmp, JSON.stringify(checkpoint), "utf8");
+    const fh = await open(tmp, "w");
+    try {
+      await fh.writeFile(JSON.stringify(checkpoint), "utf8");
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
     await rename(tmp, this.file);
+    try {
+      const dh = await open(dir, "r");
+      try {
+        await dh.sync();
+      } finally {
+        await dh.close();
+      }
+    } catch (err) {
+      // Not every platform lets a directory be opened and synced; any other
+      // failure is a real one and is not hidden behind a successful save.
+      const code =
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        typeof err.code === "string"
+          ? err.code
+          : "";
+      if (!DIRECTORY_SYNC_UNSUPPORTED.has(code)) throw err;
+    }
   }
 
   async clear(): Promise<void> {
     await rm(this.file, { force: true });
   }
 }
+
+/**
+ * Errors that mean "this platform or file system does not sync directories":
+ * Windows refuses to open one, and some file systems refuse to fsync one.
+ */
+const DIRECTORY_SYNC_UNSUPPORTED: ReadonlySet<string> = new Set([
+  "EISDIR",
+  "EPERM",
+  "EINVAL",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+]);
 
 function isCheckpoint(value: unknown): value is MigrationCheckpoint {
   if (typeof value !== "object" || value === null) return false;
@@ -173,12 +214,18 @@ function isCheckpoint(value: unknown): value is MigrationCheckpoint {
 /**
  * How old a position must be before it is persisted.
  *
- * Leaving the writer is not the same as being on disk. QuestDB commits ILP
- * rows within seconds but does not fsync them, so after a power cut what
- * survives is what the kernel had already written back — by default anything
+ * Leaving the writer is not the same as being stored. QuestDB takes ILP rows
+ * into memory and commits them on an interval of seconds, so a crash of either
+ * process loses the rows of the last interval. The managed container runs
+ * QuestDB with cairo.commit.mode=sync, which puts a commit on disk; an external
+ * one may be on QuestDB's default nosync, where what survives a power cut is
+ * what the kernel had already written back — with default settings anything
  * older than about 35 s (30 s dirty-page expiry plus the 5 s flusher period).
- * A minute clears that with room to spare. The price is that a resumed import
- * redoes up to a minute of work, which costs nothing but the time: rows upsert.
+ * A minute clears both with room to spare, on the assumption of those
+ * defaults: an external QuestDB is the operator's, and the README asks them to
+ * run it with sync, which is the real answer for a power cut. The price is
+ * that a resumed import redoes up to a minute of work, which costs nothing but
+ * the time: rows upsert.
  */
 export const CHECKPOINT_LAG_MS = 60_000;
 

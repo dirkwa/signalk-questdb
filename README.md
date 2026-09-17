@@ -240,11 +240,15 @@ position** starts over.
 The saved position deliberately trails the import by about a minute, and is
 only advanced once the rows behind it have left the plugin. QuestDB does not
 acknowledge rows sent this way, so that margin is what keeps the position behind
-what QuestDB has actually stored: it outlasts a crash of Signal K or of QuestDB,
-and — with the kernel's default write-back settings — a power cut. The cost is
-that a resumed import repeats up to a minute or so of work, which the
-deduplication above makes harmless. An import shorter than that saves nothing,
-and is simply run again.
+what QuestDB has actually committed: it covers the commit interval lost to a
+crash of Signal K or of QuestDB, and, on a power cut, the OS write-back as well
+when QuestDB runs on its default `nosync` (the managed container does not; see
+[Durability on power loss](#durability-on-power-loss)). The position file is
+synced and renamed into place, so a power cut leaves the previous position or
+the new one, never a damaged one; should none survive, the import starts again,
+which is always safe. The cost is that a resumed import repeats up to a minute
+or so of work, which the deduplication above makes harmless. An import shorter
+than that saves nothing, and is simply run again.
 
 Anything that cannot be mapped (a gap, an unsupported value type, a `jsonValue`
 that is not valid JSON, a latitude with no matching longitude) is counted in the
