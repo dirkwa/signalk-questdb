@@ -679,12 +679,15 @@ describe("import run", () => {
     assert.strictEqual(writer.strings[1].kind, "boolean");
   });
 
+  // Position measurements are read pivoted: InfluxDB puts every field of an
+  // instant on one record, with the series' tags as grouped columns.
   test("a lat/lon pair imports as one position tagged with the source", async () => {
     const csv = [
-      "#datatype,string,long,dateTime:RFC3339,double,string",
-      ",result,table,_time,_value,_field",
-      ",,0,2024-03-01T12:00:00Z,52.1,latitude",
-      ",,0,2024-03-01T12:00:00Z,4.3,longitude",
+      "#datatype,string,long,dateTime:RFC3339,string,double,double",
+      "#group,false,false,false,true,false,false",
+      "#default,_result,,,,,",
+      ",result,table,_time,source,latitude,longitude",
+      ",,0,2024-03-01T12:00:00Z,gps,52.1,4.3",
     ].join("\n");
     const fakeFetch = (async () =>
       new Response(csv, { status: 200 })) as unknown as typeof fetch;
@@ -717,9 +720,11 @@ describe("import run", () => {
   // read - written - skipped stops adding up.
   test("a dropped half-pair position is counted as skipped", async () => {
     const csv = [
-      "#datatype,string,long,dateTime:RFC3339,double,string",
-      ",result,table,_time,_value,_field",
-      ",,0,2024-03-01T12:00:00Z,52.1,latitude",
+      "#datatype,string,long,dateTime:RFC3339,string,double",
+      "#group,false,false,false,true,false",
+      "#default,_result,,,,",
+      ",result,table,_time,source,latitude",
+      ",,0,2024-03-01T12:00:00Z,gps,52.1",
     ].join("\n");
     const fakeFetch = (async () =>
       new Response(csv, { status: 200 })) as unknown as typeof fetch;
@@ -744,6 +749,132 @@ describe("import run", () => {
     assert.strictEqual(writer.positions.length, 0);
     assert.strictEqual(run.progress.skipped, 1);
     assert.strictEqual(run.progress.read, 1);
+  });
+
+  // Captured from a live InfluxDB 2.7.12 answering the pivoted position query:
+  // one table per series, CRLF line ends, tags as grouped columns, and three
+  // cases in one response — a half pair, a signalk-to-influxdb 1.x point
+  // carrying `jsonValue` AND `lat`/`lon`, and two fixes whose series differ
+  // only by the `s2_cell_id` tag signalk-to-influxdb2 adds.
+  test("a live pivoted position response imports whole, once, without its tags", async () => {
+    const csv = [
+      "#datatype,string,long,dateTime:RFC3339,string,string,double",
+      "#group,false,false,false,true,true,false",
+      "#default,_result,,,,,",
+      ",result,table,_time,context,source,lat",
+      ",,0,2024-03-01T12:00:02Z,vessels.self,gps2,59",
+      "",
+      "#datatype,string,long,dateTime:RFC3339,string,string,string,double,double",
+      "#group,false,false,false,true,true,false,false,false",
+      "#default,_result,,,,,,,",
+      ",result,table,_time,context,source,jsonValue,lat,lon",
+      ',,1,2024-03-01T12:00:03Z,vessels.self,legacy,"{""longitude"":25.5,""latitude"":61.5}",61.5,25.5',
+      "",
+      "#datatype,string,long,dateTime:RFC3339,string,string,string,double,double",
+      "#group,false,false,false,true,true,true,false,false",
+      "#default,_result,,,,,,,",
+      ",result,table,_time,context,s2_cell_id,source,lat,lon",
+      ",,2,2024-03-01T12:00:00Z,vessels.self,abc,gps1,60.1,24.9",
+      ",,3,2024-03-01T12:00:01Z,vessels.self,abd,gps1,60.2,24.8",
+      "",
+    ].join("\r\n");
+    let sent = "";
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      sent = String(init?.body ?? "");
+      return new Response(csv, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tpivot", "http://x", "b");
+    await runMigration(
+      {
+        url: "http://x",
+        type: "influxdb2",
+        bucket: "b",
+        from: "2024-03-01T00:00:00Z",
+        to: "2024-03-02T00:00:00Z",
+        context: "self",
+        measurements: ["navigation.position"],
+      },
+      writer,
+      run,
+      { fetchImpl: fakeFetch },
+    );
+
+    assert.strictEqual(run.state, "done");
+    assert.match(sent, /pivot\(/, "position measurements are read pivoted");
+    assert.deepStrictEqual(
+      writer.positions.map((p) => [p.lat, p.lon]),
+      [
+        [61.5, 25.5],
+        [60.1, 24.9],
+        [60.2, 24.8],
+      ],
+    );
+    // Tags are what the table is grouped by, never fields.
+    assert.deepStrictEqual(writer.strings, []);
+    assert.deepStrictEqual(writer.numbers, []);
+    // The lat with no lon.
+    assert.strictEqual(run.progress.skipped, 1);
+    assert.strictEqual(run.progress.read, 4);
+  });
+
+  // InfluxDB sends annotations only when the request asks for them, and only
+  // the JSON request form can ask. Bare CSV has no `#datatype`, so a string
+  // field holding "3.5" reads as a number — verified against a live 2.7.12.
+  test("2.x reads ask for the annotations the reader depends on", async () => {
+    const bodies: { contentType: string; body: string }[] = [];
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      bodies.push({
+        contentType: String(
+          (init?.headers as Record<string, string>)["Content-Type"],
+        ),
+        body: String(init?.body ?? ""),
+      });
+      return new Response(
+        [
+          "#datatype,string,long,dateTime:RFC3339,string,string",
+          "#group,false,false,false,false,true",
+          "#default,_result,,,,",
+          ",result,table,_time,_value,_field",
+          ",,0,2024-03-01T12:00:00Z,3.5,value",
+        ].join("\n"),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tdialect", "http://x", "b");
+    await runMigration(
+      {
+        url: "http://x",
+        type: "influxdb2",
+        bucket: "b",
+        from: "2024-03-01T00:00:00Z",
+        to: "2024-03-02T00:00:00Z",
+        context: "self",
+        measurements: ["design.name"],
+      },
+      writer,
+      run,
+      { fetchImpl: fakeFetch },
+    );
+
+    assert.strictEqual(bodies.length, 1);
+    assert.strictEqual(bodies[0].contentType, "application/json");
+    const request = JSON.parse(bodies[0].body) as {
+      query: string;
+      dialect: { annotations: string[] };
+    };
+    assert.match(request.query, /_measurement == "design\.name"/);
+    assert.ok(request.dialect.annotations.includes("datatype"));
+    assert.ok(request.dialect.annotations.includes("group"));
+    // And with them, the string stays a string.
+    assert.deepStrictEqual(writer.numbers, []);
+    assert.deepStrictEqual(
+      writer.strings.map((w) => w.value),
+      ["3.5"],
+    );
   });
 
   // Reading must pause while the writer is backed up, or the ILP buffer cap
@@ -1535,5 +1666,346 @@ describe("import run", () => {
     );
     assert.strictEqual(run.state, "failed");
     assert.match(run.error ?? "", /after/);
+  });
+});
+
+/**
+ * A response whose body is handed over one chunk per read, only when asked.
+ * `highWaterMark: 0` stops the stream reading ahead, so `pulled` is exactly
+ * how much of the body the import has asked for so far.
+ */
+function streamedResponse(
+  chunks: Uint8Array[],
+  signal?: AbortSignal | null,
+): { response: Response; pulled: () => number; cancelled: () => boolean } {
+  let pulled = 0;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        // What fetch does with an aborted request: the body errors.
+        signal?.addEventListener("abort", () => {
+          try {
+            controller.error(new DOMException("aborted", "AbortError"));
+          } catch {
+            // Already closed or cancelled.
+          }
+        });
+      },
+      pull(controller) {
+        if (pulled < chunks.length) controller.enqueue(chunks[pulled++]);
+        else controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return {
+    response: new Response(body, { status: 200 }),
+    pulled: () => pulled,
+    cancelled: () => cancelled,
+  };
+}
+
+const FLUX_VALUE_HEADER = [
+  "#datatype,string,long,dateTime:RFC3339,double,string",
+  "#group,false,false,false,false,true",
+  "#default,_result,,,,",
+  ",result,table,_time,_value,_field",
+].join("\r\n");
+
+/** `count` numeric Flux records, one per second from `first`. */
+function fluxValueRows(first: number, count: number): string {
+  const t0 = Date.parse("2024-03-01T00:00:00Z");
+  let out = "";
+  for (let i = first; i < first + count; i++) {
+    out += `,,0,${new Date(t0 + i * 1000).toISOString()},${i},value\r\n`;
+  }
+  return out;
+}
+
+const streamedRequest = (type: string, measurement = "m") => ({
+  url: "http://x",
+  type,
+  bucket: "b",
+  from: "2024-03-01T00:00:00Z",
+  to: "2024-03-02T00:00:00Z",
+  context: "self",
+  measurements: [measurement],
+});
+
+describe("streamed reads", () => {
+  // The network cuts a body wherever it likes: mid-line, mid-record, and in
+  // the middle of a multi-byte character.
+  test("a body split at arbitrary byte boundaries reads the same", async () => {
+    const csv = [
+      "#datatype,string,long,dateTime:RFC3339,string,string",
+      "#group,false,false,false,false,true",
+      "#default,_result,,,,",
+      ",result,table,_time,_value,_field",
+      ",,0,2024-03-01T12:00:00Z,Ålesund ⚓,value",
+      ',,0,2024-03-01T12:00:01Z,"two',
+      'lines",value',
+      "",
+    ].join("\r\n");
+    const bytes = new TextEncoder().encode(csv);
+    const chunks: Uint8Array[] = [];
+    for (let i = 0; i < bytes.length; i += 7)
+      chunks.push(bytes.slice(i, i + 7));
+    const fakeFetch = (async () =>
+      streamedResponse(chunks).response) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tsplit", "http://x", "b");
+    await runMigration(streamedRequest("influxdb2"), writer, run, {
+      fetchImpl: fakeFetch,
+    });
+
+    assert.strictEqual(run.state, "done");
+    assert.deepStrictEqual(
+      writer.strings.map((w) => w.value),
+      ["Ålesund ⚓", "two\nlines"],
+    );
+  });
+
+  test("a window larger than one batch is imported in full", async () => {
+    const total = 12_001;
+    const chunks = [new TextEncoder().encode(FLUX_VALUE_HEADER + "\r\n")];
+    for (let i = 0; i < total; i += 1000) {
+      chunks.push(
+        new TextEncoder().encode(fluxValueRows(i, Math.min(1000, total - i))),
+      );
+    }
+    const fakeFetch = (async () =>
+      streamedResponse(chunks).response) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tbatches", "http://x", "b");
+    await runMigration(streamedRequest("influxdb2"), writer, run, {
+      fetchImpl: fakeFetch,
+      // The fake writer never drains by itself.
+      sleep: async () => {
+        writer.numbers.length = 0;
+      },
+    });
+
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(run.progress.read, total);
+    assert.strictEqual(run.progress.written, total);
+    assert.strictEqual(run.progress.skipped, 0);
+  });
+
+  // What bounds memory: while QuestDB is backed up the import stops ASKING for
+  // data, rather than reading the window and holding it.
+  test("a backed-up writer stops the body being read ahead", async () => {
+    const chunkCount = 60;
+    const chunks = [new TextEncoder().encode(FLUX_VALUE_HEADER + "\r\n")];
+    for (let i = 0; i < chunkCount; i++) {
+      chunks.push(new TextEncoder().encode(fluxValueRows(i * 1000, 1000)));
+    }
+    let body: ReturnType<typeof streamedResponse> | undefined;
+    const fakeFetch = (async () => {
+      body = streamedResponse(chunks);
+      return body.response;
+    }) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const pulledAtFirstWait: number[] = [];
+    const run = new MigrationRun("tdemand", "http://x", "b");
+    await runMigration(streamedRequest("influxdb2"), writer, run, {
+      fetchImpl: fakeFetch,
+      sleep: async () => {
+        pulledAtFirstWait.push(body!.pulled());
+        writer.numbers.length = 0;
+      },
+    });
+
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(run.progress.written, chunkCount * 1000);
+    // The first wait comes once 20k lines are queued. By then 20-odd of the
+    // 60 thousand-row chunks have been asked for — not the whole window.
+    assert.ok(pulledAtFirstWait.length > 0, "the writer never backed up");
+    assert.ok(
+      pulledAtFirstWait[0] < 30,
+      `read ahead to chunk ${pulledAtFirstWait[0]} of ${chunks.length} before waiting`,
+    );
+  });
+
+  test("cancelling mid-window abandons the rest of the body", async () => {
+    const chunks = [new TextEncoder().encode(FLUX_VALUE_HEADER + "\r\n")];
+    for (let i = 0; i < 40; i++) {
+      chunks.push(new TextEncoder().encode(fluxValueRows(i * 1000, 1000)));
+    }
+    let body: ReturnType<typeof streamedResponse> | undefined;
+    let signal: AbortSignal | null | undefined;
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      signal = init?.signal;
+      body = streamedResponse(chunks, init?.signal);
+      return body.response;
+    }) as unknown as typeof fetch;
+
+    const run = new MigrationRun("tcancel", "http://x", "b");
+    const writer = new FakeWriter();
+    const write = writer.writeAtNanos.bind(writer);
+    writer.writeAtNanos = (...args) => {
+      write(...args);
+      if (writer.numbers.length === 1500) run.cancel();
+    };
+    await runMigration(streamedRequest("influxdb2"), writer, run, {
+      fetchImpl: fakeFetch,
+    });
+
+    assert.strictEqual(run.state, "cancelled");
+    assert.ok(body!.pulled() < chunks.length, "the whole body was still read");
+    // The request is given up, not left streaming into a socket nobody reads.
+    assert.ok(signal?.aborted, "the request was not aborted");
+  });
+
+  // An InfluxDB that accepts the query and then goes quiet must fail the run
+  // with a reason, not hold it at "running" forever.
+  test("a body that stalls fails the run instead of hanging it", async () => {
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      const stalled = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(FLUX_VALUE_HEADER));
+          init?.signal?.addEventListener("abort", () =>
+            controller.error(new DOMException("aborted", "AbortError")),
+          );
+        },
+      });
+      return new Response(stalled, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const run = new MigrationRun("tstall", "http://x", "b");
+    await runMigration(streamedRequest("influxdb2"), new FakeWriter(), run, {
+      fetchImpl: fakeFetch,
+      readIdleTimeoutMs: 30,
+    });
+
+    assert.strictEqual(run.state, "failed");
+    assert.match(run.error ?? "", /sent no data/);
+  });
+
+  // The idle clock runs only while a read is outstanding. A long pause for the
+  // writer is not InfluxDB being slow, and must not be mistaken for it.
+  test("time spent waiting for the writer does not count as a stalled read", async () => {
+    const chunks = [new TextEncoder().encode(FLUX_VALUE_HEADER + "\r\n")];
+    for (let i = 0; i < 30; i++) {
+      chunks.push(new TextEncoder().encode(fluxValueRows(i * 1000, 1000)));
+    }
+    const fakeFetch = (async (_url: string, init?: RequestInit) =>
+      streamedResponse(chunks, init?.signal)
+        .response) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tpause", "http://x", "b");
+    await runMigration(streamedRequest("influxdb2"), writer, run, {
+      fetchImpl: fakeFetch,
+      readIdleTimeoutMs: 40,
+      // Each drain wait outlasts the idle timeout several times over.
+      sleep: async () => {
+        await new Promise((r) => setTimeout(r, 150));
+        writer.numbers.length = 0;
+      },
+    });
+
+    assert.strictEqual(run.error, undefined);
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(run.progress.written, 30_000);
+  });
+
+  // Captured shape from a live InfluxDB 1.8.10 with chunked=true: one complete
+  // JSON document per line, `partial` set on all but the last.
+  test("1.x is read chunk by chunk, every chunk imported", async () => {
+    const doc = (values: number[][], partial: boolean) =>
+      JSON.stringify({
+        results: [
+          {
+            statement_id: 0,
+            series: [
+              { name: "m", columns: ["time", "value"], values, partial },
+            ],
+            partial,
+          },
+        ],
+      }) + "\n";
+    const t = 1709294400000000000;
+    const ndjson =
+      doc(
+        [
+          [t, 1],
+          [t + 1000, 2],
+        ],
+        true,
+      ) +
+      doc([[t + 2000, 3]], true) +
+      doc([[t + 3000, 4]], false);
+    let url = "";
+    const fakeFetch = (async (input: string) => {
+      url = input;
+      return new Response(ndjson, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("t1xchunks", "http://x", "db");
+    await runMigration(streamedRequest("influxdb1"), writer, run, {
+      fetchImpl: fakeFetch,
+    });
+
+    assert.strictEqual(run.state, "done");
+    assert.deepStrictEqual(
+      writer.numbers.map((n) => n.value),
+      [1, 2, 3, 4],
+    );
+    const params = new URL(url).searchParams;
+    assert.strictEqual(params.get("chunked"), "true");
+    assert.ok(Number(params.get("chunk_size")) > 0);
+  });
+
+  // 1.x reports failures inside an HTTP 200, and with chunking one can arrive
+  // after good chunks have already been read.
+  test("a 1.x error in a later chunk fails the run", async () => {
+    const t = 1709294400000000000;
+    const ndjson =
+      JSON.stringify({
+        results: [
+          {
+            series: [
+              { name: "m", columns: ["time", "value"], values: [[t, 1]] },
+            ],
+            partial: true,
+          },
+        ],
+      }) +
+      "\n" +
+      JSON.stringify({ results: [{ error: "engine: shard closed" }] }) +
+      "\n";
+    const fakeFetch = (async () =>
+      new Response(ndjson, { status: 200 })) as unknown as typeof fetch;
+
+    const run = new MigrationRun("t1xlate", "http://x", "db");
+    await runMigration(streamedRequest("influxdb1"), new FakeWriter(), run, {
+      fetchImpl: fakeFetch,
+    });
+
+    assert.strictEqual(run.state, "failed");
+    assert.match(run.error ?? "", /shard closed/);
+  });
+
+  test("a 1.x request-level error fails the run", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ error: "database not found: db" }) + "\n", {
+        status: 200,
+      })) as unknown as typeof fetch;
+
+    const run = new MigrationRun("t1xreq", "http://x", "db");
+    await runMigration(streamedRequest("influxdb1"), new FakeWriter(), run, {
+      fetchImpl: fakeFetch,
+    });
+
+    assert.strictEqual(run.state, "failed");
+    assert.match(run.error ?? "", /database not found/);
   });
 });

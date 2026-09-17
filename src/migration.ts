@@ -8,10 +8,12 @@
 // dropped: a migration that quietly loses a third of the history looks
 // identical to one that worked.
 //
-// Reads are windowed by time and drained window by window. A boat's InfluxDB
-// is routinely larger than the Pi's RAM, so neither the query nor the result
-// may be unbounded — and a window that returns nothing still advances, so a
-// multi-year gap costs one empty query per window rather than a stall.
+// Reads are windowed by time, and each window is streamed: read a batch, write
+// it, release it, read the next. A boat's InfluxDB is routinely larger than the
+// Pi's RAM, and a single dense day of one path can be too — so nothing here
+// holds a whole response, and reading stops while QuestDB is catching up. A
+// window that returns nothing still advances, so a multi-year gap costs one
+// empty query per window rather than a stall.
 
 import type { ILPWriter } from "./ilp-writer.js";
 import { routeDeltaValue, flattenObjectValue } from "./delta-routing.js";
@@ -26,10 +28,10 @@ import type {
 const NANOS_PER_MS = 1_000_000n;
 
 /**
- * How much time one read covers. Small enough that a dense measurement does
- * not return a result set too large to hold, large enough that a sparse one
- * does not need thousands of round trips. A day is the natural unit for boat
- * data: it bounds a busy passage to a few hundred thousand points.
+ * How much time one query covers. Large enough that a sparse measurement does
+ * not need thousands of round trips, small enough that one query stays cheap
+ * for InfluxDB and progress moves in visible steps. It does not bound memory:
+ * a window is streamed in batches, however many points it holds.
  */
 export const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
@@ -183,6 +185,8 @@ export async function listBuckets(
 }
 
 interface InfluxQlResponse {
+  /** Request-level failure, as opposed to a statement's own `error`. */
+  error?: string;
   results?: {
     series?: { name?: string; columns?: string[]; values?: unknown[][] }[];
     error?: string;
@@ -291,107 +295,254 @@ async function runFlux(
   fetchImpl: typeof fetch,
   timeoutMs = 120_000,
 ): Promise<AnnotatedRecord[]> {
-  const org = req.auth?.org ?? "";
-  const url = `${req.url}/api/v2/query${org ? `?org=${encodeURIComponent(org)}` : ""}`;
-  const r = await fetchImpl(url, {
-    method: "POST",
-    headers: {
-      ...headers,
-      "Content-Type": "application/vnd.flux",
-      Accept: "text/csv",
-    },
-    body: flux,
+  const r = await fetchImpl(fluxQueryUrl(req), {
+    ...fluxQueryInit(flux, headers),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!r.ok) throw new Error(await describeHttpError(r, "run query"));
   return parseAnnotatedCsv(await r.text());
 }
 
+function fluxQueryUrl(req: { url: string; auth?: InfluxAuth }): string {
+  const org = req.auth?.org ?? "";
+  return `${req.url}/api/v2/query${org ? `?org=${encodeURIComponent(org)}` : ""}`;
+}
+
 /**
- * Minimal annotated-CSV reader for Flux responses.
+ * A Flux query as a request.
+ *
+ * Sent as JSON, not as a raw `application/vnd.flux` body, because only the JSON
+ * form can carry a dialect — and without one InfluxDB answers with bare CSV, no
+ * annotation lines at all (verified against a live 2.7.12). The reader needs
+ * two of them: `#datatype`, without which a string field holding "3.5" is
+ * indistinguishable from the number and lands in the numeric table, and
+ * `#group`, which is how a pivoted record's tags are told from its fields.
+ */
+function fluxQueryInit(
+  flux: string,
+  headers: Record<string, string>,
+): RequestInit {
+  return {
+    method: "POST",
+    headers: {
+      ...headers,
+      "Content-Type": "application/json",
+      Accept: "text/csv",
+    },
+    body: JSON.stringify({
+      query: flux,
+      type: "flux",
+      dialect: { header: true, annotations: ["datatype", "group", "default"] },
+    }),
+  };
+}
+
+/**
+ * How long InfluxDB may stay silent while a read is outstanding.
+ *
+ * Not a limit on the whole request: a streamed window is read only as fast as
+ * QuestDB accepts it, so a dense one legitimately stays open for many minutes
+ * while the writer drains. The clock runs only while this side is waiting for
+ * bytes it has asked for.
+ */
+const READ_IDLE_TIMEOUT_MS = 120_000;
+
+/**
+ * Run a request and yield its response body one physical line at a time.
+ *
+ * The body is never held whole — a dense day of one measurement runs to
+ * hundreds of megabytes of CSV, and a heap exhausted by it cannot be caught:
+ * it ends the Signal K process. Reading is demand-driven, so a consumer that
+ * pauses (the import, waiting for the writer to drain) stops the reads, and
+ * TCP flow control carries that back to InfluxDB.
+ *
+ * Stopping early — cancelling a run — aborts the request rather than leaving
+ * InfluxDB streaming into a socket nobody reads.
+ */
+async function* streamLines(
+  fetchImpl: typeof fetch,
+  url: string,
+  init: RequestInit,
+  what: string,
+  idleTimeoutMs: number,
+): AsyncGenerator<string> {
+  const controller = new AbortController();
+  // Rejects on its own clock rather than waiting for the abort to surface
+  // through the pending step: the abort is what frees the connection, but the
+  // run must fail on time even if the step never notices it.
+  const guarded = <T>(step: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        controller.abort();
+        reject(
+          new Error(
+            `Cannot ${what}: InfluxDB sent no data for ${Math.round(idleTimeoutMs / 1000)}s`,
+          ),
+        );
+      }, idleTimeoutMs);
+      step().then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
+
+  const r = await guarded(() =>
+    fetchImpl(url, { ...init, signal: controller.signal }),
+  );
+  if (!r.ok) throw new Error(await guarded(() => describeHttpError(r, what)));
+  if (!r.body) return;
+
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let carry = "";
+  try {
+    for (;;) {
+      const { done, value } = await guarded(() => reader.read());
+      if (done) break;
+      carry += decoder.decode(value, { stream: true });
+      let from = 0;
+      for (
+        let nl = carry.indexOf("\n");
+        nl >= 0;
+        nl = carry.indexOf("\n", from)
+      ) {
+        yield carry.slice(from, nl);
+        from = nl + 1;
+      }
+      carry = carry.slice(from);
+    }
+    carry += decoder.decode();
+    if (carry !== "") yield carry;
+  } finally {
+    controller.abort();
+    await reader.cancel().catch(() => {});
+  }
+}
+
+/**
+ * Incremental annotated-CSV reader for Flux responses.
+ *
+ * Fed one physical line at a time, so a response is never held whole: the
+ * caller streams the body through it and sees each record as it completes.
  *
  * Flux emits one or more *tables*, each preceded by annotation lines starting
  * with `#` and then a header row. A response can therefore change its column
  * layout partway through, which is why the header is tracked per block rather
  * than read once at the top.
  */
-export function parseAnnotatedCsv(text: string): AnnotatedRecord[] {
-  const out: AnnotatedRecord[] = [];
-  let header: string[] | null = null;
+export class AnnotatedCsvReader {
+  private header: string[] | null = null;
   // Per-block `#datatype` line. Without it a genuine STRING value of "3.5"
   // is indistinguishable from the number 3.5 in the CSV body — verified
   // against a live 2.9.1 — and would be imported into the numeric table.
-  let datatypes: string[] | null = null;
-  // A quoted CSV value may contain a newline — verified against a live 2.9.1,
-  // which returns `"line1\r\nline2"` for a string value holding one. Splitting
-  // on newlines alone would tear that record in half and produce two garbage
-  // rows, so physical lines are joined until the quotes balance.
-  // \r is stripped per PHYSICAL line before joining: a quoted value spanning
-  // two CRLF lines would otherwise keep the \r of the first inside the joined
-  // value, so the imported string silently carries a stray carriage return.
-  for (const rawLine of joinQuotedLines(
-    text.split("\n").map((l) => l.replace(/\r$/, "")),
-  )) {
-    const line = rawLine;
+  private datatypes: string[] | null = null;
+  private groups: string[] | null = null;
+  // Built once per table and shared by its records: a table can run to
+  // millions of rows, and a copy per record was most of what a window cost.
+  private types: Record<string, string> = {};
+  private grouped: ReadonlySet<string> = new Set();
+  private pending: string | null = null;
+
+  /**
+   * Feed one physical line, without its `\n`. Returns the record it
+   * completes, or null for annotations, headers, blanks and partial records.
+   *
+   * A quoted CSV value may contain a newline — verified against a live 2.9.1,
+   * which returns `"line1\r\nline2"` for a string value holding one. Splitting
+   * on newlines alone would tear that record in half and produce two garbage
+   * rows, so physical lines are joined until the quotes balance ("" inside a
+   * quoted value is an escaped quote and does not change the balance).
+   * \r is stripped per PHYSICAL line before joining: a quoted value spanning
+   * two CRLF lines would otherwise keep the \r of the first inside the joined
+   * value, so the imported string silently carries a stray carriage return.
+   */
+  push(physicalLine: string): AnnotatedRecord | null {
+    const stripped = physicalLine.endsWith("\r")
+      ? physicalLine.slice(0, -1)
+      : physicalLine;
+    const line =
+      this.pending === null ? stripped : `${this.pending}\n${stripped}`;
+    if (!quotesBalanced(line)) {
+      this.pending = line;
+      return null;
+    }
+    this.pending = null;
+    return this.logicalLine(line);
+  }
+
+  /** Call once after the last line. */
+  end(): AnnotatedRecord | null {
+    if (this.pending === null) return null;
+    // Unterminated quote at EOF: emit what there is rather than dropping it.
+    const line = this.pending;
+    this.pending = null;
+    return this.logicalLine(line);
+  }
+
+  private logicalLine(line: string): AnnotatedRecord | null {
     if (line === "") {
       // Blank line separates tables; the next non-# line is a fresh header.
-      header = null;
-      datatypes = null;
-      continue;
+      this.header = null;
+      this.datatypes = null;
+      this.groups = null;
+      return null;
     }
     if (line.startsWith("#")) {
       // Annotation (#datatype/#group/#default). A new annotation block means
       // the previous header no longer applies.
-      if (line.startsWith("#datatype")) datatypes = splitCsvLine(line);
-      header = null;
-      continue;
+      if (line.startsWith("#datatype")) this.datatypes = splitCsvLine(line);
+      else if (line.startsWith("#group")) this.groups = splitCsvLine(line);
+      this.header = null;
+      return null;
     }
     const cells = splitCsvLine(line);
-    if (!header) {
-      header = cells;
-      continue;
+    if (!this.header) {
+      this.header = cells;
+      const types: Record<string, string> = {};
+      const grouped = new Set<string>();
+      for (let i = 0; i < cells.length; i++) {
+        const key = cells[i];
+        if (key === "") continue;
+        // Annotations are positionally aligned with the header row.
+        if (this.datatypes?.[i]) types[key] = this.datatypes[i];
+        if (this.groups?.[i] === "true") grouped.add(key);
+      }
+      this.types = types;
+      this.grouped = grouped;
+      return null;
     }
-    const rec: Record<string, string> = {};
-    const types: Record<string, string> = {};
-    for (let i = 0; i < header.length; i++) {
-      const key = header[i];
+    const values: Record<string, string> = {};
+    for (let i = 0; i < this.header.length; i++) {
+      const key = this.header[i];
       // Flux's leading empty column is the annotation gutter, not data.
       if (key === "") continue;
-      rec[key] = cells[i] ?? "";
-      // #datatype is positionally aligned with the header row.
-      if (datatypes && datatypes[i]) types[key] = datatypes[i];
+      values[key] = cells[i] ?? "";
     }
-    out.push({ values: rec, types });
+    return { values, types: this.types, grouped: this.grouped };
   }
-  return out;
 }
 
-/**
- * Re-join physical lines that belong to one CSV record.
- *
- * A record is complete when its double quotes are balanced ("" inside a quoted
- * value is an escaped quote and does not change the balance). Annotation and
- * blank lines can never be mid-record, so they pass straight through and the
- * caller's boundary handling is unaffected.
- */
-function joinQuotedLines(lines: string[]): string[] {
-  const out: string[] = [];
-  let pending: string | null = null;
-  for (const line of lines) {
-    const candidate: string = pending === null ? line : `${pending}\n${line}`;
-    if (quotesBalanced(candidate)) {
-      out.push(candidate);
-      pending = null;
-    } else {
-      pending = candidate;
-    }
+/** Parse a whole annotated-CSV response. For small results only. */
+export function parseAnnotatedCsv(text: string): AnnotatedRecord[] {
+  const reader = new AnnotatedCsvReader();
+  const out: AnnotatedRecord[] = [];
+  for (const line of text.split("\n")) {
+    const rec = reader.push(line);
+    if (rec) out.push(rec);
   }
-  // Unterminated quote at EOF: emit what there is rather than dropping it.
-  if (pending !== null) out.push(pending);
+  const last = reader.end();
+  if (last) out.push(last);
   return out;
 }
 
 function quotesBalanced(s: string): boolean {
+  if (!s.includes('"')) return true;
   let inQuotes = false;
   for (let i = 0; i < s.length; i++) {
     if (s[i] !== '"') continue;
@@ -404,13 +555,20 @@ function quotesBalanced(s: string): boolean {
   return !inQuotes;
 }
 
-/** One Flux CSV record plus the `#datatype` of each of its columns. */
+/**
+ * One Flux CSV record, plus what the table's annotations say about its columns.
+ * `types` and `grouped` belong to the table and are shared by all its records.
+ */
 export interface AnnotatedRecord {
   values: Record<string, string>;
-  types: Record<string, string>;
+  /** `#datatype` per column. */
+  types: Readonly<Record<string, string>>;
+  /** Columns in the table's group key (`#group` true): tags, never fields. */
+  grouped: ReadonlySet<string>;
 }
 
 function splitCsvLine(line: string): string[] {
+  if (!line.includes('"')) return line.split(",");
   const cells: string[] = [];
   let cur = "";
   let inQuotes = false;
@@ -622,6 +780,8 @@ export async function runMigration(
     debug?: (msg: string) => void;
     /** Injected so tests don't wait on real backpressure sleeps. */
     sleep?: (ms: number) => Promise<void>;
+    /** Injected so tests don't wait out a real stalled read. */
+    readIdleTimeoutMs?: number;
   } = {},
 ): Promise<void> {
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -629,6 +789,7 @@ export async function runMigration(
   const sleep =
     deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const headers = authHeaders(req.type, req.auth);
+  const readIdleTimeoutMs = deps.readIdleTimeoutMs ?? READ_IDLE_TIMEOUT_MS;
   // A non-positive window would make `start += windowMs` never advance and
   // spin forever. Not reachable from the HTTP API (which does not expose the
   // knob), but an infinite loop inside the Signal K process is severe enough
@@ -710,46 +871,54 @@ export async function runMigration(
         // Backpressure: let the writer drain before reading more.
         await awaitDrain();
 
-        const { rows, dropped } =
+        const batches =
           req.type === "influxdb2"
-            ? await readWindowFlux(
+            ? readWindowFlux(
                 req,
                 measurement,
                 start,
                 end,
                 headers,
                 fetchImpl,
+                readIdleTimeoutMs,
               )
-            : await readWindowInfluxQl(
+            : readWindowInfluxQl(
                 req,
                 measurement,
                 start,
                 end,
                 headers,
                 fetchImpl,
+                readIdleTimeoutMs,
               );
 
-        // Half-pair positions never become rows, so they are counted here or
-        // not at all — otherwise read - written - skipped silently disagrees.
-        run.progress.read += dropped;
-        run.progress.skipped += dropped;
-
-        // Checked inside the row loop too, not only between windows: a single
-        // dense window can carry far more rows than the writer's cap on its
-        // own, and waiting only at the window boundary would let the buffer
-        // sail past MAX_BUFFER_LINES mid-window — dropping its OLDEST lines,
-        // which is exactly the silent data loss this guard exists to prevent.
+        // The window is read a batch at a time and each batch is written
+        // before the next is asked for, so what is held never grows with the
+        // window. Leaving the loop early — a cancel — ends the read as well.
         let sinceDrainCheck = 0;
-        for (const row of rows) {
+        for await (const { rows, dropped } of batches) {
           if (run.isCancelled) break;
-          if (++sinceDrainCheck >= 1000) {
-            sinceDrainCheck = 0;
-            await awaitDrain();
+
+          // Half-pair positions never become rows, so they are counted here or
+          // not at all — otherwise read - written - skipped silently disagrees.
+          run.progress.read += dropped;
+          run.progress.skipped += dropped;
+
+          // Checked inside the row loop too, not only between batches: waiting
+          // only at a boundary would let the buffer sail past
+          // MAX_BUFFER_LINES mid-batch — dropping its OLDEST lines, which is
+          // exactly the silent data loss this guard exists to prevent.
+          for (const row of rows) {
+            if (run.isCancelled) break;
+            if (++sinceDrainCheck >= 1000) {
+              sinceDrainCheck = 0;
+              await awaitDrain();
+            }
+            run.progress.read++;
+            const written = writeRow(row, measurement, context, source, writer);
+            if (written) run.progress.written++;
+            else run.progress.skipped++;
           }
-          run.progress.read++;
-          const written = writeRow(row, measurement, context, source, writer);
-          if (written) run.progress.written++;
-          else run.progress.skipped++;
         }
       }
 
@@ -890,52 +1059,39 @@ function writeRow(
   }
 }
 
+/** Rows read from one stretch of a window, ready to be written. */
+interface WindowBatch {
+  rows: SourceRow[];
+  /** Points that could not become rows; counted as read and skipped. */
+  dropped: number;
+}
+
 /**
- * Read one time window of a measurement from InfluxDB 2.x.
- *
- * `navigation.position` is stored by the Signal K plugins as two fields on one
- * measurement, so the rows are pivoted back into a single object value —
- * otherwise latitude and longitude would land as two meaningless numeric paths
- * instead of a position.
+ * How many Flux records go into one batch. Bounds what a window holds at once:
+ * a batch is parsed, written and released before the next is read.
  */
-async function readWindowFlux(
-  req: MigrationRequest,
+const FLUX_BATCH_RECORDS = 5_000;
+
+/**
+ * Whether a measurement may hold a position split across latitude/longitude
+ * fields — the measurements mergePositionRows reassembles.
+ */
+function isPositionMeasurement(measurement: string): boolean {
+  return measurement.includes("position");
+}
+
+/**
+ * Turn the rows gathered so far into a batch.
+ *
+ * Decoding and position reassembly work within the batch, so a batch must
+ * hold WHOLE points: every field of an instant together. Both readers
+ * guarantee that — see each for how.
+ */
+function finishBatch(
   measurement: string,
-  startMs: number,
-  endMs: number,
-  headers: Record<string, string>,
-  fetchImpl: typeof fetch,
-): Promise<{ rows: SourceRow[]; dropped: number }> {
-  const flux = `from(bucket: ${JSON.stringify(req.bucket)})
-  |> range(start: ${new Date(startMs).toISOString()}, stop: ${new Date(endMs).toISOString()})
-  |> filter(fn: (r) => r._measurement == ${JSON.stringify(measurement)})
-  |> keep(columns: ["_time", "_field", "_value"])`;
-  const records = await runFlux(req, flux, headers, fetchImpl);
-  const rows: SourceRow[] = [];
-  // A record with no usable timestamp cannot be placed in time, so it is not
-  // importable — but it IS reported. The module's contract is that nothing is
-  // dropped silently, and a `read` total that quietly excludes these makes an
-  // import look smaller than the source rather than showing what was lost.
-  let unusable = 0;
-  for (const rec of records) {
-    const t = rec.values["_time"];
-    if (!t) {
-      unusable++;
-      continue;
-    }
-    const tsNanos = rfc3339ToNanos(t);
-    if (tsNanos === null) {
-      unusable++;
-      continue;
-    }
-    rows.push({
-      tsNanos,
-      field: rec.values["_field"] ?? "value",
-      // The declared type decides: a genuine string "3.5" must stay a string
-      // rather than being parsed into the numeric table.
-      value: coerceValue(rec.values["_value"] ?? "", rec.types["_value"]),
-    });
-  }
+  rows: SourceRow[],
+  unusable: number,
+): WindowBatch {
   const decoded = decodeJsonValueRows(rows);
   const merged = mergePositionRows(measurement, decoded.rows);
   return {
@@ -944,15 +1100,145 @@ async function readWindowFlux(
   };
 }
 
-/** Read one time window of a measurement from InfluxDB 1.x. */
-async function readWindowInfluxQl(
+/**
+ * Read one time window of a measurement from InfluxDB 2.x, in batches.
+ *
+ * Flux returns one table per field, each running the length of the window. For
+ * most measurements that is fine — every record is a complete value. A
+ * position is not: its latitude and longitude arrive as two separate tables,
+ * the second starting only after the first has ended, so pairing them from the
+ * stream would mean holding a whole table back. Position measurements are
+ * therefore pivoted by InfluxDB, which puts every field of an instant on one
+ * record and lets a position be assembled record by record.
+ */
+async function* readWindowFlux(
   req: MigrationRequest,
   measurement: string,
   startMs: number,
   endMs: number,
   headers: Record<string, string>,
   fetchImpl: typeof fetch,
-): Promise<{ rows: SourceRow[]; dropped: number }> {
+  idleTimeoutMs: number,
+): AsyncGenerator<WindowBatch> {
+  const pivoted = isPositionMeasurement(measurement);
+  const source = `from(bucket: ${JSON.stringify(req.bucket)})
+  |> range(start: ${new Date(startMs).toISOString()}, stop: ${new Date(endMs).toISOString()})
+  |> filter(fn: (r) => r._measurement == ${JSON.stringify(measurement)})`;
+  const flux = pivoted
+    ? `${source}
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> drop(columns: ["_start", "_stop", "_measurement"])`
+    : `${source}
+  |> keep(columns: ["_time", "_field", "_value"])`;
+  const csv = new AnnotatedCsvReader();
+  let rows: SourceRow[] = [];
+  let records = 0;
+  // A record with no usable timestamp cannot be placed in time, so it is not
+  // importable — but it IS reported. The module's contract is that nothing is
+  // dropped silently, and a `read` total that quietly excludes these makes an
+  // import look smaller than the source rather than showing what was lost.
+  let unusable = 0;
+  const take = (rec: AnnotatedRecord): void => {
+    records++;
+    const t = rec.values["_time"];
+    const tsNanos = t ? rfc3339ToNanos(t) : null;
+    if (tsNanos === null) {
+      unusable++;
+      return;
+    }
+    if (pivoted) {
+      pushPivotedFields(rec, tsNanos, rows);
+      return;
+    }
+    rows.push({
+      tsNanos,
+      field: rec.values["_field"] ?? "value",
+      // The declared type decides: a genuine string "3.5" must stay a string
+      // rather than being parsed into the numeric table.
+      value: coerceValue(rec.values["_value"] ?? "", rec.types["_value"]),
+    });
+  };
+
+  const lines = streamLines(
+    fetchImpl,
+    fluxQueryUrl(req),
+    fluxQueryInit(flux, headers),
+    "read data",
+    idleTimeoutMs,
+  );
+  for await (const line of lines) {
+    const rec = csv.push(line);
+    if (!rec) continue;
+    take(rec);
+    if (records >= FLUX_BATCH_RECORDS) {
+      yield finishBatch(measurement, rows, unusable);
+      rows = [];
+      records = 0;
+      unusable = 0;
+    }
+  }
+  const last = csv.end();
+  if (last) take(last);
+  if (records > 0) yield finishBatch(measurement, rows, unusable);
+}
+
+/** Columns of a pivoted record that are bookkeeping rather than fields. */
+const PIVOT_NON_FIELD_COLUMNS: ReadonlySet<string> = new Set([
+  "result",
+  "table",
+  "_time",
+]);
+
+/**
+ * The fields of one pivoted record, as rows at its instant.
+ *
+ * A pivoted record carries the series' tags as columns too. They are what the
+ * table is grouped by, which is how they are told from fields: reading them as
+ * fields would import a bogus `measurement.source` path for every point.
+ *
+ * An empty cell is a field this point does not have, not a value.
+ */
+function pushPivotedFields(
+  rec: AnnotatedRecord,
+  tsNanos: bigint,
+  out: SourceRow[],
+): void {
+  for (const column of Object.keys(rec.values)) {
+    if (PIVOT_NON_FIELD_COLUMNS.has(column) || rec.grouped.has(column))
+      continue;
+    const raw = rec.values[column];
+    if (raw === "") continue;
+    out.push({
+      tsNanos,
+      field: column,
+      value: coerceValue(raw, rec.types[column]),
+    });
+  }
+}
+
+/**
+ * How many points InfluxDB 1.x puts in one chunk of a chunked response. Each
+ * chunk becomes a batch, so this bounds what a window holds at once.
+ */
+const INFLUXQL_CHUNK_POINTS = 10_000;
+
+/**
+ * Read one time window of a measurement from InfluxDB 1.x, in batches.
+ *
+ * `chunked=true` makes InfluxDB answer with a series of complete JSON
+ * documents, one per line, instead of one document for the whole window. A
+ * 1.x row already carries every field of its point, so each chunk holds whole
+ * points and can be finished on its own.
+ */
+async function* readWindowInfluxQl(
+  req: MigrationRequest,
+  measurement: string,
+  startMs: number,
+  endMs: number,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+  idleTimeoutMs: number,
+): AsyncGenerator<WindowBatch> {
   // Measurement names come from SHOW MEASUREMENTS on this same server, but
   // they still land inside a query string — quote them as identifiers.
   //
@@ -968,18 +1254,42 @@ async function readWindowInfluxQl(
   // Signal K's own InfluxDB writers tag their points, so this is the common
   // case, not an exotic one.
   const q = `SELECT *::field FROM ${quoted} WHERE time >= ${BigInt(startMs) * NANOS_PER_MS} AND time < ${BigInt(endMs) * NANOS_PER_MS}`;
-  const url = `${req.url}/query?db=${encodeURIComponent(req.bucket)}&epoch=ns&q=${encodeURIComponent(q)}`;
-  const r = await fetchImpl(url, {
-    headers,
-    signal: AbortSignal.timeout(120_000),
-  });
-  if (!r.ok) throw new Error(await describeHttpError(r, "read data"));
-  const body = (await r.json()) as InfluxQlResponse;
-  if (body.results?.[0]?.error) throw new Error(body.results[0].error);
-  const series = body.results?.[0]?.series ?? [];
-  const rows: SourceRow[] = [];
-  // See readWindowFlux: values that cannot be imported are reported, not
-  // dropped in silence.
+  const url = `${req.url}/query?db=${encodeURIComponent(req.bucket)}&epoch=ns&chunked=true&chunk_size=${INFLUXQL_CHUNK_POINTS}&q=${encodeURIComponent(q)}`;
+  for await (const line of streamLines(
+    fetchImpl,
+    url,
+    { headers },
+    "read data",
+    idleTimeoutMs,
+  )) {
+    if (line.trim() === "") continue;
+    let body: InfluxQlResponse;
+    try {
+      body = JSON.parse(line) as InfluxQlResponse;
+    } catch {
+      throw new Error(
+        "Cannot read data: InfluxDB returned a malformed response",
+      );
+    }
+    if (body.error) throw new Error(body.error);
+    if (body.results?.[0]?.error) throw new Error(body.results[0].error);
+    const rows: SourceRow[] = [];
+    const unusable = pushInfluxQlSeries(body.results?.[0]?.series ?? [], rows);
+    if (rows.length > 0 || unusable > 0)
+      yield finishBatch(measurement, rows, unusable);
+  }
+}
+
+/**
+ * The points of one InfluxQL result, as rows. Returns how many values could
+ * not be imported — reported, like readWindowFlux's, not dropped in silence.
+ */
+function pushInfluxQlSeries(
+  series: NonNullable<
+    NonNullable<InfluxQlResponse["results"]>[number]["series"]
+  >,
+  rows: SourceRow[],
+): number {
   let unusable = 0;
   for (const s of series) {
     const columns = s.columns ?? [];
@@ -1027,12 +1337,7 @@ async function readWindowInfluxQl(
       }
     }
   }
-  const decoded = decodeJsonValueRows(rows);
-  const merged = mergePositionRows(measurement, decoded.rows);
-  return {
-    rows: merged.rows,
-    dropped: merged.dropped + decoded.dropped + unusable,
-  };
+  return unusable;
 }
 
 /**
