@@ -2,6 +2,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert";
 import {
   coerceValue,
+  decodeJsonValueRows,
   listBuckets,
   listMeasurements,
   mergePositionRows,
@@ -233,6 +234,45 @@ describe("value and path mapping", () => {
     );
   });
 
+  // signalk-to-influxdb 1.x names the field after the value's type. Appending
+  // those names would file every string, boolean and object under a path no
+  // Signal K consumer ever asks for.
+  test("the 1.x typed value fields map to the measurement as the path", () => {
+    for (const field of ["stringValue", "boolValue", "jsonValue"]) {
+      assert.strictEqual(
+        toSignalKPath("navigation.state", field),
+        "navigation.state",
+      );
+    }
+  });
+
+  test("a jsonValue field is decoded into the value it encodes", () => {
+    const rows: SourceRow[] = [
+      { tsNanos: 1n, field: "jsonValue", value: '{"a":1,"b":"x"}' },
+      { tsNanos: 2n, field: "value", value: 3.5 },
+    ];
+    const decoded = decodeJsonValueRows(rows);
+    assert.strictEqual(decoded.dropped, 0);
+    assert.deepStrictEqual(decoded.rows[0].value, { a: 1, b: "x" });
+    assert.strictEqual(decoded.rows[1].value, 3.5);
+  });
+
+  test("an unparseable jsonValue is dropped and reported", () => {
+    const rows: SourceRow[] = [
+      { tsNanos: 1n, field: "jsonValue", value: "{not json" },
+    ];
+    assert.deepStrictEqual(decodeJsonValueRows(rows), { rows: [], dropped: 1 });
+  });
+
+  // Only the field NAME marks a value as JSON. A genuine string that happens
+  // to look like JSON must stay the string it was recorded as.
+  test("a JSON-looking string in another field is left alone", () => {
+    const rows: SourceRow[] = [
+      { tsNanos: 1n, field: "stringValue", value: '{"a":1}' },
+    ];
+    assert.deepStrictEqual(decodeJsonValueRows(rows), { rows, dropped: 0 });
+  });
+
   test("numeric text becomes a number, other text stays a string", () => {
     assert.strictEqual(coerceValue("3.5"), 3.5);
     assert.strictEqual(coerceValue("hello"), "hello");
@@ -280,6 +320,33 @@ describe("position reassembly", () => {
     assert.deepStrictEqual(merged.rows, []);
     // Reported, not silently vanished — it lands in the run's skipped total.
     assert.strictEqual(merged.dropped, 1);
+  });
+
+  // signalk-to-influxdb 1.x with `separateLatLon` on writes the same fix both
+  // ways. Importing both would count one position twice.
+  test("a lat/lon pair duplicating a whole position at that instant is not repeated", () => {
+    const whole: SourceRow = {
+      tsNanos: 1n,
+      field: "jsonValue",
+      value: { latitude: 52.1, longitude: 4.3 },
+    };
+    const rows: SourceRow[] = [
+      whole,
+      { tsNanos: 1n, field: "lat", value: 52.1 },
+      { tsNanos: 1n, field: "lon", value: 4.3 },
+      { tsNanos: 2n, field: "lat", value: 52.2 },
+      { tsNanos: 2n, field: "lon", value: 4.4 },
+    ];
+    const merged = mergePositionRows("navigation.position", rows);
+    assert.strictEqual(merged.dropped, 0);
+    assert.deepStrictEqual(merged.rows, [
+      whole,
+      {
+        tsNanos: 2n,
+        field: "value",
+        value: { latitude: 52.2, longitude: 4.4 },
+      },
+    ]);
   });
 
   test("non-position measurements pass through untouched", () => {
@@ -991,6 +1058,87 @@ describe("import run", () => {
       value: "true",
       kind: "boolean",
     });
+  });
+
+  // The layout signalk-to-influxdb 1.x actually writes: one field per value
+  // type, and the position as a JSON string.
+  test("a signalk-to-influxdb 1.x database imports under its real paths", async () => {
+    const ts = 1709294400000000000;
+    const series: Record<string, { columns: string[]; values: unknown[][] }> = {
+      "navigation.position": {
+        columns: ["time", "jsonValue"],
+        values: [[ts, '{"longitude":24.95,"latitude":60.17}']],
+      },
+      "navigation.state": {
+        columns: ["time", "stringValue"],
+        values: [[ts, "sailing"]],
+      },
+      "steering.autopilot.engaged": {
+        columns: ["time", "boolValue"],
+        values: [[ts, true]],
+      },
+      "environment.depth.belowKeel": {
+        columns: ["time", "value"],
+        values: [[ts, 4.2]],
+      },
+      "environment.current": {
+        columns: ["time", "jsonValue"],
+        values: [[ts, '{"drift":0.5,"setTrue":1.2}']],
+      },
+    };
+    const fakeFetch = (async (input: string | URL | Request) => {
+      const q = new URL(String(input)).searchParams.get("q") ?? "";
+      const name = Object.keys(series).find((m) => q.includes(`"${m}"`));
+      return new Response(
+        JSON.stringify({
+          results: [{ series: name ? [{ name, ...series[name] }] : [] }],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const writer = new FakeWriter();
+    const run = new MigrationRun("t1xschema", "http://x", "db");
+    await runMigration(
+      {
+        url: "http://x",
+        type: "influxdb1",
+        bucket: "db",
+        from: "2024-03-01T00:00:00Z",
+        to: "2024-03-02T00:00:00Z",
+        context: "self",
+        measurements: Object.keys(series),
+      },
+      writer,
+      run,
+      { fetchImpl: fakeFetch },
+    );
+
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(run.progress.skipped, 0);
+    assert.deepStrictEqual(
+      writer.positions.map((p) => ({ lat: p.lat, lon: p.lon })),
+      [{ lat: 60.17, lon: 24.95 }],
+    );
+    assert.deepStrictEqual(
+      writer.strings.map((s) => ({
+        path: s.path,
+        value: s.value,
+        kind: s.kind,
+      })),
+      [
+        { path: "navigation.state", value: "sailing", kind: undefined },
+        { path: "steering.autopilot.engaged", value: "true", kind: "boolean" },
+      ],
+    );
+    assert.deepStrictEqual(
+      writer.numbers.map((n) => ({ path: n.path, value: n.value })),
+      [
+        { path: "environment.depth.belowKeel", value: 4.2 },
+        { path: "environment.current.drift", value: 0.5 },
+        { path: "environment.current.setTrue", value: 1.2 },
+      ],
+    );
   });
 
   // The last window must not read past the requested end. An unclamped
