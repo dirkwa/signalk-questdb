@@ -226,6 +226,31 @@ describe("plugin entry point (what Signal K loads)", () => {
   });
 });
 
+interface FederationContainer {
+  init: (shareScope: Record<string, unknown>) => Promise<unknown> | unknown;
+  get: (module: string) => Promise<unknown>;
+}
+
+/**
+ * The container, loaded the way the Admin UI loads it: import the remote
+ * entry, `init()` it once with the host's share scope, and only then `get()`.
+ *
+ * The order is part of the contract. `get()` waits for the shared modules the
+ * exposed code asked for, and those settle during `init()` — so on a container
+ * that was never initialised, the first `get()` resolves and every later one
+ * waits forever. The share scope is empty here, which leaves the remote on its
+ * own bundled React: what a host with no React to offer would get.
+ */
+let containerPromise: Promise<FederationContainer> | null = null;
+const loadContainer = (): Promise<FederationContainer> =>
+  (containerPromise ??= (async () => {
+    const entry = (await import(
+      pathToFileURL(path.join(publicDir, "remoteEntry.js")).href
+    )) as FederationContainer;
+    await entry.init({});
+    return entry;
+  })());
+
 describe("federated config panel (what the Admin UI fetches)", () => {
   it("emits a remote entry", () => {
     requirePanelBuild();
@@ -249,34 +274,40 @@ describe("federated config panel (what the Admin UI fetches)", () => {
     );
   });
 
-  it("actually exposes ./PluginConfigurationPanel", async () => {
-    requirePanelBuild();
-    // A container can export get/init and still expose nothing under the
-    // name the Admin UI asks for — a renamed or dropped `exposes` key in
-    // vite.config.ts builds cleanly and fails only when a user opens the
-    // panel. So request the module the way the host does.
-    const entry = await import(
-      pathToFileURL(path.join(publicDir, "remoteEntry.js")).href
-    );
-    const factory = await entry.get("./PluginConfigurationPanel");
-    assert.equal(
-      typeof factory,
-      "function",
-      "get('./PluginConfigurationPanel') must return a module factory",
-    );
-  });
+  // A `get()` that never settles would otherwise hold the whole run open with
+  // no output; the timeout turns that into a named failure.
+  const GET_TIMEOUT_MS = 15_000;
 
-  it("actually exposes ./AppPanel", async () => {
+  it(
+    "actually exposes ./PluginConfigurationPanel",
+    {
+      timeout: GET_TIMEOUT_MS,
+    },
+    async () => {
+      requirePanelBuild();
+      // A container can export get/init and still expose nothing under the
+      // name the Admin UI asks for — a renamed or dropped `exposes` key in
+      // vite.config.ts builds cleanly and fails only when a user opens the
+      // panel. So request the module the way the host does.
+      const container = await loadContainer();
+      const factory = await container.get("./PluginConfigurationPanel");
+      assert.equal(
+        typeof factory,
+        "function",
+        "get('./PluginConfigurationPanel') must return a module factory",
+      );
+    },
+  );
+
+  it("actually exposes ./AppPanel", { timeout: GET_TIMEOUT_MS }, async () => {
     requirePanelBuild();
     // The embeddable webapp. Signal K's Embedded route (/admin/#/e/<name>)
     // resolves this exact module name; without it the admin UI fails with
     // "Module ./AppPanel does not exist in container". Shipping a static
     // public/index.html is NOT a substitute — that file is never loaded, which
     // is precisely how 1.8.0 went out with a webapp that could not open.
-    const entry = await import(
-      pathToFileURL(path.join(publicDir, "remoteEntry.js")).href
-    );
-    const factory = await entry.get("./AppPanel");
+    const container = await loadContainer();
+    const factory = await container.get("./AppPanel");
     assert.equal(
       typeof factory,
       "function",
