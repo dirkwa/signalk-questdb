@@ -663,6 +663,13 @@ export default function PluginConfigurationPanel({
   };
 
   const discardMigration = async () => {
+    if (
+      !window.confirm(
+        "Discard the saved position? The import will then start again from " +
+          "the beginning. Rows already imported are kept and are not duplicated.",
+      )
+    )
+      return;
     setActionStatus("");
     setStatusError(false);
     try {

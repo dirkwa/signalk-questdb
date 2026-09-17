@@ -172,7 +172,7 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | POST   | `/migration/measurements`                | List measurements and their field keys in a bucket/database                              |
 | POST   | `/migration/start`                       | Start an import, or continue a stopped one with `{"resume": true}`; returns immediately  |
 | GET    | `/migration/status`                      | Progress and state of the current/last import, and any stopped import that can resume    |
-| POST   | `/migration/cancel`                      | Cancel the running import; its position is kept                                          |
+| POST   | `/migration/cancel`                      | Cancel the running import; any saved position is kept                                    |
 | POST   | `/migration/discard`                     | Forget a stopped import's saved position, so the next start begins again                 |
 | GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)               |
 | GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                   |
@@ -238,9 +238,11 @@ the identical import again the ordinary way continues it too. **Discard saved
 position** starts over.
 
 The saved position deliberately trails the import by about a minute, and is
-only advanced once the rows behind it have left the plugin. It can therefore
-never be ahead of what QuestDB actually holds, even after a power cut; the cost
-is that a resumed import repeats up to a minute or so of work, which the
+only advanced once the rows behind it have left the plugin. QuestDB does not
+acknowledge rows sent this way, so that margin is what keeps the position behind
+what QuestDB has actually stored: it outlasts a crash of Signal K or of QuestDB,
+and — with the kernel's default write-back settings — a power cut. The cost is
+that a resumed import repeats up to a minute or so of work, which the
 deduplication above makes harmless. An import shorter than that saves nothing,
 and is simply run again.
 
