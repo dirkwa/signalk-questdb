@@ -218,6 +218,9 @@ How the data maps:
   pair (signalk-to-influxdb2).
 - Rows keep their **original nanosecond timestamps**, so imported history sorts
   and aggregates alongside live data.
+- History is **streamed**: read in batches and written before more is asked
+  for, pausing while QuestDB catches up. Memory use stays flat however dense
+  the source is, so a large import is safe on a small board.
 - Every imported row is tagged `source=influxdb-import`, which makes it
   distinguishable from live recording — and because the tables deduplicate on
   `(ts, path, context, source)`, **re-running the same range overwrites rather
