@@ -1061,7 +1061,12 @@ export function mergePositionRows(
   const wholePositionTimes = new Set<string>();
   for (const row of rows) {
     const key = row.tsNanos.toString();
-    if (routeDeltaValue(measurement, row.value) === "position") {
+    // Routed on the mapped path, as writeRow does, so a row is only counted as
+    // a whole position here if it is going to be written as one.
+    if (
+      routeDeltaValue(toSignalKPath(measurement, row.field), row.value) ===
+      "position"
+    ) {
       wholePositionTimes.add(key);
       passthrough.push(row);
     } else if (latKeys.has(row.field) && typeof row.value === "number") {

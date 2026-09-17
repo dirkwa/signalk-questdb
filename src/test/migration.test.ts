@@ -349,6 +349,32 @@ describe("position reassembly", () => {
     ]);
   });
 
+  // A position-shaped object in a NAMED field is written under a child path
+  // and flattened, not recorded as a position — so it must not stand in for
+  // the lat/lon pair at that instant, or the fix is lost altogether.
+  test("a position-shaped object in a named field does not suppress the lat/lon pair", () => {
+    const named: SourceRow = {
+      tsNanos: 1n,
+      field: "anchor",
+      value: { latitude: 1, longitude: 2 },
+    };
+    const rows: SourceRow[] = [
+      named,
+      { tsNanos: 1n, field: "lat", value: 52.1 },
+      { tsNanos: 1n, field: "lon", value: 4.3 },
+    ];
+    const merged = mergePositionRows("navigation.position", rows);
+    assert.strictEqual(merged.dropped, 0);
+    assert.deepStrictEqual(merged.rows, [
+      named,
+      {
+        tsNanos: 1n,
+        field: "value",
+        value: { latitude: 52.1, longitude: 4.3 },
+      },
+    ]);
+  });
+
   test("non-position measurements pass through untouched", () => {
     const rows: SourceRow[] = [{ tsNanos: 1n, field: "value", value: 3.5 }];
     assert.deepStrictEqual(
