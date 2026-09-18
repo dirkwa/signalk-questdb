@@ -4,7 +4,7 @@ import {
   QUESTDB_DATA_DIR,
   VOLUME_MOUNT_ROOT,
   adoptDatabaseFromVolumeRoot,
-  databaseWaitsAtVolumeRoot,
+  databaseAtVolumeRoot,
   resolveQuestdbMount,
   shapeQuestdbMount,
   wipeDataInSignalk,
@@ -210,25 +210,16 @@ describe("adopting a database from a volume's root", () => {
   ];
 
   // What the caller asks before stopping the container that may still be
-  // running on the volume's root.
-  test("a database waits at the root until the data directory holds one", async () => {
+  // running on the volume's root: QuestDB's own file, not a bare `db`.
+  test("a database at the root is told by QuestDB's file in it", async () => {
     assert.strictEqual(
-      await databaseWaitsAtVolumeRoot(new FakeFs(OLD_LAYOUT), ROOT, DATA),
+      await databaseAtVolumeRoot(new FakeFs(OLD_LAYOUT), ROOT),
       true,
     );
     assert.strictEqual(
-      await databaseWaitsAtVolumeRoot(
-        new FakeFs([...OLD_LAYOUT, `${DATA}/db/_tab_index.d`]),
-        ROOT,
-        DATA,
-      ),
-      false,
-    );
-    assert.strictEqual(
-      await databaseWaitsAtVolumeRoot(
+      await databaseAtVolumeRoot(
         new FakeFs([`${ROOT}/db`, `${ROOT}/security.json`]),
         ROOT,
-        DATA,
       ),
       false,
     );
@@ -362,19 +353,23 @@ describe("adopting a database from a volume's root", () => {
     assert.deepStrictEqual(fs.made, []);
   });
 
-  // Two databases means somebody has already used the data directory; a
-  // move would clobber it. Neither is touched.
-  test("a data directory that already holds a database is not overwritten", async () => {
+  // Two databases is the same conflict as any other duplicate: a move would
+  // clobber one and a skip would hide the other for good. Neither is touched
+  // and the start fails naming both.
+  test("a database at both places is a conflict, and neither is touched", async () => {
     const fs = new FakeFs([
       ...OLD_LAYOUT,
+      DATA,
       `${DATA}/db`,
       `${DATA}/db/_tab_index.d`,
     ]);
-    assert.deepStrictEqual(
-      await adoptDatabaseFromVolumeRoot(fs, ROOT, DATA),
-      [],
+    await assert.rejects(
+      () => adoptDatabaseFromVolumeRoot(fs, ROOT, DATA),
+      (err: Error) => /QuestDB's db exists at both/.test(err.message),
     );
     assert.deepStrictEqual(fs.renames, []);
     assert.deepStrictEqual(fs.made, []);
+    assert.ok(fs.present.has(`${ROOT}/db/_tab_index.d`));
+    assert.ok(fs.present.has(`${DATA}/db/_tab_index.d`));
   });
 });

@@ -186,20 +186,15 @@ export interface DataDirFs {
 }
 
 /**
- * Whether a QuestDB database sits at the volume's root with none in the data
- * directory — the situation `adoptDatabaseFromVolumeRoot` resolves. Asked
- * first by the caller, which has to stop the container still running on that
- * root before anything moves.
+ * Whether a QuestDB database sits at the volume's root — what
+ * `adoptDatabaseFromVolumeRoot` moves. Asked first by the caller, which has
+ * to stop the container still running on that root before anything moves.
  */
-export async function databaseWaitsAtVolumeRoot(
+export async function databaseAtVolumeRoot(
   fs: DataDirFs,
   volumeRoot: string,
-  dataDir: string,
 ): Promise<boolean> {
-  return (
-    (await fs.exists(path.join(volumeRoot, DB_MARK))) &&
-    !(await fs.exists(path.join(dataDir, DB_MARK)))
-  );
+  return fs.exists(path.join(volumeRoot, DB_MARK));
 }
 
 /**
@@ -213,14 +208,14 @@ export async function databaseWaitsAtVolumeRoot(
  * entries are renamed across, which is instant and does not touch their
  * contents.
  *
- * Only when the root holds a QuestDB database (`db/_tab_index.d`) and the
- * data directory holds none: anything else is not that situation and is left
- * alone. Each entry moves on its own, so a move interrupted part-way is
- * finished by the next call: an entry no longer at the root is done, and
- * `db` moves last. An entry QuestDB has at both places is a duplicate, not
- * an interruption — a completed rename leaves nothing behind — and once `db`
- * has moved nothing would look at the root again, so it is a conflict that
- * fails the start before anything moves. A destination that exists without
+ * Only when the root holds a QuestDB database (`db/_tab_index.d`): anything
+ * else is not that situation and is left alone. Each entry moves on its own,
+ * so a move interrupted part-way is finished by the next call: an entry no
+ * longer at the root is done, and `db` moves last. An entry QuestDB has at
+ * both places — the tables included — is a duplicate, not an interruption:
+ * a completed rename leaves nothing behind, and once `db` has moved nothing
+ * would look at the root again. So it is a conflict that fails the start
+ * before anything moves. A destination that exists without
  * QuestDB's file is replaced if empty — that is what `rename` does — and a
  * conflict otherwise, which fails the start rather than leaving the
  * database behind unnoticed. Returns the entries moved.
@@ -230,7 +225,7 @@ export async function adoptDatabaseFromVolumeRoot(
   volumeRoot: string,
   dataDir: string,
 ): Promise<string[]> {
-  if (!(await databaseWaitsAtVolumeRoot(fs, volumeRoot, dataDir))) return [];
+  if (!(await databaseAtVolumeRoot(fs, volumeRoot))) return [];
   const pending: { name: string; from: string; to: string }[] = [];
   for (const { name, mark } of QUESTDB_ROOT_ENTRIES) {
     const from = path.join(volumeRoot, name);
