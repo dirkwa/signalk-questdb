@@ -45,6 +45,10 @@ import type {
   WrittenTail,
 } from "./migration-checkpoint.js";
 import {
+  countLegacyImportRows,
+  removeLegacyImportRows,
+} from "./migration-cleanup.js";
+import {
   WalMonitor,
   buildPendingSegmentsSQL,
   computeSkipPlan,
@@ -67,6 +71,7 @@ import {
 import { nofileClampSatisfied, readMaxMapCount } from "./host-limits.js";
 import type {
   DbStatus,
+  LegacyImportRowsResponse,
   MigrationDetectResponse,
   MigrationBucketsResponse,
   MigrationContextsResponse,
@@ -202,6 +207,18 @@ export default (app: App) => {
   // no writer to resume it onto. A restart therefore forgets it, and re-running
   // is safe because imported rows upsert on (ts, path, context, source).
   let activeMigration: MigrationRun | null = null;
+  // While the string table is being rebuilt — or a rebuild that failed after
+  // its swap is being finished — nothing may import into it, and the schema
+  // heal must keep its hands off it.
+  let legacyCleanupRunning = false;
+  // A heal in progress drops and recreates a mismatched table; the rebuild
+  // waits it out rather than rename underneath it.
+  const awaitHealIdle = async (): Promise<void> => {
+    for (let waited = 0; healing && waited < 30_000; waited += 100) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (healing) throw new Error("A schema repair is in progress; try again");
+  };
   let migrationCounter = 0;
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
@@ -366,7 +383,10 @@ export default (app: App) => {
   // is rebuilt with the correct `ts` schema. Best-effort: introspection/heal
   // errors are logged, not thrown, so they never break the lifecycle.
   const healSchemaTables = async (): Promise<void> => {
-    if (!queryClient || healing) return;
+    // Not while the string table is being rebuilt: the rebuild renames it
+    // away for a moment, and a heal finding it absent would create a fresh
+    // one for the rebuilt table to then collide with.
+    if (!queryClient || healing || legacyCleanupRunning) return;
     healing = true;
     try {
       let mismatch = false;
@@ -2780,6 +2800,12 @@ export default (app: App) => {
           } satisfies MigrationStatusResponse);
           return;
         }
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The string table is being rebuilt; try again in a moment",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
 
         const posted = (req.body ?? {}) as Record<string, unknown>;
         const stored = await checkpoints.load();
@@ -2994,11 +3020,18 @@ export default (app: App) => {
           });
         }
 
-        // The await above yielded; another start may have got in.
+        // The awaits above yielded; another start, or a rebuild of the string
+        // table, may have got in.
         if (activeMigration && activeMigration.state === "running") {
           res.status(409).json({
             error: "A migration is already running",
             run: migrationRunView(activeMigration),
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The string table is being rebuilt; try again in a moment",
           } satisfies MigrationStatusResponse);
           return;
         }
@@ -3056,6 +3089,87 @@ export default (app: App) => {
           run: activeMigration ? migrationRunView(activeMigration) : undefined,
           interrupted: stored ? interruptedView(stored) : undefined,
         } satisfies MigrationStatusResponse);
+      });
+
+      // What an import made before 2.1.5 left under suffixed paths. Counted
+      // on request rather than at start: it is a scan of the string table,
+      // and a one-time question.
+      router.get("/api/migration/legacy-rows", async (_req, res) => {
+        if (!queryClient) {
+          res.status(503).json({
+            error: "QuestDB not connected",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        // Counting also finishes a rebuild that failed after its swap, which
+        // must not run alongside one in progress — so it takes the same flag.
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The rows are being removed",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        legacyCleanupRunning = true;
+        try {
+          await awaitHealIdle();
+          res.json({
+            rows: await countLegacyImportRows(queryClient),
+          } satisfies LegacyImportRowsResponse);
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+        } finally {
+          legacyCleanupRunning = false;
+        }
+      });
+
+      // Rebuilds the string table without those rows. Not while an import is
+      // writing to it: the rebuild would race the import for the table.
+      router.post("/api/migration/legacy-rows/remove", async (_req, res) => {
+        if (!queryClient || !writer) {
+          res.status(503).json({
+            error: "QuestDB not connected",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        if (activeMigration && activeMigration.state === "running") {
+          res.status(409).json({
+            error: "An import is running; wait for it or cancel it first",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The rows are already being removed",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        legacyCleanupRunning = true;
+        try {
+          await awaitHealIdle();
+          const { removed, dropped } = await removeLegacyImportRows(
+            queryClient,
+            writer,
+          );
+          res.json({
+            rows: removed,
+            dropped,
+          } satisfies LegacyImportRowsResponse);
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+        } finally {
+          legacyCleanupRunning = false;
+        }
       });
 
       // Start over: forget the stopped import, so the next start is a new one.

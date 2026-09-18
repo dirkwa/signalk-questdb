@@ -129,6 +129,22 @@ export function toMigrationStatus(
 }
 
 /**
+ * GET /api/migration/legacy-rows and its POST remove: a row count, or 0, and
+ * after a removal the live samples dropped during the swap, normally 0.
+ */
+export function toLegacyImportRows(body: unknown): {
+  rows: number;
+  dropped: number;
+} {
+  const count = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+  return {
+    rows: count(isRecord(body) ? body.rows : undefined),
+    dropped: count(isRecord(body) ? body.dropped : undefined),
+  };
+}
+
+/**
  * POST /api/migration/contexts: the vessels the source holds. A body without
  * a proper list reads as "none found", which leaves the choice out of the form
  * rather than rendering a broken one.

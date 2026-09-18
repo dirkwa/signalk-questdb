@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   formatDateTime,
+  toLegacyImportRows,
   toMigrationBuckets,
   toMigrationContexts,
   toMigrationInterrupted,
@@ -360,6 +361,28 @@ describe("toMigrationContexts", () => {
         contexts: [],
         self: undefined,
       });
+    }
+  });
+});
+
+describe("toLegacyImportRows", () => {
+  it("reads the counts, and anything else as zero", () => {
+    assert.deepEqual(toLegacyImportRows({ rows: 75000000, dropped: 3 }), {
+      rows: 75000000,
+      dropped: 3,
+    });
+    assert.deepEqual(toLegacyImportRows({ rows: 2.7 }), {
+      rows: 2,
+      dropped: 0,
+    });
+    for (const body of [
+      null,
+      {},
+      { rows: "many" },
+      { rows: -1 },
+      { rows: NaN },
+    ]) {
+      assert.deepEqual(toLegacyImportRows(body), { rows: 0, dropped: 0 });
     }
   });
 });

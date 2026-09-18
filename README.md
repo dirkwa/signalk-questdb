@@ -175,6 +175,8 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | GET    | `/migration/status`                      | Progress and state of the current/last import, and any stopped import that can resume     |
 | POST   | `/migration/cancel`                      | Cancel the running import; any saved position is kept                                     |
 | POST   | `/migration/discard`                     | Forget a stopped import's saved position, so the next start begins again                  |
+| GET    | `/migration/legacy-rows`                 | Count rows an import made before 2.1.5 filed under suffixed paths                         |
+| POST   | `/migration/legacy-rows/remove`          | Rebuild the string table without those rows; recording continues meanwhile                |
 | GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)                |
 | GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                    |
 | GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet. Optional half-open `[from, to)` range for slicing into shards  |
@@ -235,6 +237,22 @@ How the data maps:
   distinguishable from live recording — and because the tables deduplicate on
   `(ts, path, context, source)`, **re-running the same range overwrites rather
   than duplicating**.
+
+### Imports made before 2.1.5
+
+Imports from a signalk-to-influxdb 1.x database made before 2.1.5 filed every
+string, boolean and position under a path suffixed with the InfluxDB field
+name — `navigation.state.stringValue`, `steering.autopilot.engaged.boolValue`,
+`navigation.position.jsonValue` — which nothing reads. Running the import again
+writes them under their real paths but cannot remove the old rows: the path is
+part of the deduplication key, and QuestDB has no row delete. When such rows
+exist, the panel says how many and offers **Remove these rows**, which rebuilds
+`signalk_str` without them. Recording continues while it runs; only the swap
+of the rebuilt table for the old one holds the writer, for a few seconds, and
+rows recorded during the rebuild are carried across. Should recording be fast
+enough to fill the writer's buffer during those seconds, the samples it could
+not keep are counted and the panel says how many. Run the import again
+afterwards.
 
 ### Resuming an interrupted import
 
