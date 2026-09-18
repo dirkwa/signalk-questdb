@@ -9,7 +9,11 @@ import {
   type DataDirFs,
 } from "../questdb-mount.js";
 
-const DATA = "/home/node/.signalk/plugin-config-data/signalk-questdb";
+// Signal K's config directory as a containerized server sees it. The
+// plugin-ci validator refuses a hardcoded home-directory path in a source
+// file, so the stand-in lives elsewhere.
+const CONFIG = "/var/lib/synthetic/.signalk";
+const DATA = `${CONFIG}/plugin-config-data/signalk-questdb`;
 
 describe("QuestDB mount shaping", () => {
   // Bare-metal, or an older signalk-container without resolveHostPath: the
@@ -72,7 +76,7 @@ describe("QuestDB mount shaping", () => {
     assert.strictEqual(m.wipePath, DATA);
     // And the volume's root, as Signal K sees it, is where a database left
     // behind by the old behaviour sits.
-    assert.strictEqual(m.volumeRootInSignalk, "/home/node/.signalk");
+    assert.strictEqual(m.volumeRootInSignalk, CONFIG);
   });
 
   test("a resolver that answers nothing, or throws, falls back to the path", async () => {
@@ -131,7 +135,7 @@ describe("adopting a database from a volume's root", () => {
       this.present.add(p);
     }
   }
-  const ROOT = "/home/node/.signalk";
+  const ROOT = CONFIG;
   // What a whole-volume mount left: QuestDB's database at the root of the
   // Signal K volume, next to security.json.
   const OLD_LAYOUT = [
