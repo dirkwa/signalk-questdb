@@ -600,10 +600,10 @@ describe("identity is restored over a longer window than motion (issue #127)", (
 
   it("restores AIS ship type from its flattened leaves (issue #148)", () => {
     // design.aisShipType is an object {id, name} recorded as leaves. Freeboard
-    // colours a target by .id; before #148 the bare path was the only one in
-    // the identity set, so nothing came back and every target kept the default
-    // colour. Both leaves are static identity, so they restore over the long
-    // window even when older than the motion window.
+    // colours a target by the object's .id; before #148 the bare path was the
+    // only one in the identity set, so nothing came back and every target
+    // kept the default colour. Both leaves are static identity, so they
+    // restore over the long window even when older than the motion window.
     const { promise, deltas } = run([
       position(AIS, 60_000),
       [ago(40 * 60_000), "design.aisShipType.id", AIS, "36", "number"] as Row,
@@ -626,10 +626,74 @@ describe("identity is restored over a longer window than motion (issue #127)", (
         0,
         "the ship-type leaves must use the identity window, not the motion one",
       );
-      const idVal = valueAt(deltas[0], "design.aisShipType.id");
-      const nameVal = valueAt(deltas[0], "design.aisShipType.name");
-      assert.equal(idVal?.value, 36, "the .id leaf drives Freeboard's colour");
-      assert.equal(nameVal?.value, "Sailing");
+      assert.deepEqual(
+        valueAt(deltas[0], "design.aisShipType")?.value,
+        { id: 36, name: "Sailing" },
+        "the object's .id drives Freeboard's colour",
+      );
+    });
+  });
+
+  it("replays an object identity as the object under its bare path, not as leaves (issue #170)", () => {
+    // What reaches the chart. Freeboard reads `design.aisShipType.value` from
+    // the model and looks for the bare path in a delta; a leaf replayed as
+    // `design.aisShipType.id` lands as `design.aisShipType.id.value`, which
+    // nothing reads — every target stayed purple after a restart even though
+    // the restore had found its type (#170, after #148 and #163). The object
+    // carries the time of its newest leaf, and the leaves themselves are gone.
+    const { promise, deltas } = run([
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.aisShipType.id", AIS, "70", "number"] as Row,
+      [ago(50 * 60_000), "design.aisShipType.name", AIS, "Cargo", null] as Row,
+      [
+        ago(45 * 60_000),
+        "design.length.overall",
+        AIS,
+        "112.5",
+        "number",
+      ] as Row,
+    ]);
+
+    return promise.then((result) => {
+      assert.equal(result.contexts, 1);
+      const paths = allValues(deltas[0]).map((v) => v.path);
+      assert.ok(!paths.includes("design.aisShipType.id"), "no .id leaf");
+      assert.ok(!paths.includes("design.aisShipType.name"), "no .name leaf");
+      assert.ok(!paths.includes("design.length.overall"), "no .overall leaf");
+      const type = deltas[0].updates.find((u) =>
+        u.values.some((v) => v.path === "design.aisShipType"),
+      );
+      assert.equal(type?.timestamp, ago(40 * 60_000), "the newest leaf's time");
+      assert.deepEqual(
+        type?.values.find((v) => v.path === "design.aisShipType")?.value,
+        { id: 70, name: "Cargo" },
+      );
+      assert.deepEqual(valueAt(deltas[0], "design.length")?.value, {
+        overall: 112.5,
+      });
+      assert.equal(result.values, 3, "position, type, length");
+    });
+  });
+
+  it("keeps a bare-path ship type from before flattening, unless leaves exist", () => {
+    // A database recorded by a source that emitted the type as a plain
+    // number (issue #128) holds it under the bare path; that replays as it
+    // was. Once leaves exist they are what current sources record, and win.
+    const bare = run([
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.aisShipType", AIS, "36", "number"] as Row,
+    ]);
+    const both = run([
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.aisShipType", AIS, "36", "number"] as Row,
+      [ago(50 * 60_000), "design.aisShipType.id", AIS, "70", "number"] as Row,
+    ]);
+
+    return Promise.all([bare.promise, both.promise]).then(() => {
+      assert.equal(valueAt(bare.deltas[0], "design.aisShipType")?.value, 36);
+      assert.deepEqual(valueAt(both.deltas[0], "design.aisShipType")?.value, {
+        id: 70,
+      });
     });
   });
 
@@ -658,9 +722,9 @@ describe("identity is restored over a longer window than motion (issue #127)", (
         0,
         "a 3-day-old ship type must survive the row-level age check too",
       );
-      assert.equal(
-        valueAt(deltas[0], "design.aisShipType.id")?.value,
-        70,
+      assert.deepEqual(
+        valueAt(deltas[0], "design.aisShipType")?.value,
+        { id: 70 },
         "a ship type older than 24h must still colour the target",
       );
     });
@@ -679,10 +743,42 @@ describe("identity is restored over a longer window than motion (issue #127)", (
     return promise.then((result) => {
       assert.equal(result.contexts, 1);
       assert.equal(result.skippedStale, 0);
-      const idVal = valueAt(deltas[0], "design.aisShipType.id");
-      assert.equal(idVal?.value, 70, "a cargo ship must colour from .id alone");
-      // No name leaf → no name value; the target still draws in its colour.
-      assert.equal(valueAt(deltas[0], "design.aisShipType.name"), undefined);
+      assert.deepEqual(
+        valueAt(deltas[0], "design.aisShipType")?.value,
+        { id: 70 },
+        "a cargo ship must colour from .id alone",
+      );
+    });
+  });
+
+  it("restores every recorded leaf of the length, and hull alone", () => {
+    // The recorder writes each scalar leaf of `design.length`, so a hull
+    // length is on disk whenever a source sent one; the object comes back
+    // with whatever leaves were recorded.
+    const both = run([
+      position(AIS, 60_000),
+      [
+        ago(40 * 60_000),
+        "design.length.overall",
+        AIS,
+        "112.5",
+        "number",
+      ] as Row,
+      [ago(40 * 60_000), "design.length.hull", AIS, "108", "number"] as Row,
+    ]);
+    const hullOnly = run([
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.length.hull", AIS, "108", "number"] as Row,
+    ]);
+
+    return Promise.all([both.promise, hullOnly.promise]).then(() => {
+      assert.deepEqual(valueAt(both.deltas[0], "design.length")?.value, {
+        overall: 112.5,
+        hull: 108,
+      });
+      assert.deepEqual(valueAt(hullOnly.deltas[0], "design.length")?.value, {
+        hull: 108,
+      });
     });
   });
 

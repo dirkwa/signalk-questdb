@@ -98,22 +98,26 @@ const MOTION_PATHS = [
  */
 const IDENTITY_PATHS = [
   // `design.aisShipType` is an OBJECT in Signal K ({id, name}) — Freeboard
-  // colours a target by its `.id`. Like `design.length` it is recorded as its
-  // flattened leaves (`design.aisShipType.id` in the numeric table,
-  // `design.aisShipType.name` in the string table), so restoring only the bare
-  // path brought back nothing and every restored target stayed the default
-  // colour (issue #148). The bare path is kept for databases recorded before
-  // flattening (issue #128) by a source that emitted it as a plain number.
+  // colours a target by the `.id` of the object under the bare path. Like
+  // `design.length` it is recorded as its flattened leaves
+  // (`design.aisShipType.id` in the numeric table, `design.aisShipType.name`
+  // in the string table), so restoring only the bare path brought back
+  // nothing and every restored target stayed the default colour (issue
+  // #148); the leaves are put back under the bare path before replay
+  // (OBJECT_IDENTITY_PATHS). The bare path is kept for databases recorded
+  // before flattening (issue #128) by a source that emitted it as a plain
+  // number.
   "design.aisShipType",
   "design.aisShipType.id",
   "design.aisShipType.name",
   // `design.length` is an OBJECT in Signal K ({overall, hull}), so it is
   // recorded as its leaves, not under the bare path — which never existed in
-  // the table and so restored nothing. Both spellings are listed: the leaf is
-  // what new data writes, and the bare path stays for databases recorded
+  // the table and so restored nothing. Both spellings are listed: the leaves
+  // are what new data writes, and the bare path stays for databases recorded
   // before flattening by a source that emitted it as a plain number.
   "design.length",
   "design.length.overall",
+  "design.length.hull",
   "design.beam",
   // No "mmsi": for another vessel the MMSI IS the context
   // (`vessels.urn:mrn:imo:mmsi:244813000`), built by the decoder from the AIS
@@ -165,6 +169,23 @@ const IDENTITY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
  * reached back for.
  */
 const IDENTITY_PATH_SET: ReadonlySet<string> = new Set(IDENTITY_PATHS);
+
+/**
+ * Identity paths whose Signal K value is an object, with the leaves they are
+ * recorded as. A leaf replayed under its own path lands in the data model as
+ * `design.aisShipType.id.value`, which no consumer reads: Freeboard takes a
+ * target's type from `design.aisShipType.value` and its dimensions from
+ * `design.length.value`, and its stream worker looks for the bare path in a
+ * delta. So the leaves go back together under the bare path before replay
+ * (issue #170).
+ */
+const OBJECT_IDENTITY_PATHS: ReadonlyArray<{
+  path: string;
+  leaves: readonly string[];
+}> = ["design.aisShipType", "design.length"].map((path) => ({
+  path,
+  leaves: IDENTITY_PATHS.filter((p) => p.startsWith(`${path}.`)),
+}));
 
 function isIdentityPath(path: string): boolean {
   return IDENTITY_PATH_SET.has(path);
@@ -371,6 +392,24 @@ export async function restoreFromHistory(
     if (deps.hasLiveData?.(storedContext)) {
       skippedLive++;
       continue;
+    }
+
+    // An object-valued identity goes back under its bare path, at the time
+    // of its newest leaf. A bare-path row — a plain number from a source
+    // that emitted one, before flattening — stands only when no leaf does.
+    for (const { path, leaves } of OBJECT_IDENTITY_PATHS) {
+      const value: Record<string, unknown> = {};
+      let newest: { ts: string; time: number } | undefined;
+      for (const leaf of leaves) {
+        const row = entry.byPath.get(leaf);
+        if (!row) continue;
+        value[leaf.slice(path.length + 1)] = row.value;
+        if (!newest || row.time > newest.time) newest = row;
+        entry.byPath.delete(leaf);
+      }
+      if (newest) {
+        entry.byPath.set(path, { ...newest, value, isName: false });
+      }
     }
 
     // One update per distinct recorded time. These paths were sampled at
