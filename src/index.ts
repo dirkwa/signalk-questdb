@@ -2484,7 +2484,10 @@ export default (app: App) => {
             res.status(503).json({ error: "Container manager not available" });
             return;
           }
-          if (!containers.removeManagedData) {
+          // A volume is purged from this process; only a host path needs
+          // signalk-container's in-userns wipe.
+          const mount = await resolveQuestdbDataMount(containers);
+          if (mount.wipe === "runtime" && !containers.removeManagedData) {
             res.status(501).json({
               error:
                 "Data removal requires signalk-container 1.19.0 or newer. Update it, or delete the QuestDB data directory manually.",
@@ -2529,7 +2532,6 @@ export default (app: App) => {
             }
             queryClient = null;
 
-            const mount = await resolveQuestdbDataMount(containers);
             app.setPluginStatus("Removing QuestDB container and data...");
             try {
               if (mount.wipe === "runtime") {
