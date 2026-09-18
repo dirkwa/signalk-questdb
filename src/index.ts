@@ -49,7 +49,6 @@ import {
 } from "./migration-cleanup.js";
 import {
   adoptDatabaseFromVolumeRoot,
-  databaseAtVolumeRoot,
   wipeDataInSignalk,
   resolveQuestdbMount,
 } from "./questdb-mount.js";
@@ -924,20 +923,18 @@ export default (app: App) => {
             rename: (from, to) => fs.rename(from, to),
             mkdir: (p) => fs.mkdir(p, { recursive: true }).then(() => {}),
           };
-          const volumeRoot = mount.volumeRootInSignalk;
-          const dataPath = app.getDataDirPath();
-          if (await databaseAtVolumeRoot(dataFs, volumeRoot)) {
+          const moved = await adoptDatabaseFromVolumeRoot(
+            dataFs,
+            mount.volumeRootInSignalk,
+            app.getDataDirPath(),
             // The container from before may still be running on that root,
-            // and QuestDB writes to paths under its root, so it must be
-            // stopped before its directories move; ensureRunning below
-            // brings it back on the new mount.
-            await containers.stop(QUESTDB_CONTAINER_NAME);
-            if (signal.aborted) return;
-            const moved = await adoptDatabaseFromVolumeRoot(
-              dataFs,
-              volumeRoot,
-              dataPath,
-            );
+            // and QuestDB writes to paths under its root, so it is stopped
+            // before its directories move — once the move is known to go
+            // ahead; ensureRunning below brings it back on the new mount.
+            () => containers.stop(QUESTDB_CONTAINER_NAME),
+          );
+          if (signal.aborted) return;
+          if (moved.length > 0) {
             app.debug(
               `moved QuestDB's database from the volume root into the data directory: ${moved.join(", ")}`,
             );

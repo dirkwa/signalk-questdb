@@ -4,7 +4,6 @@ import {
   QUESTDB_DATA_DIR,
   VOLUME_MOUNT_ROOT,
   adoptDatabaseFromVolumeRoot,
-  databaseAtVolumeRoot,
   resolveQuestdbMount,
   shapeQuestdbMount,
   wipeDataInSignalk,
@@ -209,20 +208,47 @@ describe("adopting a database from a volume's root", () => {
     `${ROOT}/plugin-config-data/signalk-grafana`,
   ];
 
-  // What the caller asks before stopping the container that may still be
-  // running on the volume's root: QuestDB's own file, not a bare `db`.
-  test("a database at the root is told by QuestDB's file in it", async () => {
-    assert.strictEqual(
-      await databaseAtVolumeRoot(new FakeFs(OLD_LAYOUT), ROOT),
-      true,
+  // The container from before may still be running on the root; the caller
+  // stops it in the hook, which must run once every entry is checked and
+  // before anything moves — and not at all when nothing will move.
+  test("the hook runs once, after the checks and before the first rename", async () => {
+    const fs = new FakeFs(OLD_LAYOUT);
+    const renamesAtHook: number[] = [];
+    const moved = await adoptDatabaseFromVolumeRoot(
+      fs,
+      ROOT,
+      DATA,
+      async () => {
+        renamesAtHook.push(fs.renames.length);
+      },
     );
-    assert.strictEqual(
-      await databaseAtVolumeRoot(
-        new FakeFs([`${ROOT}/db`, `${ROOT}/security.json`]),
+    assert.deepStrictEqual(renamesAtHook, [0]);
+    assert.deepStrictEqual(moved, ["conf", "public", "db"]);
+
+    let calls = 0;
+    const hook = async () => {
+      calls++;
+    };
+    await adoptDatabaseFromVolumeRoot(
+      new FakeFs([`${ROOT}/db`, `${ROOT}/security.json`]),
+      ROOT,
+      DATA,
+      hook,
+    );
+    await assert.rejects(() =>
+      adoptDatabaseFromVolumeRoot(
+        new FakeFs([
+          ...OLD_LAYOUT,
+          DATA,
+          `${DATA}/db`,
+          `${DATA}/db/_tab_index.d`,
+        ]),
         ROOT,
+        DATA,
+        hook,
       ),
-      false,
     );
+    assert.strictEqual(calls, 0);
   });
 
   // It moves into the data directory, entry by entry, the tables last, and

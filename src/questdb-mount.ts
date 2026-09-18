@@ -186,18 +186,6 @@ export interface DataDirFs {
 }
 
 /**
- * Whether a QuestDB database sits at the volume's root — what
- * `adoptDatabaseFromVolumeRoot` moves. Asked first by the caller, which has
- * to stop the container still running on that root before anything moves.
- */
-export async function databaseAtVolumeRoot(
-  fs: DataDirFs,
-  volumeRoot: string,
-): Promise<boolean> {
-  return fs.exists(path.join(volumeRoot, DB_MARK));
-}
-
-/**
  * Move a QuestDB database that sits at a volume's root into the data
  * directory inside that volume.
  *
@@ -219,13 +207,18 @@ export async function databaseAtVolumeRoot(
  * QuestDB's file is replaced if empty — that is what `rename` does — and a
  * conflict otherwise, which fails the start rather than leaving the
  * database behind unnoticed. Returns the entries moved.
+ *
+ * `beforeMove` runs once, after every entry has been checked and before the
+ * first rename — the moment to stop a container still running on the root,
+ * and not earlier: a conflict then leaves it running.
  */
 export async function adoptDatabaseFromVolumeRoot(
   fs: DataDirFs,
   volumeRoot: string,
   dataDir: string,
+  beforeMove: () => Promise<void> = async () => {},
 ): Promise<string[]> {
-  if (!(await databaseAtVolumeRoot(fs, volumeRoot))) return [];
+  if (!(await fs.exists(path.join(volumeRoot, DB_MARK)))) return [];
   const pending: { name: string; from: string; to: string }[] = [];
   for (const { name, mark } of QUESTDB_ROOT_ENTRIES) {
     const from = path.join(volumeRoot, name);
@@ -238,6 +231,7 @@ export async function adoptDatabaseFromVolumeRoot(
     }
     pending.push({ name, from, to });
   }
+  await beforeMove();
   await fs.mkdir(dataDir);
   const moved: string[] = [];
   for (const { name, from, to } of pending) {
