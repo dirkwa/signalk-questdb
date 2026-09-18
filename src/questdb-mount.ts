@@ -38,12 +38,16 @@ export interface QuestdbMount {
   env: Record<string, string>;
   /** QuestDB's data root inside the container. */
   dataDir: string;
-  /**
-   * What to hand `removeManagedData` on a purge: the exact host path for a
-   * bind, and Signal K's own path for a volume, which the Signal K process
-   * can delete from since the volume is mounted in its own tree.
-   */
+  /** What a purge deletes. */
   wipePath: string;
+  /**
+   * Who can delete it. `runtime`: `wipePath` is a host path the runtime can
+   * bind-mount, so signalk-container's `removeManagedData` deletes it and,
+   * where the Signal K user cannot, wipes it from inside the runtime.
+   * `signalk`: `wipePath` is Signal K's own path inside a volume, which the
+   * runtime cannot mount by that name; only the Signal K process reaches it.
+   */
+  wipe: "runtime" | "signalk";
   /**
    * Set for a volume-backed data directory: the Signal K-side path of the
    * volume's root. What QuestDB wrote there before the offset was honoured
@@ -73,6 +77,7 @@ export function shapeQuestdbMount(
       env: {},
       dataDir: QUESTDB_DATA_DIR,
       wipePath: source,
+      wipe: "runtime",
     };
   }
   if (resolution.subPath === "") {
@@ -82,6 +87,7 @@ export function shapeQuestdbMount(
       env: {},
       dataDir: QUESTDB_DATA_DIR,
       wipePath: dataPath,
+      wipe: "signalk",
     };
   }
   const mountDest = `${VOLUME_MOUNT_ROOT}/${resolution.source}`;
@@ -91,6 +97,7 @@ export function shapeQuestdbMount(
     env: { QUESTDB_DATA_DIR: dataDir },
     dataDir,
     wipePath: dataPath,
+    wipe: "signalk",
     // The offset is relative to where the volume is mounted in Signal K's
     // container, so that root is the data path with the offset taken off.
     volumeRootInSignalk: dataPath.slice(
@@ -128,24 +135,49 @@ export async function resolveQuestdbMount(
 }
 
 /**
- * The directories QuestDB keeps under its data root, in the order they are
- * moved. `db` — the tables — goes last: it is what marks the root as a
- * database, so a move that stops short still leaves a root that is
- * recognised, and picked up again, on the next start.
+ * Delete the data directory from the Signal K process — the purge for a
+ * volume, which the runtime cannot mount by Signal K's path. QuestDB's
+ * entrypoint makes the directory its own user's, so where that user is not
+ * the Signal K user (rootless Podman maps it to a subuid) the delete is
+ * refused, and the only way left is by hand.
  */
-export const QUESTDB_ROOT_ENTRIES = [
-  "conf",
-  "public",
-  "snapshot",
-  ".checkpoint",
-  "import",
-  "export",
-  "profiles",
-  "db",
-] as const;
+export async function wipeDataInSignalk(
+  rm: (p: string) => Promise<void>,
+  dataPath: string,
+): Promise<void> {
+  try {
+    await rm(dataPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      throw new Error(
+        `${dataPath} is owned by QuestDB's user and the Signal K user cannot delete it (${code}); the container is removed, delete the directory by hand`,
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * The directories QuestDB keeps under its data root, each with a file
+ * QuestDB itself writes there. An entry moves only when it carries that
+ * file: the names are generic, and a directory of the same name at Signal
+ * K's root is somebody else's. `db` — the tables — goes last: it is what
+ * marks the root as a database, so a move that stops short still leaves a
+ * root that is recognised, and picked up again, on the next start.
+ */
+export const QUESTDB_ROOT_ENTRIES: ReadonlyArray<{
+  name: string;
+  mark: string;
+}> = [
+  { name: "conf", mark: "server.conf" },
+  { name: "public", mark: "version.txt" },
+  { name: "db", mark: "_tab_index.d" },
+];
 
 /** QuestDB writes this into `db` on its first start, tables or not. */
-const DB_SIGNATURE = "_tab_index.d";
+const DB_MARK = path.join("db", "_tab_index.d");
 
 export interface DataDirFs {
   exists(p: string): Promise<boolean>;
@@ -167,8 +199,10 @@ export interface DataDirFs {
  * Only when the root holds a QuestDB database (`db/_tab_index.d`) and the
  * data directory holds none: anything else is not that situation and is left
  * alone. Each entry moves on its own, so a move interrupted part-way is
- * finished by the next call: `db` moves last and is what the root is
- * recognised by, and an entry already at the destination stays where it is.
+ * finished by the next call: an entry already across is skipped, and `db`
+ * moves last. A destination that exists without QuestDB's file is replaced
+ * if empty — that is what `rename` does — and a conflict otherwise, which
+ * fails the start rather than leaving the database behind unnoticed.
  * Returns the entries moved.
  */
 export async function adoptDatabaseFromVolumeRoot(
@@ -176,16 +210,24 @@ export async function adoptDatabaseFromVolumeRoot(
   volumeRoot: string,
   dataDir: string,
 ): Promise<string[]> {
-  if (!(await fs.exists(path.join(volumeRoot, "db", DB_SIGNATURE)))) return [];
-  if (await fs.exists(path.join(dataDir, "db"))) return [];
+  if (!(await fs.exists(path.join(volumeRoot, DB_MARK)))) return [];
+  if (await fs.exists(path.join(dataDir, DB_MARK))) return [];
   await fs.mkdir(dataDir);
   const moved: string[] = [];
-  for (const entry of QUESTDB_ROOT_ENTRIES) {
-    const from = path.join(volumeRoot, entry);
-    const to = path.join(dataDir, entry);
-    if (!(await fs.exists(from)) || (await fs.exists(to))) continue;
-    await fs.rename(from, to);
-    moved.push(entry);
+  for (const { name, mark } of QUESTDB_ROOT_ENTRIES) {
+    const from = path.join(volumeRoot, name);
+    const to = path.join(dataDir, name);
+    if (!(await fs.exists(path.join(from, mark)))) continue;
+    if (await fs.exists(path.join(to, mark))) continue;
+    try {
+      await fs.rename(from, to);
+    } catch (err) {
+      throw new Error(
+        `QuestDB's ${name} at ${volumeRoot} could not be moved into ${dataDir}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
+    moved.push(name);
   }
   return moved;
 }

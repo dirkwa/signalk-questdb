@@ -49,6 +49,7 @@ import {
 } from "./migration-cleanup.js";
 import {
   adoptDatabaseFromVolumeRoot,
+  wipeDataInSignalk,
   resolveQuestdbMount,
 } from "./questdb-mount.js";
 import type { QuestdbMount } from "./questdb-mount.js";
@@ -470,12 +471,7 @@ export default (app: App) => {
     mountPath: "/plugins/signalk-questdb/console",
   });
 
-  /**
-   * The mount for QuestDB's data directory, however Signal K is deployed —
-   * see questdb-mount.ts. A volume that holds the directory at an offset is
-   * mounted whole and QuestDB pointed inside it; everything else mounts at
-   * the image's data root as before.
-   */
+  /** The mount for QuestDB's data directory — see questdb-mount.ts. */
   async function resolveQuestdbDataMount(
     containers: ContainerManagerApi,
   ): Promise<QuestdbMount> {
@@ -2515,13 +2511,25 @@ export default (app: App) => {
             }
             queryClient = null;
 
-            const { wipePath } = await resolveQuestdbDataMount(containers);
+            const mount = await resolveQuestdbDataMount(containers);
             app.setPluginStatus("Removing QuestDB container and data...");
-            await containers.removeManagedData!(
-              QUESTDB_CONTAINER_NAME,
-              wipePath,
-              { ownerPluginId: "signalk-questdb" },
-            );
+            if (mount.wipe === "runtime") {
+              await containers.removeManagedData!(
+                QUESTDB_CONTAINER_NAME,
+                mount.wipePath,
+                { ownerPluginId: "signalk-questdb" },
+              );
+            } else {
+              // A volume: the runtime cannot mount it by Signal K's path, so
+              // signalk-container's in-userns wipe would mount the wrong
+              // directory. Delete from here, the one process that reaches it.
+              await containers.remove(QUESTDB_CONTAINER_NAME);
+              const fs = await import("fs/promises");
+              await wipeDataInSignalk(
+                (p) => fs.rm(p, { recursive: true, force: true }),
+                mount.wipePath,
+              );
+            }
           };
 
           // Purge is the RECOVERY action, so it must make progress even when a

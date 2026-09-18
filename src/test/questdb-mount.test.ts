@@ -6,6 +6,7 @@ import {
   adoptDatabaseFromVolumeRoot,
   resolveQuestdbMount,
   shapeQuestdbMount,
+  wipeDataInSignalk,
   type DataDirFs,
 } from "../questdb-mount.js";
 
@@ -26,6 +27,7 @@ describe("QuestDB mount shaping", () => {
       env: {},
       dataDir: QUESTDB_DATA_DIR,
       wipePath: DATA,
+      wipe: "runtime",
     });
   });
 
@@ -45,6 +47,7 @@ describe("QuestDB mount shaping", () => {
       m.wipePath,
       "/srv/signalk-race-config/plugin-config-data/signalk-questdb",
     );
+    assert.strictEqual(m.wipe, "runtime");
     assert.strictEqual(m.volumeRootInSignalk, undefined);
   });
 
@@ -52,7 +55,10 @@ describe("QuestDB mount shaping", () => {
     const m = shapeQuestdbMount(DATA, { source: "questdb-data", subPath: "" });
     assert.deepStrictEqual(m.volumes, { [QUESTDB_DATA_DIR]: "questdb-data" });
     assert.deepStrictEqual(m.env, {});
+    // The runtime cannot mount the volume by Signal K's path, so the purge
+    // deletes from the Signal K process.
     assert.strictEqual(m.wipePath, DATA);
+    assert.strictEqual(m.wipe, "signalk");
   });
 
   // The reported case: Signal K's whole config directory is a named volume.
@@ -72,10 +78,10 @@ describe("QuestDB mount shaping", () => {
       QUESTDB_DATA_DIR: `${VOLUME_MOUNT_ROOT}/${name}/plugin-config-data/signalk-questdb`,
     });
     assert.strictEqual(m.dataDir, m.env.QUESTDB_DATA_DIR);
-    // Signal K's own path is what its process can delete from on a purge.
     assert.strictEqual(m.wipePath, DATA);
-    // And the volume's root, as Signal K sees it, is where a database left
-    // behind by the old behaviour sits.
+    assert.strictEqual(m.wipe, "signalk");
+    // The volume's root, as Signal K sees it, is where a database left
+    // behind by a whole-volume mount sits.
     assert.strictEqual(m.volumeRootInSignalk, CONFIG);
   });
 
@@ -102,9 +108,48 @@ describe("QuestDB mount shaping", () => {
   });
 });
 
+describe("purging a volume from the Signal K process", () => {
+  test("deletes the data path", async () => {
+    const removed: string[] = [];
+    await wipeDataInSignalk(async (p) => {
+      removed.push(p);
+    }, DATA);
+    assert.deepStrictEqual(removed, [DATA]);
+  });
+
+  // QuestDB's entrypoint made the directory its own user's; under rootless
+  // Podman that is a subuid the Signal K user cannot touch.
+  test("an ownership refusal names the path and says the container is gone", async () => {
+    const denied = Object.assign(new Error("EACCES: permission denied"), {
+      code: "EACCES",
+    });
+    await assert.rejects(
+      () =>
+        wipeDataInSignalk(async () => {
+          throw denied;
+        }, DATA),
+      (err: Error) =>
+        err.message.includes(DATA) &&
+        /by hand/.test(err.message) &&
+        err.cause === denied,
+    );
+  });
+
+  test("any other failure passes through", async () => {
+    const io = Object.assign(new Error("EIO"), { code: "EIO" });
+    await assert.rejects(
+      () =>
+        wipeDataInSignalk(async () => {
+          throw io;
+        }, DATA),
+      (err) => err === io,
+    );
+  });
+});
+
 describe("adopting a database from a volume's root", () => {
   // A directory tree as a set of paths; renaming a directory takes what is
-  // under it along, as on a filesystem.
+  // under it along, and onto a non-empty directory fails, as on a filesystem.
   class FakeFs implements DataDirFs {
     present: Set<string>;
     renames: [string, string][] = [];
@@ -122,6 +167,14 @@ describe("adopting a database from a volume's root", () => {
         this.failAt = -1;
         throw new Error(`EIO: rename '${from}'`);
       }
+      for (const p of this.present) {
+        if (p.startsWith(`${to}/`)) {
+          throw Object.assign(
+            new Error(`ENOTEMPTY: directory not empty, rename '${from}'`),
+            { code: "ENOTEMPTY" },
+          );
+        }
+      }
       this.renames.push([from, to]);
       for (const p of [...this.present]) {
         if (p === from || p.startsWith(`${from}/`)) {
@@ -129,6 +182,7 @@ describe("adopting a database from a volume's root", () => {
           this.present.add(`${to}${p.slice(from.length)}`);
         }
       }
+      this.present.add(to);
     }
     async mkdir(p: string) {
       this.made.push(p);
@@ -137,7 +191,8 @@ describe("adopting a database from a volume's root", () => {
   }
   const ROOT = CONFIG;
   // What a whole-volume mount left: QuestDB's database at the root of the
-  // Signal K volume, next to security.json.
+  // Signal K volume, next to security.json, each directory carrying the
+  // file QuestDB writes there.
   const OLD_LAYOUT = [
     `${ROOT}/db`,
     `${ROOT}/db/_tab_index.d`,
@@ -145,7 +200,9 @@ describe("adopting a database from a volume's root", () => {
     `${ROOT}/conf`,
     `${ROOT}/conf/server.conf`,
     `${ROOT}/public`,
-    `${ROOT}/.checkpoint`,
+    `${ROOT}/public/version.txt`,
+    `${ROOT}/public/index.html`,
+    `${ROOT}/import`,
     `${ROOT}/security.json`,
     `${ROOT}/plugin-config-data`,
     `${ROOT}/plugin-config-data/signalk-grafana`,
@@ -156,18 +213,37 @@ describe("adopting a database from a volume's root", () => {
   test("a database at the volume root moves into the data directory", async () => {
     const fs = new FakeFs(OLD_LAYOUT);
     const moved = await adoptDatabaseFromVolumeRoot(fs, ROOT, DATA);
-    assert.deepStrictEqual(moved, ["conf", "public", ".checkpoint", "db"]);
+    assert.deepStrictEqual(moved, ["conf", "public", "db"]);
     assert.deepStrictEqual(fs.made, [DATA]);
     assert.deepStrictEqual(fs.renames, [
       [`${ROOT}/conf`, `${DATA}/conf`],
       [`${ROOT}/public`, `${DATA}/public`],
-      [`${ROOT}/.checkpoint`, `${DATA}/.checkpoint`],
       [`${ROOT}/db`, `${DATA}/db`],
     ]);
     assert.ok(fs.present.has(`${DATA}/db/signalk~7`));
+    assert.ok(fs.present.has(`${DATA}/public/index.html`));
     assert.ok(fs.present.has(`${ROOT}/security.json`));
     assert.ok(fs.present.has(`${ROOT}/plugin-config-data/signalk-grafana`));
     assert.ok(!fs.present.has(`${ROOT}/db`));
+  });
+
+  // The names are generic: a `public` at Signal K's root without QuestDB's
+  // file in it is somebody else's, and so is a bare `import`.
+  test("a same-named directory without QuestDB's file stays at the root", async () => {
+    const fs = new FakeFs([
+      `${ROOT}/db`,
+      `${ROOT}/db/_tab_index.d`,
+      `${ROOT}/conf`,
+      `${ROOT}/conf/server.conf`,
+      `${ROOT}/public`,
+      `${ROOT}/public/index.html`,
+      `${ROOT}/import`,
+      `${ROOT}/import/boat.csv`,
+    ]);
+    const moved = await adoptDatabaseFromVolumeRoot(fs, ROOT, DATA);
+    assert.deepStrictEqual(moved, ["conf", "db"]);
+    assert.ok(fs.present.has(`${ROOT}/public/index.html`));
+    assert.ok(fs.present.has(`${ROOT}/import/boat.csv`));
   });
 
   // A start that fails part-way through the move must not strand the tables
@@ -178,16 +254,15 @@ describe("adopting a database from a volume's root", () => {
     fs.failAt = 1;
     await assert.rejects(
       () => adoptDatabaseFromVolumeRoot(fs, ROOT, DATA),
-      /EIO/,
+      /could not be moved.*EIO/,
     );
     assert.deepStrictEqual(fs.renames, [[`${ROOT}/conf`, `${DATA}/conf`]]);
     assert.ok(fs.present.has(`${ROOT}/db/_tab_index.d`));
 
     const moved = await adoptDatabaseFromVolumeRoot(fs, ROOT, DATA);
-    assert.deepStrictEqual(moved, ["public", ".checkpoint", "db"]);
+    assert.deepStrictEqual(moved, ["public", "db"]);
     assert.deepStrictEqual(fs.renames.slice(1), [
       [`${ROOT}/public`, `${DATA}/public`],
-      [`${ROOT}/.checkpoint`, `${DATA}/.checkpoint`],
       [`${ROOT}/db`, `${DATA}/db`],
     ]);
     assert.ok(fs.present.has(`${DATA}/conf/server.conf`));
@@ -201,17 +276,33 @@ describe("adopting a database from a volume's root", () => {
     );
   });
 
-  test("an entry already at the destination stays where it is", async () => {
+  // An empty `db` in the data directory is no database; `rename` replaces
+  // an empty directory, so the root's tables still come across.
+  test("an empty db directory at the destination is replaced", async () => {
+    const fs = new FakeFs([...OLD_LAYOUT, DATA, `${DATA}/db`]);
+    const moved = await adoptDatabaseFromVolumeRoot(fs, ROOT, DATA);
+    assert.deepStrictEqual(moved, ["conf", "public", "db"]);
+    assert.ok(fs.present.has(`${DATA}/db/_tab_index.d`));
+    assert.ok(!fs.present.has(`${ROOT}/db`));
+  });
+
+  // Something else in the way — not QuestDB's, not empty — is a conflict
+  // that fails the start, rather than leaving the tables behind unnoticed.
+  test("a non-empty db directory without QuestDB's file at the destination is a conflict", async () => {
     const fs = new FakeFs([
       ...OLD_LAYOUT,
-      `${DATA}/conf`,
-      `${DATA}/conf/server.conf`,
+      DATA,
+      `${DATA}/db`,
+      `${DATA}/db/notes.txt`,
     ]);
-    const moved = await adoptDatabaseFromVolumeRoot(fs, ROOT, DATA);
-    assert.deepStrictEqual(moved, ["public", ".checkpoint", "db"]);
-    assert.ok(fs.present.has(`${ROOT}/conf/server.conf`));
-    assert.ok(fs.present.has(`${DATA}/conf/server.conf`));
-    assert.ok(fs.present.has(`${DATA}/db/_tab_index.d`));
+    await assert.rejects(
+      () => adoptDatabaseFromVolumeRoot(fs, ROOT, DATA),
+      (err: Error) =>
+        /QuestDB's db at .* could not be moved into/.test(err.message) &&
+        /ENOTEMPTY/.test(err.message),
+    );
+    assert.ok(fs.present.has(`${ROOT}/db/_tab_index.d`));
+    assert.ok(fs.present.has(`${DATA}/db/notes.txt`));
   });
 
   test("a root without a database is left alone", async () => {
