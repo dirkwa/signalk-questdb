@@ -302,6 +302,26 @@ describe("adopting a database from a volume's root", () => {
     );
   });
 
+  // QuestDB's file in the same entry at both places is not an interrupted
+  // move — a finished rename leaves nothing behind — and once `db` is across
+  // nothing looks at the root again. Nothing moves; the start fails.
+  test("an entry QuestDB has at both places is a conflict before anything moves", async () => {
+    const fs = new FakeFs([
+      ...OLD_LAYOUT,
+      DATA,
+      `${DATA}/public`,
+      `${DATA}/public/version.txt`,
+    ]);
+    await assert.rejects(
+      () => adoptDatabaseFromVolumeRoot(fs, ROOT, DATA),
+      (err: Error) => /QuestDB's public exists at both/.test(err.message),
+    );
+    assert.deepStrictEqual(fs.renames, []);
+    assert.deepStrictEqual(fs.made, []);
+    assert.ok(fs.present.has(`${ROOT}/conf/server.conf`));
+    assert.ok(fs.present.has(`${ROOT}/db/_tab_index.d`));
+  });
+
   // An empty `db` in the data directory is no database; `rename` replaces
   // an empty directory, so the root's tables still come across.
   test("an empty db directory at the destination is replaced", async () => {

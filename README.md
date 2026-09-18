@@ -766,7 +766,7 @@ How it reaches the container differs:
 QuestDB's entrypoint makes its data root its own on start, so the plugin keeps
 the one file it writes alongside — the import checkpoint,
 `signalk-questdb.influx-import-checkpoint.json` — next to the directory rather
-than in it. A purge removes it with the data.
+than in it. A purge removes it, whether or not the data could be deleted.
 
 ## Grafana Integration
 

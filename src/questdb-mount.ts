@@ -216,11 +216,14 @@ export async function databaseWaitsAtVolumeRoot(
  * Only when the root holds a QuestDB database (`db/_tab_index.d`) and the
  * data directory holds none: anything else is not that situation and is left
  * alone. Each entry moves on its own, so a move interrupted part-way is
- * finished by the next call: an entry already across is skipped, and `db`
- * moves last. A destination that exists without QuestDB's file is replaced
- * if empty — that is what `rename` does — and a conflict otherwise, which
- * fails the start rather than leaving the database behind unnoticed.
- * Returns the entries moved.
+ * finished by the next call: an entry no longer at the root is done, and
+ * `db` moves last. An entry QuestDB has at both places is a duplicate, not
+ * an interruption — a completed rename leaves nothing behind — and once `db`
+ * has moved nothing would look at the root again, so it is a conflict that
+ * fails the start before anything moves. A destination that exists without
+ * QuestDB's file is replaced if empty — that is what `rename` does — and a
+ * conflict otherwise, which fails the start rather than leaving the
+ * database behind unnoticed. Returns the entries moved.
  */
 export async function adoptDatabaseFromVolumeRoot(
   fs: DataDirFs,
@@ -228,13 +231,21 @@ export async function adoptDatabaseFromVolumeRoot(
   dataDir: string,
 ): Promise<string[]> {
   if (!(await databaseWaitsAtVolumeRoot(fs, volumeRoot, dataDir))) return [];
-  await fs.mkdir(dataDir);
-  const moved: string[] = [];
+  const pending: { name: string; from: string; to: string }[] = [];
   for (const { name, mark } of QUESTDB_ROOT_ENTRIES) {
     const from = path.join(volumeRoot, name);
     const to = path.join(dataDir, name);
     if (!(await fs.exists(path.join(from, mark)))) continue;
-    if (await fs.exists(path.join(to, mark))) continue;
+    if (await fs.exists(path.join(to, mark))) {
+      throw new Error(
+        `QuestDB's ${name} exists at both ${volumeRoot} and ${dataDir}; remove one of them`,
+      );
+    }
+    pending.push({ name, from, to });
+  }
+  await fs.mkdir(dataDir);
+  const moved: string[] = [];
+  for (const { name, from, to } of pending) {
     try {
       await fs.rename(from, to);
     } catch (err) {
