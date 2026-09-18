@@ -223,6 +223,18 @@ export interface MigrationContextsResponse extends ApiError {
   self?: string;
 }
 
+/**
+ * GET /api/migration/legacy-rows: rows an import made before 2.1.5 filed under
+ * suffixed paths, and POST /api/migration/legacy-rows/remove: how many it
+ * removed.
+ */
+export interface LegacyImportRowsResponse extends ApiError {
+  rows: number;
+  /** After a removal: live samples the writer's cap discarded while it was
+   * held for the table swap. Normally 0. */
+  dropped?: number;
+}
+
 /** Per-run counters, also the shape the panel renders as progress. */
 export interface MigrationProgress {
   /** Rows read from InfluxDB. */

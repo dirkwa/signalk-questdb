@@ -45,6 +45,10 @@ import type {
   WrittenTail,
 } from "./migration-checkpoint.js";
 import {
+  countLegacyImportRows,
+  removeLegacyImportRows,
+} from "./migration-cleanup.js";
+import {
   WalMonitor,
   buildPendingSegmentsSQL,
   computeSkipPlan,
@@ -67,6 +71,7 @@ import {
 import { nofileClampSatisfied, readMaxMapCount } from "./host-limits.js";
 import type {
   DbStatus,
+  LegacyImportRowsResponse,
   MigrationDetectResponse,
   MigrationBucketsResponse,
   MigrationContextsResponse,
@@ -202,6 +207,22 @@ export default (app: App) => {
   // no writer to resume it onto. A restart therefore forgets it, and re-running
   // is safe because imported rows upsert on (ts, path, context, source).
   let activeMigration: MigrationRun | null = null;
+  // While the string table is being rebuilt — or a rebuild that failed after
+  // its swap is being finished — nothing may import into it, and the schema
+  // heal must keep its hands off it.
+  let legacyCleanupRunning = false;
+  // The rebuild in flight, so stop() can wait for it: disconnecting the
+  // writer while it is held would drop the held lines, and a swap left half
+  // done is work for the next run rather than a loss, but still work.
+  let legacyCleanup: Promise<unknown> | null = null;
+  // A heal in progress drops and recreates a mismatched table; the rebuild
+  // waits it out rather than rename underneath it.
+  const awaitHealIdle = async (): Promise<void> => {
+    for (let waited = 0; healing && waited < 30_000; waited += 100) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (healing) throw new Error("A schema repair is in progress; try again");
+  };
   let migrationCounter = 0;
   let queryClient: QueryClient | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
@@ -328,6 +349,10 @@ export default (app: App) => {
   // anyway. After this it forces its teardown through even if a hung start
   // never released the lock (see PURGE_LOCK_TIMEOUT_MS use below).
   const PURGE_LOCK_TIMEOUT_MS = 30000;
+  // A rebuild of the string table waits this long for the lifecycle lock. A
+  // wedged start pins the lock (see PURGE_LOCK_TIMEOUT_MS); unlike a purge
+  // the rebuild then gives up rather than proceed, since it is optional.
+  const LEGACY_CLEANUP_LOCK_TIMEOUT_MS = 30000;
 
   // Record a clamp event so /api/status and the config-panel banner can
   // surface it. (The plugin status line is not used — it is driven by the
@@ -366,7 +391,10 @@ export default (app: App) => {
   // is rebuilt with the correct `ts` schema. Best-effort: introspection/heal
   // errors are logged, not thrown, so they never break the lifecycle.
   const healSchemaTables = async (): Promise<void> => {
-    if (!queryClient || healing) return;
+    // Not while the string table is being rebuilt: the rebuild renames it
+    // away for a moment, and a heal finding it absent would create a fresh
+    // one for the rebuilt table to then collide with.
+    if (!queryClient || healing || legacyCleanupRunning) return;
     healing = true;
     try {
       let mismatch = false;
@@ -1512,6 +1540,10 @@ export default (app: App) => {
       // (e.g. a switch to external/unmanaged mode that never calls ensureRunning).
       ulimitClamp = null;
 
+      // A rebuild of the string table first: its hold keeps the writer's last
+      // lines back, and disconnecting under it would lose them.
+      if (legacyCleanup) await legacyCleanup.catch(() => {});
+
       // Stop any import before the writer goes away: runMigration holds a
       // direct reference to it, so a run left going would keep enqueueing
       // lines onto a disconnected writer for as long as its read loop lasts.
@@ -1877,6 +1909,15 @@ export default (app: App) => {
 
       router.post("/api/update/apply", async (_req, res) => {
         try {
+          // Not under a rebuild of the string table: it holds the writer
+          // across a swap, and an update tears the writer down.
+          if (legacyCleanupRunning) {
+            res.status(409).json({
+              error:
+                "The string table is being rebuilt; wait for it to finish first",
+            });
+            return;
+          }
           // Captured at route entry, before ANY await: a stop() that lands
           // during the release fetch below must already invalidate this
           // update, not just one that lands after the lock is acquired.
@@ -2393,6 +2434,15 @@ export default (app: App) => {
 
       router.post("/api/purge-data", async (_req, res) => {
         try {
+          // Not under a rebuild of the string table: it holds the writer
+          // across a swap, and this tears the writer down.
+          if (legacyCleanupRunning) {
+            res.status(409).json({
+              error:
+                "The string table is being rebuilt; wait for it to finish first",
+            });
+            return;
+          }
           // External mode is a config fact independent of the runtime, so
           // answer it first — an external-mode install without signalk-container
           // should get the clear 400, not a 503 about a missing container
@@ -2780,6 +2830,12 @@ export default (app: App) => {
           } satisfies MigrationStatusResponse);
           return;
         }
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The string table is being rebuilt; try again in a moment",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
 
         const posted = (req.body ?? {}) as Record<string, unknown>;
         const stored = await checkpoints.load();
@@ -2994,11 +3050,18 @@ export default (app: App) => {
           });
         }
 
-        // The await above yielded; another start may have got in.
+        // The awaits above yielded; another start, or a rebuild of the string
+        // table, may have got in.
         if (activeMigration && activeMigration.state === "running") {
           res.status(409).json({
             error: "A migration is already running",
             run: migrationRunView(activeMigration),
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The string table is being rebuilt; try again in a moment",
           } satisfies MigrationStatusResponse);
           return;
         }
@@ -3056,6 +3119,127 @@ export default (app: App) => {
           run: activeMigration ? migrationRunView(activeMigration) : undefined,
           interrupted: stored ? interruptedView(stored) : undefined,
         } satisfies MigrationStatusResponse);
+      });
+
+      // What an import made before 2.1.5 left under suffixed paths. Counted
+      // on request rather than at start: it is a scan of the string table,
+      // and a one-time question.
+      router.get("/api/migration/legacy-rows", async (_req, res) => {
+        if (!queryClient) {
+          res.status(503).json({
+            error: "QuestDB not connected",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        // Counting also finishes a rebuild that failed after its swap, which
+        // must not run alongside one in progress — so it takes the same flag.
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The rows are being removed",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        legacyCleanupRunning = true;
+        try {
+          await awaitHealIdle();
+          res.json({
+            rows: await countLegacyImportRows(queryClient),
+          } satisfies LegacyImportRowsResponse);
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+        } finally {
+          legacyCleanupRunning = false;
+        }
+      });
+
+      // Rebuilds the string table without those rows. Not while an import is
+      // writing to it: the rebuild would race the import for the table.
+      router.post("/api/migration/legacy-rows/remove", async (_req, res) => {
+        if (!pluginRunning || !queryClient || !writer) {
+          res.status(503).json({
+            error: "QuestDB not connected",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        if (activeMigration && activeMigration.state === "running") {
+          res.status(409).json({
+            error: "An import is running; wait for it or cancel it first",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        if (legacyCleanupRunning) {
+          res.status(409).json({
+            error: "The rows are already being removed",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        legacyCleanupRunning = true;
+        // Under the lifecycle lock, like the update and the purge teardown:
+        // neither can then disconnect the writer while a swap holds it. The
+        // route-entry checks above and in those handlers only fail fast; this
+        // is the exclusion. (A purge that has waited its 30 s for the lock
+        // proceeds regardless, by design — it discards the data anyway.)
+        //
+        // Bounded: a wedged start pins the lock, and a rebuild queued behind
+        // it would hang this request and keep the flag set for good. Past the
+        // timeout the request fails, and the queued callback is abandoned so
+        // it cannot run later, unasked, once the lock frees.
+        let acquired = false;
+        let abandoned = false;
+        const rebuild = withLifecycleLock(async () => {
+          if (abandoned) return null;
+          acquired = true;
+          if (!queryClient || !writer) {
+            throw new Error("QuestDB not connected");
+          }
+          await awaitHealIdle();
+          return removeLegacyImportRows(queryClient, writer);
+        });
+        const lockTimeout = new Promise<never>((_, reject) => {
+          const timer = setTimeout(() => {
+            if (acquired) return;
+            abandoned = true;
+            reject(
+              new Error(
+                "The plugin is busy starting or updating; try again in a moment",
+              ),
+            );
+          }, LEGACY_CLEANUP_LOCK_TIMEOUT_MS);
+          void rebuild.then(
+            () => clearTimeout(timer),
+            () => clearTimeout(timer),
+          );
+        });
+        // What stop() waits for is the bounded request, not the queued
+        // callback: behind a wedged start, the latter would hold stop() too.
+        const bounded = Promise.race([rebuild, lockTimeout]);
+        legacyCleanup = bounded;
+        try {
+          const result = await bounded;
+          if (result === null) throw new Error("The rebuild did not run");
+          res.json({
+            rows: result.removed,
+            dropped: result.dropped,
+          } satisfies LegacyImportRowsResponse);
+        } catch (err) {
+          // Busy is a 409, like the other lifecycle refusals; a rebuild that
+          // ran and failed is a 500.
+          res.status(abandoned ? 409 : 500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+        } finally {
+          legacyCleanupRunning = false;
+          if (legacyCleanup === bounded) legacyCleanup = null;
+        }
       });
 
       // Start over: forget the stopped import, so the next start is a new one.

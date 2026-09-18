@@ -31,6 +31,7 @@ import {
 import { S } from "./styles.js";
 import {
   formatDateTime,
+  toLegacyImportRows,
   toMigrationBuckets,
   toMigrationContexts,
   toMigrationInterrupted,
@@ -220,6 +221,10 @@ export default function PluginConfigurationPanel({
     MigrationStatusResponse["run"] | null
   >(null);
   const [migrationStarting, setMigrationStarting] = useState(false);
+  // Rows an import made before 2.1.5 filed under suffixed paths. Counted
+  // once when the panel opens; null until then.
+  const [legacyRows, setLegacyRows] = useState<number | null>(null);
+  const [legacyRemoving, setLegacyRemoving] = useState(false);
   const [migrationInterrupted, setMigrationInterrupted] = useState<
     MigrationStatusResponse["interrupted"] | null
   >(null);
@@ -826,6 +831,68 @@ export default function PluginConfigurationPanel({
       clearTimeout(timer);
     };
   }, [migrationRun?.state]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(
+          "/plugins/signalk-questdb/api/migration/legacy-rows",
+        );
+        const { rows } = toLegacyImportRows(await res.json().catch(() => null));
+        if (!cancelled && res.ok) setLegacyRows(rows);
+      } catch {
+        // Nothing to offer; the count is a convenience, not a requirement.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const removeLegacyRows = async () => {
+    if (!legacyRows) return;
+    if (
+      !window.confirm(
+        `Remove ${formatNumber(legacyRows)} rows imported under suffixed paths?\n\n` +
+          "This rebuilds the string table without them, which can take a few " +
+          "minutes on a large database. Recording continues meanwhile. " +
+          "Run the import again afterwards to get these rows under their " +
+          "real paths.",
+      )
+    )
+      return;
+    setLegacyRemoving(true);
+    setActionStatus("");
+    setStatusError(false);
+    try {
+      const res = await fetch(
+        "/plugins/signalk-questdb/api/migration/legacy-rows/remove",
+        { method: "POST" },
+      );
+      const body = await res.json().catch(() => null);
+      if (res.ok) {
+        const { rows, dropped } = toLegacyImportRows(body);
+        setLegacyRows(0);
+        setActionStatus(
+          `Removed ${formatNumber(rows)} rows. Run the import again to get them under their real paths.` +
+            (dropped > 0
+              ? ` ${formatNumber(dropped)} live samples could not be kept while the table was swapped.`
+              : ""),
+        );
+        if (dropped > 0) setStatusError(true);
+      } else {
+        setActionStatus(
+          (body as ApiError | null)?.error ?? "Could not remove the rows.",
+        );
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus("Could not remove the rows: " + errorMessage(e));
+      setStatusError(true);
+    }
+    setLegacyRemoving(false);
+  };
 
   // Pick up a run that was already going when the panel mounted (a reload
   // mid-import, or a second browser tab).
@@ -1716,6 +1783,43 @@ export default function PluginConfigurationPanel({
       </CollapsibleSection>
 
       <CollapsibleSection title="InfluxDB Migration">
+        {legacyRows !== null && legacyRows > 0 && (
+          <div
+            style={{
+              ...S.empty,
+              padding: "12px",
+              textAlign: "left",
+              marginBottom: 12,
+            }}
+          >
+            <div>
+              <strong>
+                {formatNumber(legacyRows)} rows from an earlier import
+              </strong>{" "}
+              sit under paths nothing reads
+            </div>
+            <div style={S.fieldHelp}>
+              Imports made before 2.1.5 from a signalk-to-influxdb 1.x database
+              filed strings, booleans and positions under paths ending in{" "}
+              <code>.stringValue</code>, <code>.boolValue</code> or{" "}
+              <code>.jsonValue</code>. Removing them rebuilds the string table
+              without them; run the import again afterwards and they land under
+              their real paths.
+            </div>
+            <div style={{ ...S.migrationActions, marginTop: 10 }}>
+              <Button
+                variant="danger"
+                busy={legacyRemoving}
+                busyLabel="Removing..."
+                disabled={migrationRun?.state === "running"}
+                onClick={removeLegacyRows}
+              >
+                Remove these rows
+              </Button>
+            </div>
+          </div>
+        )}
+
         {migrationInterrupted && migrationRun?.state !== "running" && (
           <div
             style={{

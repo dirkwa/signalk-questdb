@@ -774,3 +774,67 @@ describe("ILPWriter atCapacity", () => {
     assert.equal(writer.droppedLineCount, 1);
   });
 });
+
+describe("ILPWriter hold", () => {
+  // While a table is swapped out from under the writer, a line that reached
+  // QuestDB would make it create a fresh table with the wrong schema. Held
+  // lines wait in the buffer and go out on release.
+  it("keeps lines back until release, then sends them", async () => {
+    const received: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on("data", (d) => received.push(d.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 50,
+    });
+    await writer.connect();
+    try {
+      // What is buffered at the hold goes out with it: the last line written
+      // before the hold is the last line sent.
+      writer.write("before.hold", "self", 0, new Date());
+      writer.hold();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.ok(received.join("").includes("before.hold"), "flushed on hold");
+
+      writer.write("a.b", "self", 1, new Date());
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.ok(!received.join("").includes("a.b"), "a held line was sent");
+      assert.equal(writer.pendingLines, 1);
+
+      writer.release();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.ok(received.join("").includes("a.b"), "released line not sent");
+    } finally {
+      await writer.disconnect();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe("ILPWriter timestamp watch", () => {
+  it("reports the oldest timestamp written while it ran, then stops", () => {
+    const writer = new ILPWriter("127.0.0.1", 1);
+    writer.write("a.b", "self", 0, new Date("2024-01-01T00:00:00Z"));
+    assert.equal(writer.endTimestampWatch(), null, "nothing without a watch");
+
+    writer.startTimestampWatch();
+    writer.writeAtNanos("a.b", "self", 1, 1_700_000_000_000_000_000n);
+    writer.writeString("a.c", "self", "x", new Date("2020-06-01T00:00:00Z"));
+    writer.writePositionAtNanos(
+      "self",
+      { latitude: 1, longitude: 2 },
+      1_650_000_000_000_000_000n,
+    );
+    assert.equal(
+      writer.endTimestampWatch(),
+      BigInt(Date.parse("2020-06-01T00:00:00Z")) * 1_000_000n,
+    );
+    // The watch is over: what is written now is not reported.
+    writer.writeAtNanos("a.b", "self", 1, 1n);
+    assert.equal(writer.endTimestampWatch(), null);
+  });
+});

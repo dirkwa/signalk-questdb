@@ -72,6 +72,9 @@ export class ILPWriter {
   private connected = false;
   private connecting = false;
   private stopped = false;
+  private held = false;
+  private watchingTimestamps = false;
+  private oldestWatched: bigint | null = null;
   // Last timestamp handed out, in nanoseconds. Rows are stamped at write time
   // with the server clock (see the delta handler), but `Date` is only
   // millisecond-resolution while the `signalk`/`signalk_str` tables dedup on
@@ -333,6 +336,7 @@ export class ILPWriter {
     const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     this.enqueue(
       `signalk,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag} value=${value} ${tsNanos}\n`,
+      tsNanos,
     );
   }
 
@@ -348,6 +352,7 @@ export class ILPWriter {
     const kindTag = kind ? `,value_kind=${escapeTag(kind)}` : "";
     this.enqueue(
       `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag}${kindTag} value_str="${escapeFieldString(value)}" ${tsNanos}\n`,
+      tsNanos,
     );
   }
 
@@ -360,6 +365,7 @@ export class ILPWriter {
     const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     this.enqueue(
       `signalk_position,context=${escapeTag(context)}${sourceTag} lat=${position.latitude},lon=${position.longitude} ${tsNanos}\n`,
+      tsNanos,
     );
   }
 
@@ -398,6 +404,7 @@ export class ILPWriter {
     const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     this.enqueue(
       `signalk,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag} value=${value} ${ts}\n`,
+      ts,
     );
   }
 
@@ -419,6 +426,7 @@ export class ILPWriter {
     const kindTag = kind ? `,value_kind=${escapeTag(kind)}` : "";
     this.enqueue(
       `signalk_str,path=${escapeTag(path)},context=${escapeTag(context)}${sourceTag}${kindTag} value_str="${escapeFieldString(value)}" ${ts}\n`,
+      ts,
     );
   }
 
@@ -434,12 +442,19 @@ export class ILPWriter {
     const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     this.enqueue(
       `signalk_position,context=${escapeTag(context)}${sourceTag} lat=${position.latitude},lon=${position.longitude} ${ts}\n`,
+      ts,
     );
   }
 
-  private enqueue(line: string): void {
+  private enqueue(line: string, tsNanos: bigint): void {
     this.buffer.push(line);
     this.totalEnqueuedLines++;
+    if (
+      this.watchingTimestamps &&
+      (this.oldestWatched === null || tsNanos < this.oldestWatched)
+    ) {
+      this.oldestWatched = tsNanos;
+    }
     this.enforceBufferCap();
     if (this.buffer.length >= FLUSH_BATCH_SIZE) {
       this.flush();
@@ -490,6 +505,49 @@ export class ILPWriter {
   }
 
   /**
+   * From now on, note the oldest timestamp of the lines written.
+   *
+   * A caller that copies a table while the writer keeps writing into it needs
+   * to know how far back the rows it must carry over can reach, and only the
+   * writer sees the timestamps: a source with a wrong clock records the
+   * present under any date it likes.
+   */
+  startTimestampWatch(): void {
+    this.watchingTimestamps = true;
+    this.oldestWatched = null;
+  }
+
+  /** The oldest timestamp written since the watch began — null if nothing
+   * was — and the end of the watch. */
+  endTimestampWatch(): bigint | null {
+    this.watchingTimestamps = false;
+    const oldest = this.oldestWatched;
+    this.oldestWatched = null;
+    return oldest;
+  }
+
+  /**
+   * Send what is buffered, then keep further lines back until release().
+   *
+   * For the seconds a table is swapped out from under the writer: a line
+   * arriving while the table is absent would have QuestDB create a fresh one
+   * with the wrong schema, and the swap would then fail against it. Flushing
+   * first makes the last line written before the hold the last line sent, so
+   * a caller that wrote a marker can wait for QuestDB to show it and know
+   * everything before it has arrived too. Lines keep being accepted and the
+   * buffer cap keeps applying, so a hold must be short.
+   */
+  hold(): void {
+    this.flush();
+    this.held = true;
+  }
+
+  release(): void {
+    this.held = false;
+    this.flush();
+  }
+
+  /**
    * Whether the next enqueue would push the cap and discard the oldest line.
    * A bulk writer that must never write behind a gap checks this first: the
    * check and its write run without yielding, so nothing can fill the buffer
@@ -510,6 +568,7 @@ export class ILPWriter {
   }
 
   private flush(): void {
+    if (this.held) return;
     if (!this.connected || !this.socket || this.buffer.length === 0) return;
 
     const data = this.buffer.join("");
