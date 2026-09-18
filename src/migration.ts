@@ -1110,7 +1110,7 @@ export async function runMigration(
     if (!run.isCancelled) {
       const mark = writer.enqueuedLineCount;
       let waited = 0;
-      for (;;) {
+      while (!run.isCancelled) {
         failOnDrops();
         const settled =
           mark === undefined ||

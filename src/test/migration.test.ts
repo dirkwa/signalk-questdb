@@ -2437,6 +2437,26 @@ describe("resuming an import", () => {
     assert.ok(checkpoints.current.done.length < 3);
   });
 
+  test("a cancel during the final wait ends it as a cancel", async () => {
+    const checkpoints = new MemoryCheckpoints();
+    const run = new MigrationRun("r", "http://x", "db");
+    let answers = 0;
+    await runMigration(resumeRequest(), new SettledWriter(), run, {
+      fetchImpl: dailySource().fetchImpl,
+      checkpoints,
+      checkpointLagMs: 0,
+      sleep: async () => {},
+      confirmStored: async () => {
+        // Positions confirm; the final rows never do, and the user gives up.
+        if (++answers > 3) run.cancel();
+        return answers <= 3;
+      },
+    });
+    assert.strictEqual(run.state, "cancelled");
+    assert.strictEqual(run.error, undefined);
+    assert.ok(checkpoints.current, "the saved position was cleared");
+  });
+
   test("done waits for the last rows to leave the writer", async () => {
     const writer = new SettledWriter();
     // Everything enqueued is still in the writer until a sleep lets it go.
