@@ -2296,6 +2296,104 @@ describe("resuming an import", () => {
     assert.strictEqual(run.progress.measurementsDone, 0);
   });
 
+  // Writing on after a drop would leave a gap with a complete window behind
+  // it, and the row that closes that window would then vouch for rows that
+  // were never stored. So a drop ends the run where it happens.
+  test("a dropped line stops the import at once, not at its end", async () => {
+    const source = dailySource();
+    const checkpoints = new MemoryCheckpoints();
+    const writer = Object.assign(new SettledWriter(), { droppedLineCount: 0 });
+    const write = writer.writeAtNanos.bind(writer);
+    writer.writeAtNanos = (...args) => {
+      write(...args);
+      if (writer.numbers.length === 2) writer.droppedLineCount = 1;
+    };
+    const run = new MigrationRun("r", "http://x", "db");
+    await runMigration(resumeRequest(), writer, run, {
+      fetchImpl: source.fetchImpl,
+      checkpoints,
+      checkpointLagMs: 0,
+    });
+
+    assert.strictEqual(run.state, "failed");
+    assert.match(run.error ?? "", /dropped/);
+    // Two of twelve windows were read: the one with the drop, and no more.
+    assert.strictEqual(source.requests.length, 2);
+    // And nothing was saved past it.
+    assert.ok(
+      !checkpoints.current || checkpoints.current.done.length === 0,
+      "a position was saved after the drop",
+    );
+  });
+
+  // Within one batch too: the rows after a drop must not be written, or the
+  // window's last row could land in QuestDB behind a gap.
+  test("no row is written after a drop, even within the same batch", async () => {
+    const csv = [
+      "#datatype,string,long,dateTime:RFC3339,double,string",
+      "#group,false,false,false,false,true",
+      "#default,_result,,,,",
+      ",result,table,_time,_value,_field",
+      ",,0,2024-03-01T12:00:00Z,1,value",
+      ",,0,2024-03-01T12:00:01Z,2,value",
+      ",,0,2024-03-01T12:00:02Z,3,value",
+      ",,0,2024-03-01T12:00:03Z,4,value",
+      ",,0,2024-03-01T12:00:04Z,5,value",
+    ].join("\n");
+    const checkpoints = new MemoryCheckpoints();
+    const writer = Object.assign(new SettledWriter(), { droppedLineCount: 0 });
+    const write = writer.writeAtNanos.bind(writer);
+    writer.writeAtNanos = (...args) => {
+      write(...args);
+      // The writer's cap discards an older line as this one is enqueued.
+      if (writer.numbers.length === 2) writer.droppedLineCount = 1;
+    };
+    const run = new MigrationRun("r", "http://x", "b");
+    await runMigration(
+      { ...streamedRequest("influxdb2"), measurements: ["m"] },
+      writer,
+      run,
+      {
+        fetchImpl: (async () =>
+          new Response(csv, { status: 200 })) as unknown as typeof fetch,
+        checkpoints,
+        checkpointLagMs: 0,
+      },
+    );
+
+    assert.strictEqual(run.state, "failed");
+    assert.deepStrictEqual(
+      writer.numbers.map((n) => n.value),
+      [1, 2],
+      "rows were written after the drop",
+    );
+    assert.strictEqual(checkpoints.current, null);
+  });
+
+  // The write that fills the buffer past its cap is the one behind the gap.
+  // It must be refused before it is enqueued, not noticed afterwards.
+  test("a row is not written into a buffer that is at capacity", async () => {
+    const source = dailySource();
+    const writer = Object.assign(new SettledWriter(), { atCapacity: false });
+    const write = writer.writeAtNanos.bind(writer);
+    writer.writeAtNanos = (...args) => {
+      write(...args);
+      if (writer.numbers.length === 3) writer.atCapacity = true;
+    };
+    const run = new MigrationRun("r", "http://x", "db");
+    await runMigration(resumeRequest(), writer, run, {
+      fetchImpl: source.fetchImpl,
+    });
+
+    assert.strictEqual(run.state, "failed");
+    assert.match(run.error ?? "", /buffer is full/);
+    assert.strictEqual(
+      writer.numbers.length,
+      3,
+      "a row was written into a full buffer",
+    );
+  });
+
   test("a checkpoint that cannot be written does not fail the import", async () => {
     const failing: CheckpointStore = {
       save: async () => {

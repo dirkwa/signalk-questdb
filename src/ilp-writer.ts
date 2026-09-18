@@ -490,6 +490,16 @@ export class ILPWriter {
   }
 
   /**
+   * Whether the next enqueue would push the cap and discard the oldest line.
+   * A bulk writer that must never write behind a gap checks this first: the
+   * check and its write run without yielding, so nothing can fill the buffer
+   * in between.
+   */
+  get atCapacity(): boolean {
+    return this.buffer.length >= this.maxBufferLines;
+  }
+
+  /**
    * Lines the socket has accepted, monotonic and exact — counted when the
    * write completes, not when it is issued, and never for a batch that failed
    * and was re-queued. Unlike `pendingLines`, which estimates the socket's

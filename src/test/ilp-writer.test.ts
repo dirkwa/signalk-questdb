@@ -758,3 +758,19 @@ describe("ILPWriter settledLineCount", () => {
     assert.equal(writer.settledLineCount, 0);
   });
 });
+
+describe("ILPWriter atCapacity", () => {
+  it("is set exactly when the next enqueue would drop a line", () => {
+    const writer = new ILPWriter("127.0.0.1", 1, undefined, {
+      maxBufferLines: 3,
+    });
+    writer.write("a.b", "self", 1, new Date());
+    writer.write("a.b", "self", 2, new Date());
+    assert.equal(writer.atCapacity, false);
+    writer.write("a.b", "self", 3, new Date());
+    assert.equal(writer.atCapacity, true);
+    assert.equal(writer.droppedLineCount, 0, "nothing dropped yet");
+    writer.write("a.b", "self", 4, new Date());
+    assert.equal(writer.droppedLineCount, 1);
+  });
+});

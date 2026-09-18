@@ -94,6 +94,12 @@ export function sameIdentity(
  * ILP is one ordered stream, and QuestDB applies a table's WAL in order, so if
  * this row can be read back, every row written to that table before it has
  * been committed and applied — which is what a saved position promises.
+ *
+ * The row may have been written by an earlier run of the same import; the
+ * key is the same and the value is the same. That is still proof, because an
+ * import stops at its first dropped line and a lost connection loses a
+ * suffix: no run ever leaves a window's last row in QuestDB without the
+ * whole window before it.
  */
 export interface WrittenTail {
   context: string;

@@ -791,6 +791,7 @@ export async function runMigration(
     readonly droppedLineCount?: number;
     readonly enqueuedLineCount?: number;
     readonly settledLineCount?: number;
+    readonly atCapacity?: boolean;
   },
   run: MigrationRun,
   deps: {
@@ -836,6 +837,37 @@ export async function runMigration(
   // The writer's drop counter is monotonic and shared with the live recorder,
   // so only the delta across this run is attributable to it.
   const droppedAtStart = writer.droppedLineCount ?? 0;
+  // The writer drops the OLDEST buffered lines when its cap is hit — while
+  // disconnected, or when QuestDB cannot keep up. Those rows were counted as
+  // written but never reached the database, so the run must not go on as if
+  // they had, and must not end as a success: the whole point of an import is
+  // knowing what actually landed.
+  //
+  // Checked before every row is written, not only at the end, and that is
+  // load-bearing for resume. A run that stops at its first drop never writes
+  // anything after a gap, so a window's last row, wherever it came from, is
+  // only ever in QuestDB with the whole window before it — which is what lets
+  // a saved position be confirmed by reading that row back, even one an
+  // earlier run wrote. Before the write rather than after: a drop registered
+  // while the run waited for the writer would otherwise be followed by one
+  // more row.
+  const failOnDrops = (): void => {
+    const droppedByWriter = (writer.droppedLineCount ?? 0) - droppedAtStart;
+    if (droppedByWriter > 0) {
+      throw new Error(
+        `QuestDB could not keep up: ${droppedByWriter} buffered rows were dropped before reaching the database. ` +
+          `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
+      );
+    }
+    // A write into a full buffer would itself cause the drop — and be the
+    // row behind the gap. Refused instead, before it is enqueued.
+    if (writer.atCapacity) {
+      throw new Error(
+        `QuestDB could not keep up: the writer's buffer is full. ` +
+          `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
+      );
+    }
+  };
 
   try {
     // Checked BEFORE discovery: listMeasurements is a network round trip, and
@@ -1030,6 +1062,7 @@ export async function runMigration(
               sinceDrainCheck = 0;
               await awaitDrain();
             }
+            failOnDrops();
             run.progress.read++;
             const written = writeRow(
               row,
@@ -1042,6 +1075,9 @@ export async function runMigration(
             if (written) run.progress.written++;
             else run.progress.skipped++;
           }
+          // Again after the batch, so a drop on its last row ends the run
+          // here rather than after the next window has been requested.
+          failOnDrops();
         }
 
         // A window left early is not an imported window.
@@ -1063,18 +1099,7 @@ export async function runMigration(
       );
     }
 
-    // The writer drops the OLDEST buffered lines when its cap is hit — while
-    // disconnected, or when QuestDB cannot keep up. Those rows were counted as
-    // written but never reached the database, so a run that ends there is NOT
-    // a clean success and must not be reported as one: the whole point of an
-    // import is knowing what actually landed.
-    const droppedByWriter = (writer.droppedLineCount ?? 0) - droppedAtStart;
-    if (droppedByWriter > 0) {
-      throw new Error(
-        `QuestDB could not keep up: ${droppedByWriter} buffered rows were dropped before reaching the database. ` +
-          `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
-      );
-    }
+    failOnDrops();
 
     run.state = run.isCancelled ? "cancelled" : "done";
     // Nothing left to resume. Kept on a cancel or a failure, which is exactly
