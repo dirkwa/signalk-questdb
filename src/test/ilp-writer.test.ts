@@ -695,3 +695,82 @@ describe("ILPWriter droppedLineCount", () => {
     assert.equal(writer.droppedLineCount, 3, "monotonic across overflows");
   });
 });
+
+describe("ILPWriter enqueuedLineCount", () => {
+  // The import's checkpoint asks whether the rows behind a position have left
+  // the writer: `enqueuedLineCount - pendingLines` lines have. That only holds
+  // if this counts every line once, whatever then happens to it.
+  it("counts every line once, across all three tables and through drops", () => {
+    const writer = new ILPWriter("127.0.0.1", 1, undefined, {
+      maxBufferLines: 3,
+    });
+    assert.equal(writer.enqueuedLineCount, 0);
+    writer.write("a.b", "self", 1, new Date());
+    writer.writeString("a.c", "self", "x", new Date());
+    writer.writePosition("self", { latitude: 1, longitude: 2 }, new Date());
+    assert.equal(writer.enqueuedLineCount, 3);
+    assert.equal(writer.pendingLines, 3);
+
+    // Overflow discards buffered lines; they were still enqueued.
+    writer.write("a.b", "self", 2, new Date());
+    writer.write("a.b", "self", 3, new Date());
+    assert.equal(writer.enqueuedLineCount, 5);
+    assert.equal(writer.droppedLineCount, 2);
+    assert.equal(writer.pendingLines, 3);
+  });
+});
+
+describe("ILPWriter settledLineCount", () => {
+  // The exact half of the checkpoint guard: a line counts as having left only
+  // once the socket has accepted it. Enqueued-but-unsent must not count, or a
+  // checkpoint could be saved ahead of rows that a crash then loses.
+  it("advances when the socket accepts the lines, not when they are enqueued", async () => {
+    const server = net.createServer((socket) => socket.resume());
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 50,
+    });
+    await writer.connect();
+
+    writer.write("a.b", "self", 1, new Date());
+    writer.writeString("a.c", "self", "x", new Date());
+    writer.writePosition("self", { latitude: 1, longitude: 2 }, new Date());
+    assert.equal(writer.enqueuedLineCount, 3);
+    assert.equal(writer.settledLineCount, 0, "nothing has been sent yet");
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(writer.settledLineCount, 3);
+
+    await writer.disconnect();
+    server.close();
+  });
+
+  it("does not count lines that never reached a socket", () => {
+    const writer = new ILPWriter("127.0.0.1", 1, undefined, {
+      maxBufferLines: 3,
+    });
+    for (let i = 0; i < 5; i++) writer.write("a.b", "self", i, new Date());
+    assert.equal(writer.enqueuedLineCount, 5);
+    assert.equal(writer.droppedLineCount, 2);
+    assert.equal(writer.settledLineCount, 0);
+  });
+});
+
+describe("ILPWriter atCapacity", () => {
+  it("is set exactly when the next enqueue would drop a line", () => {
+    const writer = new ILPWriter("127.0.0.1", 1, undefined, {
+      maxBufferLines: 3,
+    });
+    writer.write("a.b", "self", 1, new Date());
+    writer.write("a.b", "self", 2, new Date());
+    assert.equal(writer.atCapacity, false);
+    writer.write("a.b", "self", 3, new Date());
+    assert.equal(writer.atCapacity, true);
+    assert.equal(writer.droppedLineCount, 0, "nothing dropped yet");
+    writer.write("a.b", "self", 4, new Date());
+    assert.equal(writer.droppedLineCount, 1);
+  });
+});

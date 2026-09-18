@@ -17,10 +17,22 @@
 
 import type { ILPWriter } from "./ilp-writer.js";
 import { routeDeltaValue, flattenObjectValue } from "./delta-routing.js";
+import {
+  CheckpointTracker,
+  migrationIdentity,
+  sameIdentity,
+} from "./migration-checkpoint.js";
+import type {
+  CheckpointStore,
+  ConfirmStored,
+  MigrationCheckpoint,
+  WrittenTail,
+} from "./migration-checkpoint.js";
 import type {
   MigrationBucket,
   MigrationMeasurement,
   MigrationProgress,
+  MigrationResumePoint,
   MigrationRunState,
 } from "./api-contract.js";
 
@@ -722,6 +734,7 @@ export interface MigrationRunHandle {
   finishedAt?: string;
   progress: MigrationProgress;
   error?: string;
+  resumedFrom?: MigrationResumePoint;
   cancel(): void;
 }
 
@@ -734,6 +747,7 @@ export class MigrationRun implements MigrationRunHandle {
   startedAt = new Date().toISOString();
   finishedAt?: string;
   error?: string;
+  resumedFrom?: MigrationResumePoint;
   progress: MigrationProgress = {
     read: 0,
     written: 0,
@@ -773,7 +787,12 @@ export async function runMigration(
     | "writeStringAtNanos"
     | "writePositionAtNanos"
     | "pendingLines"
-  > & { readonly droppedLineCount?: number },
+  > & {
+    readonly droppedLineCount?: number;
+    readonly enqueuedLineCount?: number;
+    readonly settledLineCount?: number;
+    readonly atCapacity?: boolean;
+  },
   run: MigrationRun,
   deps: {
     fetchImpl?: typeof fetch;
@@ -782,6 +801,22 @@ export async function runMigration(
     sleep?: (ms: number) => Promise<void>;
     /** Injected so tests don't wait out a real stalled read. */
     readIdleTimeoutMs?: number;
+    /** Where the import's position is kept, so a later run can resume it. */
+    checkpoints?: CheckpointStore;
+    /**
+     * A checkpoint to continue from. Only honoured if it belongs to this same
+     * import — anything else is ignored and the run starts from the beginning.
+     */
+    resumeFrom?: MigrationCheckpoint;
+    /** Injected so tests don't wait out the real checkpoint lag. */
+    checkpointLagMs?: number;
+    now?: () => number;
+    /**
+     * QuestDB's confirmation that rows can be read back, consulted before a
+     * position is saved. Without it a position rests on the writer's counters
+     * and the lag alone.
+     */
+    confirmStored?: ConfirmStored;
   } = {},
 ): Promise<void> {
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -802,6 +837,37 @@ export async function runMigration(
   // The writer's drop counter is monotonic and shared with the live recorder,
   // so only the delta across this run is attributable to it.
   const droppedAtStart = writer.droppedLineCount ?? 0;
+  // The writer drops the OLDEST buffered lines when its cap is hit — while
+  // disconnected, or when QuestDB cannot keep up. Those rows were counted as
+  // written but never reached the database, so the run must not go on as if
+  // they had, and must not end as a success: the whole point of an import is
+  // knowing what actually landed.
+  //
+  // Checked before every row is written, not only at the end, and that is
+  // load-bearing for resume. A run that stops at its first drop never writes
+  // anything after a gap, so a window's last row, wherever it came from, is
+  // only ever in QuestDB with the whole window before it — which is what lets
+  // a saved position be confirmed by reading that row back, even one an
+  // earlier run wrote. Before the write rather than after: a drop registered
+  // while the run waited for the writer would otherwise be followed by one
+  // more row.
+  const failOnDrops = (): void => {
+    const droppedByWriter = (writer.droppedLineCount ?? 0) - droppedAtStart;
+    if (droppedByWriter > 0) {
+      throw new Error(
+        `QuestDB could not keep up: ${droppedByWriter} buffered rows were dropped before reaching the database. ` +
+          `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
+      );
+    }
+    // A write into a full buffer would itself cause the drop — and be the
+    // row behind the gap. Refused instead, before it is enqueued.
+    if (writer.atCapacity) {
+      throw new Error(
+        `QuestDB could not keep up: the writer's buffer is full. ` +
+          `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
+      );
+    }
+  };
 
   try {
     // Checked BEFORE discovery: listMeasurements is a network round trip, and
@@ -815,6 +881,27 @@ export async function runMigration(
     }
     if (toMs <= fromMs) {
       throw new Error("`to` must be after `from`");
+    }
+
+    // Before the first await, so a caller that started this run without
+    // awaiting it — the HTTP handler — already sees it as resumed, with the
+    // earlier totals, in the response it sends straight away.
+    const now = deps.now ?? Date.now;
+    const identity = migrationIdentity(req, windowMs);
+    const resume =
+      deps.resumeFrom && sameIdentity(deps.resumeFrom.identity, identity)
+        ? deps.resumeFrom
+        : undefined;
+    const done = new Set(resume?.done ?? []);
+    if (resume) {
+      run.progress.read = resume.progress.read;
+      run.progress.written = resume.progress.written;
+      run.progress.skipped = resume.progress.skipped;
+      run.resumedFrom = {
+        measurement: resume.current?.measurement,
+        windowStart:
+          resume.current && new Date(resume.current.windowStart).toISOString(),
+      };
     }
 
     let measurements = req.measurements ?? [];
@@ -835,6 +922,46 @@ export async function runMigration(
       }
     }
     run.progress.measurementsTotal = measurements.length;
+
+    const tracker = deps.checkpoints
+      ? new CheckpointTracker(
+          deps.checkpoints,
+          writer,
+          deps.checkpointLagMs,
+          now,
+          deps.confirmStored,
+        )
+      : undefined;
+    // The newest row written to each table, kept up to date by writeRow: what
+    // a position offered after it is confirmed against.
+    const tail: WrittenTail = { context, source };
+    // A checkpoint that cannot be written costs a later resume, nothing more.
+    // It must not cost the import that is running.
+    const offerCheckpoint = async (
+      current?: MigrationCheckpoint["current"],
+    ): Promise<void> => {
+      try {
+        await tracker?.offer(
+          () => ({
+            version: 1,
+            identity,
+            done: [...done],
+            current,
+            progress: {
+              read: run.progress.read,
+              written: run.progress.written,
+              skipped: run.progress.skipped,
+            },
+            updatedAt: new Date(now()).toISOString(),
+          }),
+          tail,
+        );
+      } catch (err) {
+        debug(
+          `migration: checkpoint not written: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
 
     // Wait for the writer to fall back to the resume mark.
     //
@@ -861,9 +988,30 @@ export async function runMigration(
 
     for (const measurement of measurements) {
       if (run.isCancelled) break;
+      if (done.has(measurement)) {
+        run.progress.measurementsDone++;
+        continue;
+      }
       run.progress.currentMeasurement = measurement;
 
-      for (let start = fromMs; start < toMs; start += windowMs) {
+      // Only a start this run would itself arrive at: anything else in the
+      // file is not a position of this import, and the measurement is read
+      // from its beginning instead.
+      let firstStart = fromMs;
+      const resumeAt =
+        resume?.current?.measurement === measurement
+          ? resume.current.windowStart
+          : undefined;
+      if (
+        resumeAt !== undefined &&
+        resumeAt > fromMs &&
+        resumeAt < toMs &&
+        (resumeAt - fromMs) % windowMs === 0
+      ) {
+        firstStart = resumeAt;
+      }
+
+      for (let start = firstStart; start < toMs; start += windowMs) {
         if (run.isCancelled) break;
         const end = Math.min(start + windowMs, toMs);
         run.progress.currentWindowStart = new Date(start).toISOString();
@@ -914,34 +1062,86 @@ export async function runMigration(
               sinceDrainCheck = 0;
               await awaitDrain();
             }
+            failOnDrops();
             run.progress.read++;
-            const written = writeRow(row, measurement, context, source, writer);
+            const written = writeRow(
+              row,
+              measurement,
+              context,
+              source,
+              writer,
+              tail,
+            );
             if (written) run.progress.written++;
             else run.progress.skipped++;
           }
+          // Again after the batch, so a drop on its last row ends the run
+          // here rather than after the next window has been requested.
+          failOnDrops();
+        }
+
+        // A window left early is not an imported window.
+        if (run.isCancelled) break;
+        if (start + windowMs < toMs) {
+          await offerCheckpoint({
+            measurement,
+            windowStart: start + windowMs,
+          });
         }
       }
+      if (run.isCancelled) break;
 
+      done.add(measurement);
       run.progress.measurementsDone++;
+      await offerCheckpoint();
       debug(
         `migration: ${measurement} done (${run.progress.written} written, ${run.progress.skipped} skipped)`,
       );
     }
 
-    // The writer drops the OLDEST buffered lines when its cap is hit — while
-    // disconnected, or when QuestDB cannot keep up. Those rows were counted as
-    // written but never reached the database, so a run that ends there is NOT
-    // a clean success and must not be reported as one: the whole point of an
-    // import is knowing what actually landed.
-    const droppedByWriter = (writer.droppedLineCount ?? 0) - droppedAtStart;
-    if (droppedByWriter > 0) {
-      throw new Error(
-        `QuestDB could not keep up: ${droppedByWriter} buffered rows were dropped before reaching the database. ` +
-          `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
-      );
+    failOnDrops();
+
+    // "Done" is a claim about QuestDB, not about the writer. The last rows
+    // are still on their way when the loop ends, so wait for them to leave
+    // the writer and, where QuestDB can be asked, for it to read the newest
+    // of them back — the same standard a saved position is held to. A run
+    // that cannot get that within the drain timeout fails and keeps its
+    // checkpoint, so the last windows are done again rather than assumed.
+    if (!run.isCancelled) {
+      const mark = writer.enqueuedLineCount;
+      let waited = 0;
+      while (!run.isCancelled) {
+        failOnDrops();
+        const settled =
+          mark === undefined ||
+          writer.settledLineCount === undefined ||
+          writer.settledLineCount + (writer.droppedLineCount ?? 0) >= mark;
+        const confirmed =
+          settled &&
+          (!deps.confirmStored ||
+            (await deps.confirmStored(tail).catch(() => false)));
+        if (confirmed) break;
+        if (waited >= WRITER_DRAIN_TIMEOUT_MS) {
+          throw new Error(
+            `QuestDB has not confirmed the last rows after ${Math.round(WRITER_DRAIN_TIMEOUT_MS / 1000)}s. ` +
+              `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
+          );
+        }
+        await sleep(200);
+        waited += 200;
+      }
     }
 
     run.state = run.isCancelled ? "cancelled" : "done";
+    // Nothing left to resume. Kept on a cancel or a failure, which is exactly
+    // when a later run wants it.
+    if (run.state === "done") {
+      await deps.checkpoints?.clear().catch((err: unknown) => {
+        debug(
+          `migration: finished checkpoint not removed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
   } catch (err) {
     run.state = "failed";
     run.error = err instanceof Error ? err.message : String(err);
@@ -975,6 +1175,7 @@ function writeRow(
     ILPWriter,
     "writeAtNanos" | "writeStringAtNanos" | "writePositionAtNanos"
   >,
+  tail: WrittenTail,
 ): boolean {
   const path = toSignalKPath(measurement, row.field);
   if (!path) return false;
@@ -988,6 +1189,7 @@ function writeRow(
         row.tsNanos,
         source,
       );
+      tail.numeric = { path, tsNanos: row.tsNanos };
       return true;
     case "string":
       writer.writeStringAtNanos(
@@ -998,6 +1200,7 @@ function writeRow(
         undefined,
         source,
       );
+      tail.string = { path, tsNanos: row.tsNanos };
       return true;
     case "boolean":
       writer.writeStringAtNanos(
@@ -1008,10 +1211,12 @@ function writeRow(
         "boolean",
         source,
       );
+      tail.string = { path, tsNanos: row.tsNanos };
       return true;
     case "position": {
       const v = row.value as { latitude: number; longitude: number };
       writer.writePositionAtNanos(context, v, row.tsNanos, source);
+      tail.position = { tsNanos: row.tsNanos };
       return true;
     }
     case "flatten": {
@@ -1031,6 +1236,7 @@ function writeRow(
             row.tsNanos,
             source,
           );
+          tail.numeric = { path: leaf.path, tsNanos: row.tsNanos };
         } else if (typeof leaf.value === "boolean") {
           writer.writeStringAtNanos(
             leaf.path,
@@ -1040,6 +1246,7 @@ function writeRow(
             "boolean",
             source,
           );
+          tail.string = { path: leaf.path, tsNanos: row.tsNanos };
         } else {
           writer.writeStringAtNanos(
             leaf.path,
@@ -1049,6 +1256,7 @@ function writeRow(
             undefined,
             source,
           );
+          tail.string = { path: leaf.path, tsNanos: row.tsNanos };
         }
         any = true;
       }

@@ -235,6 +235,31 @@ export interface MigrationProgress {
 
 export type MigrationRunState = "running" | "done" | "failed" | "cancelled";
 
+/** Where a resumed run picked up. */
+export interface MigrationResumePoint {
+  /** Measurement that was under way; absent if it stopped between two. */
+  measurement?: string;
+  /** First window not yet imported for that measurement, ISO. */
+  windowStart?: string;
+}
+
+/**
+ * An import that stopped before it finished and can be continued. Carries the
+ * import's own parameters — never its credentials — so it can be resumed after
+ * a server restart, when the panel no longer remembers what was entered.
+ */
+export interface MigrationInterrupted extends MigrationResumePoint {
+  url: string;
+  type: string;
+  bucket: string;
+  from: string;
+  to: string;
+  /** Measurements already imported in full. */
+  measurementsDone: number;
+  /** When the saved position was reached, ISO. */
+  updatedAt: string;
+}
+
 /** GET /api/migration/status, and the body of POST /api/migration/start. */
 export interface MigrationStatusResponse extends ApiError {
   /** Absent when no run has ever been started this process lifetime. */
@@ -249,5 +274,9 @@ export interface MigrationStatusResponse extends ApiError {
     progress: MigrationProgress;
     /** Set when state is "failed". */
     error?: string;
+    /** Set when this run continued an earlier one rather than starting over. */
+    resumedFrom?: MigrationResumePoint;
   };
+  /** Present, when no run is active, if a stopped import can be continued. */
+  interrupted?: MigrationInterrupted;
 }

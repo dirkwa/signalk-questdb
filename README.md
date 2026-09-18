@@ -170,9 +170,10 @@ All mounted at `/plugins/signalk-questdb/api/`:
 | GET    | `/migration/detect`                      | Detect InfluxDB (supports `?url=` for remote)                                            |
 | POST   | `/migration/buckets`                     | List buckets (2.x) or databases (1.x); credentials in the body, never the query string   |
 | POST   | `/migration/measurements`                | List measurements and their field keys in a bucket/database                              |
-| POST   | `/migration/start`                       | Start an import; returns immediately, progress via `/migration/status`                   |
-| GET    | `/migration/status`                      | Progress and state of the current/last import                                            |
-| POST   | `/migration/cancel`                      | Cancel the running import                                                                |
+| POST   | `/migration/start`                       | Start an import, or continue a stopped one with `{"resume": true}`; returns immediately  |
+| GET    | `/migration/status`                      | Progress and state of the current/last import, and any stopped import that can resume    |
+| POST   | `/migration/cancel`                      | Cancel the running import; any saved position is kept                                    |
+| POST   | `/migration/discard`                     | Forget a stopped import's saved position, so the next start begins again                 |
 | GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)               |
 | GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                   |
 | GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet. Optional half-open `[from, to)` range for slicing into shards |
@@ -224,7 +225,33 @@ How the data maps:
 - Every imported row is tagged `source=influxdb-import`, which makes it
   distinguishable from live recording — and because the tables deduplicate on
   `(ts, path, context, source)`, **re-running the same range overwrites rather
-  than duplicating**. An interrupted import can simply be run again.
+  than duplicating**.
+
+### Resuming an interrupted import
+
+A large import runs for hours. If it stops part-way — cancelled, failed, or the
+Signal K server restarted — the panel shows what was interrupted and offers
+**Resume import**, which continues from the saved position instead of starting
+again at the first measurement. It needs only the credentials, if InfluxDB asks
+for any: the source and range are remembered, credentials never are. Starting
+the identical import again the ordinary way continues it too. **Discard saved
+position** starts over.
+
+A position is saved only once QuestDB has been asked for the newest row written
+before it and has it — ILP gives no acknowledgment, so the plugin reads the row
+back — and once the position is about a minute old. The first keeps a stalled
+or restarted QuestDB from letting the position past rows it never took, however
+long the stall. The minute covers what a committed row still has to survive: a
+crash of either process, and on a power cut the kernel's default write-back
+timing for a QuestDB running on its default `nosync` — an assumption, not a
+guarantee, which is why an external QuestDB should run with `sync` like the
+managed container does (see
+[Durability on power loss](#durability-on-power-loss)). The position file is
+synced and renamed into place, so a power cut leaves the previous position or
+the new one, never a damaged one; should none survive, the import starts again,
+which is always safe. The cost is that a resumed import repeats up to a minute
+or so of work, which the deduplication above makes harmless. An import shorter
+than that saves nothing, and is simply run again.
 
 Anything that cannot be mapped (a gap, an unsupported value type, a `jsonValue`
 that is not valid JSON, a latitude with no matching longitude) is counted in the

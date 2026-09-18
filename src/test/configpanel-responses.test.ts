@@ -1,7 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  formatDateTime,
   toMigrationBuckets,
+  toMigrationInterrupted,
   toMigrationMeasurements,
   toMigrationRange,
   toMigrationSources,
@@ -237,5 +239,92 @@ describe("toMigrationRange", () => {
   it("an inverted range is refused before the request", () => {
     const r = toMigrationRange("2024-03-02T12:00", "2024-03-01T12:00");
     assert.ok("error" in r);
+  });
+});
+
+describe("toMigrationInterrupted", () => {
+  const interrupted = {
+    url: "http://localhost:8086",
+    type: "influxdb1",
+    bucket: "signalk",
+    from: "2024-03-01T00:00:00.000Z",
+    to: "2024-06-01T00:00:00.000Z",
+    measurement: "navigation.position",
+    windowStart: "2024-04-02T00:00:00.000Z",
+    measurementsDone: 41,
+    updatedAt: "2024-06-02T03:14:00.000Z",
+  };
+
+  it("reads the stopped import a status response offers", () => {
+    assert.deepEqual(toMigrationInterrupted({ interrupted }), interrupted);
+  });
+
+  it("is absent when the server offers none", () => {
+    assert.equal(toMigrationInterrupted({ run: { id: "x" } }), undefined);
+    assert.equal(toMigrationInterrupted(null), undefined);
+    assert.equal(toMigrationInterrupted("<html>login</html>"), undefined);
+  });
+
+  // The notice prints these. One missing would render "import of undefined",
+  // so a partial body shows no notice rather than a broken one.
+  it("rejects a body missing anything the notice prints", () => {
+    for (const key of ["url", "type", "bucket", "from", "to", "updatedAt"]) {
+      const partial: Record<string, unknown> = { ...interrupted };
+      delete partial[key];
+      assert.equal(
+        toMigrationInterrupted({ interrupted: partial }),
+        undefined,
+        key,
+      );
+    }
+  });
+
+  it("tolerates a position between two measurements, and a bad counter", () => {
+    const between = toMigrationInterrupted({
+      interrupted: {
+        ...interrupted,
+        measurement: undefined,
+        windowStart: undefined,
+        measurementsDone: "lots",
+      },
+    });
+    assert.equal(between?.measurement, undefined);
+    assert.equal(between?.windowStart, undefined);
+    assert.equal(between?.measurementsDone, 0);
+  });
+});
+
+describe("a resumed run", () => {
+  it("carries where it picked up", () => {
+    const run = toMigrationStatus({
+      run: {
+        id: "mig-1",
+        state: "running",
+        resumedFrom: {
+          measurement: "navigation.position",
+          windowStart: "2024-04-02T00:00:00.000Z",
+        },
+      },
+    });
+    assert.deepEqual(run?.resumedFrom, {
+      measurement: "navigation.position",
+      windowStart: "2024-04-02T00:00:00.000Z",
+    });
+  });
+
+  it("is not marked resumed when the server does not say so", () => {
+    const run = toMigrationStatus({ run: { id: "mig-1", state: "running" } });
+    assert.equal(run?.resumedFrom, undefined);
+  });
+});
+
+describe("formatDateTime", () => {
+  it("renders an instant, and shows anything else as it came", () => {
+    assert.equal(
+      formatDateTime("2024-04-02T00:00:00.000Z"),
+      new Date("2024-04-02T00:00:00.000Z").toLocaleString(),
+    );
+    assert.equal(formatDateTime("not a date"), "not a date");
+    assert.equal(formatDateTime(""), "");
   });
 });
