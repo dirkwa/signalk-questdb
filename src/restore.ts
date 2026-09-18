@@ -112,11 +112,12 @@ const IDENTITY_PATHS = [
   "design.aisShipType.name",
   // `design.length` is an OBJECT in Signal K ({overall, hull}), so it is
   // recorded as its leaves, not under the bare path — which never existed in
-  // the table and so restored nothing. Both spellings are listed: the leaf is
-  // what new data writes, and the bare path stays for databases recorded
+  // the table and so restored nothing. Both spellings are listed: the leaves
+  // are what new data writes, and the bare path stays for databases recorded
   // before flattening by a source that emitted it as a plain number.
   "design.length",
   "design.length.overall",
+  "design.length.hull",
   "design.beam",
   // No "mmsi": for another vessel the MMSI IS the context
   // (`vessels.urn:mrn:imo:mmsi:244813000`), built by the decoder from the AIS

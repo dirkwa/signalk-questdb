@@ -751,6 +751,37 @@ describe("identity is restored over a longer window than motion (issue #127)", (
     });
   });
 
+  it("restores every recorded leaf of the length, and hull alone", () => {
+    // The recorder writes each scalar leaf of `design.length`, so a hull
+    // length is on disk whenever a source sent one; the object comes back
+    // with whatever leaves were recorded.
+    const both = run([
+      position(AIS, 60_000),
+      [
+        ago(40 * 60_000),
+        "design.length.overall",
+        AIS,
+        "112.5",
+        "number",
+      ] as Row,
+      [ago(40 * 60_000), "design.length.hull", AIS, "108", "number"] as Row,
+    ]);
+    const hullOnly = run([
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.length.hull", AIS, "108", "number"] as Row,
+    ]);
+
+    return Promise.all([both.promise, hullOnly.promise]).then(() => {
+      assert.deepEqual(valueAt(both.deltas[0], "design.length")?.value, {
+        overall: 112.5,
+        hull: 108,
+      });
+      assert.deepEqual(valueAt(hullOnly.deltas[0], "design.length")?.value, {
+        hull: 108,
+      });
+    });
+  });
+
   it("still refuses motion older than the short window", () => {
     // The widened identity window must not leak into position: a stale fix
     // draws a target somewhere it demonstrably is not.
