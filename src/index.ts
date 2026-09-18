@@ -1,4 +1,3 @@
-import path from "node:path";
 import { IRouter } from "express";
 import { waitForContainerManager } from "signalk-container-helper";
 import type {
@@ -48,6 +47,11 @@ import {
   countLegacyImportRows,
   removeLegacyImportRows,
 } from "./migration-cleanup.js";
+import {
+  adoptDatabaseFromVolumeRoot,
+  resolveQuestdbMount,
+} from "./questdb-mount.js";
+import type { QuestdbMount } from "./questdb-mount.js";
 import {
   WalMonitor,
   buildPendingSegmentsSQL,
@@ -467,33 +471,17 @@ export default (app: App) => {
   });
 
   /**
-   * Compute the bind-mount source for QuestDB's /var/lib/questdb volume.
-   *
-   * `app.getDataDirPath()` returns the path from SK's own perspective. On
-   * bare-metal that is the host path and the runtime can use it directly.
-   * When SK runs inside a container the same string is the SK-container-
-   * internal path, and the host's runtime daemon — which is on the host,
-   * not inside SK — cannot resolve it. signalk-container 1.9.0+ exposes
-   * `resolveHostPath()` to translate such paths back to the host source;
-   * if it returns null (older signalk-container or no covering mount) we
-   * fall back to the original path, preserving bare-metal behaviour.
+   * The mount for QuestDB's data directory, however Signal K is deployed —
+   * see questdb-mount.ts. A volume that holds the directory at an offset is
+   * mounted whole and QuestDB pointed inside it; everything else mounts at
+   * the image's data root as before.
    */
-  async function resolveQuestdbVolumeSource(
+  async function resolveQuestdbDataMount(
     containers: ContainerManagerApi,
-  ): Promise<string> {
-    const dataPath = app.getDataDirPath();
-    if (typeof containers.resolveHostPath !== "function") return dataPath;
-    // signalk-container's resolveHostPath is documented as non-throwing, but
-    // we consume it through a runtime cross-plugin API (cast through `any`),
-    // so an unexpected throw from a future or older version must not abort
-    // startup — fall back to the original path instead.
-    try {
-      const resolved = await containers.resolveHostPath(dataPath);
-      return resolved?.source ?? dataPath;
-    } catch (err) {
-      app.debug("resolveHostPath threw, falling back to dataPath:", err);
-      return dataPath;
-    }
+  ): Promise<QuestdbMount> {
+    return resolveQuestdbMount(containers, app.getDataDirPath(), (msg) =>
+      app.debug(msg),
+    );
   }
 
   /**
@@ -923,15 +911,37 @@ export default (app: App) => {
       try {
         const containerEnv = buildContainerEnv(config);
 
-        const volumeSource = await resolveQuestdbVolumeSource(containers);
+        const mount = await resolveQuestdbDataMount(containers);
         if (signal.aborted) return;
+        // A volume-backed data directory: what QuestDB wrote at the volume's
+        // root while the offset went unhonoured is its database, and would be
+        // left behind. Both places are one volume, so it is renamed across.
+        if (mount.volumeRootInSignalk) {
+          const fs = await import("fs/promises");
+          const moved = await adoptDatabaseFromVolumeRoot(
+            {
+              exists: (p) =>
+                fs.access(p).then(
+                  () => true,
+                  () => false,
+                ),
+              rename: (from, to) => fs.rename(from, to),
+              mkdir: (p) => fs.mkdir(p, { recursive: true }).then(() => {}),
+            },
+            mount.volumeRootInSignalk,
+            app.getDataDirPath(),
+          );
+          if (moved.length > 0) {
+            app.debug(
+              `moved QuestDB's database from the volume root into the data directory: ${moved.join(", ")}`,
+            );
+          }
+        }
         const containerConfig: ContainerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
-          volumes: {
-            "/var/lib/questdb": volumeSource,
-          },
-          env: containerEnv,
+          volumes: mount.volumes,
+          env: { ...containerEnv, ...mount.env },
           restart: "unless-stopped",
           resources: buildResourceLimits(config),
           ulimits: QUESTDB_ULIMITS,
@@ -1981,16 +1991,16 @@ export default (app: App) => {
             // the plugin claim a version the still-running old container is not
             // actually on, surviving restarts.
 
-            const updateVolumeSource =
-              await resolveQuestdbVolumeSource(containers);
+            const updateMount = await resolveQuestdbDataMount(containers);
             app.setPluginStatus(`Starting QuestDB ${newTag}...`);
             const updateConfig: ContainerConfig = {
               image: "questdb/questdb",
               tag: newTag,
-              volumes: {
-                "/var/lib/questdb": updateVolumeSource,
+              volumes: updateMount.volumes,
+              env: {
+                ...buildContainerEnv(currentConfig ?? {}),
+                ...updateMount.env,
               },
-              env: buildContainerEnv(currentConfig ?? {}),
               restart: "unless-stopped",
               resources: currentConfig
                 ? buildResourceLimits(currentConfig)
@@ -2505,11 +2515,11 @@ export default (app: App) => {
             }
             queryClient = null;
 
-            const hostPath = await resolveQuestdbVolumeSource(containers);
+            const { wipePath } = await resolveQuestdbDataMount(containers);
             app.setPluginStatus("Removing QuestDB container and data...");
             await containers.removeManagedData!(
               QUESTDB_CONTAINER_NAME,
-              hostPath,
+              wipePath,
               { ownerPluginId: "signalk-questdb" },
             );
           };
@@ -2604,8 +2614,11 @@ export default (app: App) => {
       });
 
       // One import runs at a time, so one checkpoint is all there is to keep.
+      // Beside the data directory, not in it: QuestDB's entrypoint chowns its
+      // data root to its own uid on start, after which the Signal K user can
+      // no longer create a file there.
       const checkpoints = new FileCheckpointStore(
-        path.join(app.getDataDirPath(), "influx-import-checkpoint.json"),
+        `${app.getDataDirPath()}.influx-import-checkpoint.json`,
       );
 
       const CONFIRM_STORED_TIMEOUT_MS = 5_000;
