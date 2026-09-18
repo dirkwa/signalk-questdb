@@ -4,6 +4,7 @@ import {
   QUESTDB_DATA_DIR,
   VOLUME_MOUNT_ROOT,
   adoptDatabaseFromVolumeRoot,
+  databaseWaitsAtVolumeRoot,
   resolveQuestdbMount,
   shapeQuestdbMount,
   wipeDataInSignalk,
@@ -207,6 +208,31 @@ describe("adopting a database from a volume's root", () => {
     `${ROOT}/plugin-config-data`,
     `${ROOT}/plugin-config-data/signalk-grafana`,
   ];
+
+  // What the caller asks before stopping the container that may still be
+  // running on the volume's root.
+  test("a database waits at the root until the data directory holds one", async () => {
+    assert.strictEqual(
+      await databaseWaitsAtVolumeRoot(new FakeFs(OLD_LAYOUT), ROOT, DATA),
+      true,
+    );
+    assert.strictEqual(
+      await databaseWaitsAtVolumeRoot(
+        new FakeFs([...OLD_LAYOUT, `${DATA}/db/_tab_index.d`]),
+        ROOT,
+        DATA,
+      ),
+      false,
+    );
+    assert.strictEqual(
+      await databaseWaitsAtVolumeRoot(
+        new FakeFs([`${ROOT}/db`, `${ROOT}/security.json`]),
+        ROOT,
+        DATA,
+      ),
+      false,
+    );
+  });
 
   // It moves into the data directory, entry by entry, the tables last, and
   // nothing else at the root is touched.

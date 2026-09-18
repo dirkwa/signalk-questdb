@@ -186,6 +186,23 @@ export interface DataDirFs {
 }
 
 /**
+ * Whether a QuestDB database sits at the volume's root with none in the data
+ * directory — the situation `adoptDatabaseFromVolumeRoot` resolves. Asked
+ * first by the caller, which has to stop the container still running on that
+ * root before anything moves.
+ */
+export async function databaseWaitsAtVolumeRoot(
+  fs: DataDirFs,
+  volumeRoot: string,
+  dataDir: string,
+): Promise<boolean> {
+  return (
+    (await fs.exists(path.join(volumeRoot, DB_MARK))) &&
+    !(await fs.exists(path.join(dataDir, DB_MARK)))
+  );
+}
+
+/**
  * Move a QuestDB database that sits at a volume's root into the data
  * directory inside that volume.
  *
@@ -210,8 +227,7 @@ export async function adoptDatabaseFromVolumeRoot(
   volumeRoot: string,
   dataDir: string,
 ): Promise<string[]> {
-  if (!(await fs.exists(path.join(volumeRoot, DB_MARK)))) return [];
-  if (await fs.exists(path.join(dataDir, DB_MARK))) return [];
+  if (!(await databaseWaitsAtVolumeRoot(fs, volumeRoot, dataDir))) return [];
   await fs.mkdir(dataDir);
   const moved: string[] = [];
   for (const { name, mark } of QUESTDB_ROOT_ENTRIES) {

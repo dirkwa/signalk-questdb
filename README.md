@@ -757,12 +757,16 @@ How it reaches the container differs:
   `/signalk-vols/<volume>` and QuestDB is pointed at the plugin's directory
   inside it (`QUESTDB_DATA_DIR`). A database found at the volume's root — where
   a whole-volume mount put it — is moved into the plugin's directory on start;
-  both are the same volume, so nothing is copied.
+  both are the same volume, so nothing is copied. A purge deletes the
+  directory from the Signal K process, since the runtime cannot mount the
+  volume by Signal K's path; where QuestDB's user owns it and the Signal K
+  user cannot delete it, the purge says so and the directory is deleted by
+  hand.
 
 QuestDB's entrypoint makes its data root its own on start, so the plugin keeps
 the one file it writes alongside — the import checkpoint,
 `signalk-questdb.influx-import-checkpoint.json` — next to the directory rather
-than in it.
+than in it. A purge removes it with the data.
 
 ## Grafana Integration
 
