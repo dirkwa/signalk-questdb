@@ -71,6 +71,8 @@ describe("import identity", () => {
       { url: "http://elsewhere:8086" },
       { type: "influxdb2" },
       { context: "vessels.urn:mrn:imo:mmsi:123456789" },
+      { sourceSelfContext: "vessels.urn:mrn:signalk:uuid:other" },
+      { others: "skip" },
       { sourceLabel: "second-import" },
     ]) {
       assert.ok(
@@ -147,6 +149,24 @@ describe("checkpoint file", () => {
       ).clear();
     }));
 
+  // A checkpoint from before other vessels were told apart has no `others`;
+  // it was written by an import that filed every row as the own vessel,
+  // which is what "keep" with no own context does. It must still resume.
+  test("a checkpoint written before vessels were told apart still loads", () =>
+    withDir(async (dir) => {
+      const file = path.join(dir, "cp.json");
+      const store = new FileCheckpointStore(file);
+      const legacy = checkpoint();
+      delete (legacy.identity as { others?: unknown }).others;
+      writeFileSync(file, JSON.stringify(legacy));
+      const loaded = await store.load();
+      assert.ok(loaded, "did not load");
+      assert.ok(
+        sameIdentity(loaded.identity, migrationIdentity(request(), DAY)),
+        "a fresh start of the same import would not resume it",
+      );
+    }));
+
   // Starting over is always safe; resuming from a position that was never
   // real is not. Anything doubtful reads as "no checkpoint".
   test("a damaged or foreign file reads as no checkpoint", () =>
@@ -189,10 +209,10 @@ describe("checkpoint tracker", () => {
   const position = (n: number) => () =>
     checkpoint({ progress: { read: n, written: n, skipped: 0 } });
   const TAIL: WrittenTail = {
-    context: "self",
     source: "influxdb-import",
     numeric: {
       path: "environment.depth.belowKeel",
+      context: "self",
       tsNanos: 1_700_000_000_000_000_000n,
     },
   };
@@ -414,15 +434,23 @@ describe("checkpoint tracker", () => {
         return true;
       },
     );
-    const first: WrittenTail = { ...TAIL, numeric: { path: "a", tsNanos: 1n } };
+    const first: WrittenTail = {
+      ...TAIL,
+      numeric: { path: "a", context: "self", tsNanos: 1n },
+    };
     await tracker.offer(position(1), first);
-    first.numeric = { path: "b", tsNanos: 2n }; // mutated later, as the live tail is
+    // Mutated later, as the live tail is.
+    first.numeric = { path: "b", context: "self", tsNanos: 2n };
     clock.t += LAG;
     await tracker.offer(position(2), {
       ...TAIL,
-      numeric: { path: "c", tsNanos: 3n },
+      numeric: { path: "c", context: "self", tsNanos: 3n },
     });
-    assert.deepStrictEqual(asked[0].numeric, { path: "a", tsNanos: 1n });
+    assert.deepStrictEqual(asked[0].numeric, {
+      path: "a",
+      context: "self",
+      tsNanos: 1n,
+    });
     assert.strictEqual(store.saved.length, 1);
   });
 

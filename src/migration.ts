@@ -90,8 +90,18 @@ export interface MigrationRequest {
   /** ISO instants bounding the import. */
   from: string;
   to: string;
-  /** Signal K context to write rows under. */
+  /** Signal K context to write the source's own vessel under. */
   context: string;
+  /**
+   * The `context` tag value the source uses for its own vessel. Rows tagged
+   * with it are written under `context`; rows tagged otherwise are other
+   * vessels and keep their tag (see `others`); untagged rows are the own
+   * vessel too. Absent: every row is the own vessel.
+   */
+  sourceSelfContext?: string;
+  /** What to do with rows of other vessels: keep them under their own
+   * context (the default), or leave them out. */
+  others?: "keep" | "skip";
   /** Restrict to these measurements; empty/absent means all of them. */
   measurements?: string[];
   /** `source` tag written on every imported row, so it is distinguishable. */
@@ -280,6 +290,56 @@ schema.measurements(bucket: ${JSON.stringify(req.bucket)}, start: 1970-01-01T00:
   const body2 = (await r2.json()) as InfluxQlResponse;
   const values = body2.results?.[0]?.series?.[0]?.values ?? [];
   return values.map((row) => ({ name: String(row[0]), fields: [] }));
+}
+
+/**
+ * The `context` tag values in a bucket/database: the vessels the source holds.
+ * Both Signal K InfluxDB writers tag every point with the delta's context, so
+ * this is how the source's own vessel is told from the AIS targets it recorded.
+ * A source with no such tag — a non-Signal K schema — returns none.
+ */
+export async function listContexts(
+  req: { url: string; type: string; bucket: string; auth?: InfluxAuth },
+  fetchImpl: typeof fetch = fetch,
+): Promise<string[]> {
+  const headers = authHeaders(req.type, req.auth);
+  if (req.type === "influxdb2") {
+    const flux = `import "influxdata/influxdb/schema"
+schema.tagValues(bucket: ${JSON.stringify(req.bucket)}, tag: "context", start: 1970-01-01T00:00:00Z)`;
+    const rows = await runFlux(req, flux, headers, fetchImpl);
+    return [
+      ...new Set(
+        rows.map((r) => r.values["_value"]).filter((v): v is string => !!v),
+      ),
+    ].sort();
+  }
+
+  // Answered per measurement, each series a list of [key, value] rows.
+  const url = `${req.url}/query?db=${encodeURIComponent(req.bucket)}&q=${encodeURIComponent(
+    'SHOW TAG VALUES WITH KEY = "context"',
+  )}`;
+  const r = await fetchImpl(url, {
+    headers,
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(await describeHttpError(r, "list contexts"));
+  const body = (await r.json()) as InfluxQlResponse;
+  if (body.results?.[0]?.error) throw new Error(body.results[0].error);
+  const values = new Set<string>();
+  for (const s of body.results?.[0]?.series ?? []) {
+    for (const row of s.values ?? []) {
+      if (typeof row[1] === "string" && row[1]) values.add(row[1]);
+    }
+  }
+  return [...values].sort();
+}
+
+/**
+ * Whether a string is a Signal K context this plugin will file history under:
+ * a vessel, aton, aircraft or SAR target with a well-formed identifier.
+ */
+export function isSignalKContext(context: string): boolean {
+  return /^(vessels|atons|aircraft|sar)\.[A-Za-z0-9:._-]+$/.test(context);
 }
 
 async function describeHttpError(r: Response, what: string): Promise<string> {
@@ -832,6 +892,8 @@ export async function runMigration(
   const requestedWindow = req.windowMs ?? DEFAULT_WINDOW_MS;
   const windowMs = requestedWindow > 0 ? requestedWindow : DEFAULT_WINDOW_MS;
   const context = req.context;
+  const sourceSelf = req.sourceSelfContext;
+  const others = req.others ?? "keep";
   const source = req.sourceLabel ?? "influxdb-import";
 
   // The writer's drop counter is monotonic and shared with the live recorder,
@@ -934,7 +996,7 @@ export async function runMigration(
       : undefined;
     // The newest row written to each table, kept up to date by writeRow: what
     // a position offered after it is confirmed against.
-    const tail: WrittenTail = { context, source };
+    const tail: WrittenTail = { source };
     // A checkpoint that cannot be written costs a later resume, nothing more.
     // It must not cost the import that is running.
     const offerCheckpoint = async (
@@ -1064,10 +1126,20 @@ export async function runMigration(
             }
             failOnDrops();
             run.progress.read++;
+            const target = targetContext(
+              row.context,
+              sourceSelf,
+              context,
+              others,
+            );
+            if (target === null) {
+              run.progress.skipped++;
+              continue;
+            }
             const written = writeRow(
               row,
               measurement,
-              context,
+              target,
               source,
               writer,
               tail,
@@ -1152,11 +1224,41 @@ export async function runMigration(
   }
 }
 
+/**
+ * The Signal K context a row is written under, or null for a row that is left
+ * out — counted as skipped by the caller.
+ *
+ * The source's own vessel becomes `self`, whether the point was tagged with
+ * the source's own context, with the literal `vessels.self`, or not at all.
+ * Any other tag is another vessel: kept under its own context if it is a
+ * well-formed Signal K one, since that is what the history API is queried by,
+ * or left out when other vessels are not wanted. With no `sourceSelf` given,
+ * every row is the own vessel — what a single-vessel source amounts to.
+ */
+export function targetContext(
+  rowContext: string | undefined,
+  sourceSelf: string | undefined,
+  self: string,
+  others: "keep" | "skip",
+): string | null {
+  if (
+    rowContext === undefined ||
+    rowContext === "vessels.self" ||
+    rowContext === sourceSelf ||
+    sourceSelf === undefined
+  )
+    return self;
+  if (others === "skip") return null;
+  return isSignalKContext(rowContext) ? rowContext : null;
+}
+
 /** One point read out of InfluxDB, normalised across the two dialects. */
 export interface SourceRow {
   tsNanos: bigint;
   field: string;
   value: unknown;
+  /** The source's `context` tag, when the point carried one. */
+  context?: string;
 }
 
 /**
@@ -1189,7 +1291,7 @@ function writeRow(
         row.tsNanos,
         source,
       );
-      tail.numeric = { path, tsNanos: row.tsNanos };
+      tail.numeric = { path, context, tsNanos: row.tsNanos };
       return true;
     case "string":
       writer.writeStringAtNanos(
@@ -1200,7 +1302,7 @@ function writeRow(
         undefined,
         source,
       );
-      tail.string = { path, tsNanos: row.tsNanos };
+      tail.string = { path, context, tsNanos: row.tsNanos };
       return true;
     case "boolean":
       writer.writeStringAtNanos(
@@ -1211,12 +1313,12 @@ function writeRow(
         "boolean",
         source,
       );
-      tail.string = { path, tsNanos: row.tsNanos };
+      tail.string = { path, context, tsNanos: row.tsNanos };
       return true;
     case "position": {
       const v = row.value as { latitude: number; longitude: number };
       writer.writePositionAtNanos(context, v, row.tsNanos, source);
-      tail.position = { tsNanos: row.tsNanos };
+      tail.position = { context, tsNanos: row.tsNanos };
       return true;
     }
     case "flatten": {
@@ -1236,7 +1338,7 @@ function writeRow(
             row.tsNanos,
             source,
           );
-          tail.numeric = { path: leaf.path, tsNanos: row.tsNanos };
+          tail.numeric = { path: leaf.path, context, tsNanos: row.tsNanos };
         } else if (typeof leaf.value === "boolean") {
           writer.writeStringAtNanos(
             leaf.path,
@@ -1246,7 +1348,7 @@ function writeRow(
             "boolean",
             source,
           );
-          tail.string = { path: leaf.path, tsNanos: row.tsNanos };
+          tail.string = { path: leaf.path, context, tsNanos: row.tsNanos };
         } else {
           writer.writeStringAtNanos(
             leaf.path,
@@ -1256,7 +1358,7 @@ function writeRow(
             undefined,
             source,
           );
-          tail.string = { path: leaf.path, tsNanos: row.tsNanos };
+          tail.string = { path: leaf.path, context, tsNanos: row.tsNanos };
         }
         any = true;
       }
@@ -1337,7 +1439,7 @@ async function* readWindowFlux(
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
   |> drop(columns: ["_start", "_stop", "_measurement"])`
     : `${source}
-  |> keep(columns: ["_time", "_field", "_value"])`;
+  |> keep(columns: ["_time", "_field", "_value", "context"])`;
   const csv = new AnnotatedCsvReader();
   let rows: SourceRow[] = [];
   let records = 0;
@@ -1354,8 +1456,9 @@ async function* readWindowFlux(
       unusable++;
       return;
     }
+    const context = rec.values["context"] || undefined;
     if (pivoted) {
-      pushPivotedFields(rec, tsNanos, rows);
+      pushPivotedFields(rec, tsNanos, context, rows);
       return;
     }
     rows.push({
@@ -1364,6 +1467,7 @@ async function* readWindowFlux(
       // The declared type decides: a genuine string "3.5" must stay a string
       // rather than being parsed into the numeric table.
       value: coerceValue(rec.values["_value"] ?? "", rec.types["_value"]),
+      context,
     });
   };
 
@@ -1409,6 +1513,7 @@ const PIVOT_NON_FIELD_COLUMNS: ReadonlySet<string> = new Set([
 function pushPivotedFields(
   rec: AnnotatedRecord,
   tsNanos: bigint,
+  context: string | undefined,
   out: SourceRow[],
 ): void {
   for (const column of Object.keys(rec.values)) {
@@ -1420,6 +1525,7 @@ function pushPivotedFields(
       tsNanos,
       field: column,
       value: coerceValue(raw, rec.types[column]),
+      context,
     });
   }
 }
@@ -1461,7 +1567,9 @@ async function* readWindowInfluxQl(
   // bogus `measurement.source = "n2k"` string path for every single point.
   // Signal K's own InfluxDB writers tag their points, so this is the common
   // case, not an exotic one.
-  const q = `SELECT *::field FROM ${quoted} WHERE time >= ${BigInt(startMs) * NANOS_PER_MS} AND time < ${BigInt(endMs) * NANOS_PER_MS}`;
+  // The context tag rides along as one more column, named after the tag. A
+  // measurement without it simply has no such column.
+  const q = `SELECT *::field, "context"::tag FROM ${quoted} WHERE time >= ${BigInt(startMs) * NANOS_PER_MS} AND time < ${BigInt(endMs) * NANOS_PER_MS}`;
   const url = `${req.url}/query?db=${encodeURIComponent(req.bucket)}&epoch=ns&chunked=true&chunk_size=${INFLUXQL_CHUNK_POINTS}&q=${encodeURIComponent(q)}`;
   for await (const line of streamLines(
     fetchImpl,
@@ -1503,7 +1611,12 @@ function pushInfluxQlSeries(
     const columns = s.columns ?? [];
     const timeIdx = columns.indexOf("time");
     if (timeIdx < 0) continue;
+    const contextIdx = columns.indexOf("context");
     for (const values of s.values ?? []) {
+      const context =
+        contextIdx >= 0 && typeof values[contextIdx] === "string"
+          ? (values[contextIdx] as string) || undefined
+          : undefined;
       // epoch=ns returns the time as a number; going through BigInt(String)
       // avoids the precision loss a float64 would suffer past 2^53 ns.
       const rawTime = values[timeIdx];
@@ -1516,7 +1629,7 @@ function pushInfluxQlSeries(
         continue;
       }
       for (let i = 0; i < columns.length; i++) {
-        if (i === timeIdx) continue;
+        if (i === timeIdx || i === contextIdx) continue;
         const raw = values[i];
         // A wide row has a column per field; nulls are fields absent from
         // this point, not values.
@@ -1541,6 +1654,7 @@ function pushInfluxQlSeries(
           tsNanos,
           field: columns[i],
           value: raw,
+          context,
         });
       }
     }
@@ -1566,14 +1680,20 @@ export function mergePositionRows(
   if (!measurement.includes("position")) return { rows, dropped: 0 };
   const latKeys = new Set(["latitude", "lat"]);
   const lonKeys = new Set(["longitude", "lon", "lng"]);
-  const byTime = new Map<string, { lat?: number; lon?: number }>();
+  // Keyed by vessel AND instant: two vessels' fixes at the same instant are
+  // two positions, and a latitude of one must never pair with a longitude of
+  // the other.
+  const byTime = new Map<
+    string,
+    { context?: string; tsNanos: bigint; lat?: number; lon?: number }
+  >();
   const passthrough: SourceRow[] = [];
   // Instants that already carry a whole position. signalk-to-influxdb 1.x with
   // `separateLatLon` on writes `jsonValue` AND `lat`/`lon` for the same fix, so
   // the pair is a second copy of a row that is already going to be written.
   const wholePositionTimes = new Set<string>();
   for (const row of rows) {
-    const key = row.tsNanos.toString();
+    const key = `${row.context ?? ""}|${row.tsNanos}`;
     // Routed on the mapped path, as writeRow does, so a row is only counted as
     // a whole position here if it is going to be written as one.
     if (
@@ -1583,10 +1703,12 @@ export function mergePositionRows(
       wholePositionTimes.add(key);
       passthrough.push(row);
     } else if (latKeys.has(row.field) && typeof row.value === "number") {
-      if (!byTime.has(key)) byTime.set(key, {});
+      if (!byTime.has(key))
+        byTime.set(key, { context: row.context, tsNanos: row.tsNanos });
       byTime.get(key)!.lat = row.value;
     } else if (lonKeys.has(row.field) && typeof row.value === "number") {
-      if (!byTime.has(key)) byTime.set(key, {});
+      if (!byTime.has(key))
+        byTime.set(key, { context: row.context, tsNanos: row.tsNanos });
       byTime.get(key)!.lon = row.value;
     } else {
       passthrough.push(row);
@@ -1594,7 +1716,7 @@ export function mergePositionRows(
   }
   const merged: SourceRow[] = [];
   let dropped = 0;
-  for (const [key, { lat, lon }] of byTime) {
+  for (const [key, { context, tsNanos, lat, lon }] of byTime) {
     if (wholePositionTimes.has(key)) continue;
     // A half-pair (lat with no lon at the same instant) is not a position.
     // Emitting it as a bare number would be worse than skipping it, so it is
@@ -1605,9 +1727,10 @@ export function mergePositionRows(
       continue;
     }
     merged.push({
-      tsNanos: BigInt(key),
+      tsNanos,
       field: "value",
       value: { latitude: lat, longitude: lon },
+      ...(context === undefined ? {} : { context }),
     });
   }
   return { rows: [...passthrough, ...merged], dropped };

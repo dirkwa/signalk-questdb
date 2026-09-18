@@ -27,6 +27,11 @@ export interface MigrationIdentity {
   from: string;
   to: string;
   context: string;
+  sourceSelfContext?: string;
+  /** Absent in checkpoints written before other vessels were told apart,
+   * when every row was the own vessel: the same as "keep" with no
+   * `sourceSelfContext`. */
+  others?: "keep" | "skip";
   sourceLabel: string;
   /** An explicit measurement selection, sorted; absent means all of them. */
   measurements?: string[];
@@ -61,6 +66,8 @@ export function migrationIdentity(
     from: new Date(req.from).toISOString(),
     to: new Date(req.to).toISOString(),
     context: req.context,
+    sourceSelfContext: req.sourceSelfContext,
+    others: req.others ?? "keep",
     sourceLabel: req.sourceLabel ?? "influxdb-import",
     measurements:
       req.measurements && req.measurements.length > 0
@@ -81,6 +88,8 @@ export function sameIdentity(
     a.from === b.from &&
     a.to === b.to &&
     a.context === b.context &&
+    a.sourceSelfContext === b.sourceSelfContext &&
+    (a.others ?? "keep") === (b.others ?? "keep") &&
     a.sourceLabel === b.sourceLabel &&
     a.windowMs === b.windowMs &&
     JSON.stringify(a.measurements ?? null) ===
@@ -102,11 +111,10 @@ export function sameIdentity(
  * whole window before it.
  */
 export interface WrittenTail {
-  context: string;
   source: string;
-  numeric?: { path: string; tsNanos: bigint };
-  string?: { path: string; tsNanos: bigint };
-  position?: { tsNanos: bigint };
+  numeric?: { path: string; context: string; tsNanos: bigint };
+  string?: { path: string; context: string; tsNanos: bigint };
+  position?: { context: string; tsNanos: bigint };
 }
 
 /** Whether every row of a WrittenTail can be read back from QuestDB. */
@@ -224,6 +232,9 @@ function isCheckpoint(value: unknown): value is MigrationCheckpoint {
     typeof id.from === "string" &&
     typeof id.to === "string" &&
     typeof id.context === "string" &&
+    (id.sourceSelfContext === undefined ||
+      typeof id.sourceSelfContext === "string") &&
+    (id.others === undefined || id.others === "keep" || id.others === "skip") &&
     typeof id.sourceLabel === "string" &&
     typeof id.windowMs === "number" &&
     (id.measurements === undefined ||

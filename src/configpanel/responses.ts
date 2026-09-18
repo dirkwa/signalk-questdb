@@ -11,6 +11,7 @@
 
 import type {
   MigrationBucket,
+  MigrationContextsResponse,
   MigrationMeasurement,
   MigrationSource,
   MigrationStatusResponse,
@@ -125,6 +126,27 @@ export function toMigrationStatus(
       currentWindowStart: str(p.currentWindowStart),
     },
   };
+}
+
+/**
+ * POST /api/migration/contexts: the vessels the source holds. A body without
+ * a proper list reads as "none found", which leaves the choice out of the form
+ * rather than rendering a broken one.
+ */
+export function toMigrationContexts(
+  body: unknown,
+): Pick<MigrationContextsResponse, "contexts" | "self"> {
+  const contexts =
+    isRecord(body) && Array.isArray(body.contexts)
+      ? body.contexts.filter((c): c is string => typeof c === "string" && !!c)
+      : [];
+  const self =
+    isRecord(body) &&
+    typeof body.self === "string" &&
+    contexts.includes(body.self)
+      ? body.self
+      : undefined;
+  return { contexts, self };
 }
 
 /**

@@ -3,8 +3,11 @@ import assert from "node:assert";
 import {
   coerceValue,
   decodeJsonValueRows,
+  isSignalKContext,
   listBuckets,
+  listContexts,
   listMeasurements,
+  targetContext,
   mergePositionRows,
   parseAnnotatedCsv,
   rfc3339ToNanos,
@@ -941,8 +944,9 @@ describe("import run", () => {
   // A bare `SELECT *` returns TAG columns next to the fields, and every
   // non-time column is read as a field — so a point tagged source=n2k would
   // import a bogus `<measurement>.source = "n2k"` path. Signal K's InfluxDB
-  // writers tag their points, so this is the normal case.
-  test("the 1.x query asks for fields only, not tags", async () => {
+  // writers tag their points, so this is the normal case. The one tag that
+  // is wanted, the context, is asked for by name and read as a tag.
+  test("the 1.x query asks for fields only, plus the context tag by name", async () => {
     let seenQuery = "";
     const fakeFetch = (async (url: string | URL) => {
       seenQuery = decodeURIComponent(String(url));
@@ -968,7 +972,7 @@ describe("import run", () => {
       { fetchImpl: fakeFetch },
     );
 
-    assert.match(seenQuery, /SELECT \*::field FROM/);
+    assert.match(seenQuery, /SELECT \*::field, "context"::tag FROM/);
   });
 
   // The own vessel is stored as the literal "self" by the live recorder and
@@ -2508,5 +2512,275 @@ describe("resuming an import", () => {
     assert.strictEqual(run.state, "done");
     assert.strictEqual(checkpoints.saves, 0);
     assert.strictEqual(checkpoints.current, null);
+  });
+});
+
+describe("vessels in the source", () => {
+  const SELF = "vessels.urn:mrn:signalk:uuid:aaaa";
+  const OTHER = "vessels.urn:mrn:imo:mmsi:211000001";
+
+  test("the source's own vessel becomes self, however it was tagged", () => {
+    assert.strictEqual(targetContext(SELF, SELF, "self", "keep"), "self");
+    assert.strictEqual(
+      targetContext("vessels.self", SELF, "self", "keep"),
+      "self",
+    );
+    assert.strictEqual(targetContext(undefined, SELF, "self", "keep"), "self");
+  });
+
+  test("another vessel keeps its own context, or is left out", () => {
+    assert.strictEqual(targetContext(OTHER, SELF, "self", "keep"), OTHER);
+    assert.strictEqual(targetContext(OTHER, SELF, "self", "skip"), null);
+    // A tag that is not a Signal K context cannot be filed anywhere useful.
+    assert.strictEqual(targetContext("boat 2", SELF, "self", "keep"), null);
+  });
+
+  // A single-vessel source has nothing to tell apart.
+  test("with no own context given, every row is the own vessel", () => {
+    assert.strictEqual(targetContext(OTHER, undefined, "self", "keep"), "self");
+  });
+
+  test("a Signal K context is a vessel, aton, aircraft or SAR target", () => {
+    assert.ok(isSignalKContext(OTHER));
+    assert.ok(isSignalKContext("atons.urn:mrn:imo:mmsi:992111111"));
+    assert.ok(!isSignalKContext("self"));
+    assert.ok(!isSignalKContext("vessels."));
+    assert.ok(!isSignalKContext("vessels.a b"));
+  });
+
+  // Shapes captured from live servers: 2.x schema.tagValues answers with one
+  // `_value` per tag value; 1.x SHOW TAG VALUES answers per measurement with
+  // [key, value] rows, repeating a value once per measurement it appears in.
+  test("2.x contexts come from schema.tagValues", async () => {
+    let sent = "";
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      sent = String(init?.body ?? "");
+      return new Response(
+        [
+          "#datatype,string,long,string",
+          "#group,false,false,false",
+          "#default,_result,,",
+          ",result,table,_value",
+          `,,0,${OTHER}`,
+          `,,0,${SELF}`,
+          "",
+        ].join("\r\n"),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const contexts = await listContexts(
+      { url: "http://x", type: "influxdb2", bucket: "b" },
+      fakeFetch,
+    );
+    assert.deepStrictEqual(contexts, [OTHER, SELF]);
+    assert.match(sent, /schema\.tagValues/);
+    assert.match(sent, /tag: \\"context\\"/);
+  });
+
+  test("1.x contexts come from SHOW TAG VALUES, once each", async () => {
+    let url = "";
+    const fakeFetch = (async (input: string) => {
+      url = decodeURIComponent(input);
+      return new Response(
+        JSON.stringify({
+          results: [
+            {
+              series: [
+                {
+                  name: "navigation.position",
+                  columns: ["key", "value"],
+                  values: [
+                    ["context", OTHER],
+                    ["context", SELF],
+                  ],
+                },
+                {
+                  name: "navigation.state",
+                  columns: ["key", "value"],
+                  values: [["context", SELF]],
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const contexts = await listContexts(
+      { url: "http://x", type: "influxdb1", bucket: "db" },
+      fakeFetch,
+    );
+    assert.deepStrictEqual(contexts, [OTHER, SELF]);
+    assert.match(url, /SHOW TAG VALUES WITH KEY = "context"/);
+  });
+
+  test("a source without the tag holds no vessels to tell apart", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ results: [{}] }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    assert.deepStrictEqual(
+      await listContexts(
+        { url: "http://x", type: "influxdb1", bucket: "db" },
+        fakeFetch,
+      ),
+      [],
+    );
+  });
+
+  // Two vessels' fixes at one instant are two positions. Paired by instant
+  // alone, one's latitude would meet the other's longitude.
+  test("positions are paired per vessel, not per instant", () => {
+    const merged = mergePositionRows("navigation.position", [
+      { tsNanos: 1n, field: "lat", value: 60.1, context: SELF },
+      { tsNanos: 1n, field: "lat", value: 59.5, context: OTHER },
+      { tsNanos: 1n, field: "lon", value: 24.0, context: OTHER },
+      { tsNanos: 1n, field: "lon", value: 24.9, context: SELF },
+    ]);
+    assert.strictEqual(merged.dropped, 0);
+    assert.deepStrictEqual(
+      merged.rows.map((r) => [r.context, r.value]).sort(),
+      [
+        [OTHER, { latitude: 59.5, longitude: 24.0 }],
+        [SELF, { latitude: 60.1, longitude: 24.9 }],
+      ].sort(),
+    );
+  });
+
+  // Captured from a live 1.8.10: `SELECT *::field, "context"::tag` appends the
+  // tag as a column named after it.
+  test("a 1.x import files each vessel's rows under its own context", async () => {
+    const t = 1709294400000000000;
+    const body = {
+      results: [
+        {
+          series: [
+            {
+              name: "navigation.speedOverGround",
+              columns: ["time", "value", "context"],
+              values: [
+                [t, 3.1, SELF],
+                [t, 9.9, OTHER],
+                [t + 1000, 4.4, "not a context"],
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify(body) + "\n", {
+        status: 200,
+      })) as unknown as typeof fetch;
+
+    for (const others of ["keep", "skip"] as const) {
+      const writer = new FakeWriter();
+      const run = new MigrationRun("tctx", "http://x", "db");
+      await runMigration(
+        {
+          url: "http://x",
+          type: "influxdb1",
+          bucket: "db",
+          from: "2024-03-01T00:00:00Z",
+          to: "2024-03-02T00:00:00Z",
+          context: "self",
+          sourceSelfContext: SELF,
+          others,
+          measurements: ["navigation.speedOverGround"],
+        },
+        writer,
+        run,
+        { fetchImpl: fakeFetch },
+      );
+      assert.strictEqual(run.state, "done", others);
+      assert.deepStrictEqual(
+        writer.numbers.map((n) => [n.context, n.value]),
+        others === "keep"
+          ? [
+              ["self", 3.1],
+              [OTHER, 9.9],
+            ]
+          : [["self", 3.1]],
+        others,
+      );
+      // The malformed tag is not filed anywhere, and is counted.
+      assert.strictEqual(run.progress.skipped, others === "keep" ? 1 : 2);
+      assert.strictEqual(run.progress.read, 3);
+    }
+  });
+
+  // Captured from a live 2.7.12: with `context` kept, each (field, context)
+  // pair is its own table and the column is in the group key.
+  test("a 2.x import reads the context column of each table", async () => {
+    const csv = [
+      "#datatype,string,long,dateTime:RFC3339,double,string,string",
+      "#group,false,false,false,false,true,true",
+      "#default,_result,,,,,",
+      ",result,table,_time,_value,_field,context",
+      `,,0,2024-03-01T12:00:00Z,9.9,value,${OTHER}`,
+      `,,1,2024-03-01T12:00:00Z,3.1,value,${SELF}`,
+      "",
+    ].join("\r\n");
+    let sent = "";
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      sent = String(init?.body ?? "");
+      return new Response(csv, { status: 200 });
+    }) as unknown as typeof fetch;
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tctx2", "http://x", "b");
+    await runMigration(
+      {
+        ...streamedRequest("influxdb2", "navigation.speedOverGround"),
+        sourceSelfContext: SELF,
+      },
+      writer,
+      run,
+      { fetchImpl: fakeFetch },
+    );
+    assert.strictEqual(run.state, "done");
+    assert.match(
+      sent,
+      /keep\(columns: \[\\"_time\\", \\"_field\\", \\"_value\\", \\"context\\"\]\)/,
+    );
+    assert.deepStrictEqual(
+      writer.numbers.map((n) => [n.context, n.value]),
+      [
+        [OTHER, 9.9],
+        ["self", 3.1],
+      ],
+    );
+  });
+
+  test("a pivoted 2.x position keeps its vessel", async () => {
+    const csv = [
+      "#datatype,string,long,dateTime:RFC3339,string,string,double,double",
+      "#group,false,false,false,true,true,false,false",
+      "#default,_result,,,,,,",
+      ",result,table,_time,context,source,lat,lon",
+      `,,0,2024-03-01T12:00:00Z,${OTHER},ais,59.5,24`,
+      `,,1,2024-03-01T12:00:00Z,${SELF},gps,60.1,24.9`,
+      "",
+    ].join("\r\n");
+    const fakeFetch = (async () =>
+      new Response(csv, { status: 200 })) as unknown as typeof fetch;
+    const writer = new FakeWriter();
+    const run = new MigrationRun("tctxpos", "http://x", "b");
+    await runMigration(
+      {
+        ...streamedRequest("influxdb2", "navigation.position"),
+        sourceSelfContext: SELF,
+      },
+      writer,
+      run,
+      { fetchImpl: fakeFetch },
+    );
+    assert.strictEqual(run.state, "done");
+    assert.deepStrictEqual(
+      writer.positions.map((p) => [p.context, p.lat, p.lon]),
+      [
+        [OTHER, 59.5, 24],
+        ["self", 60.1, 24.9],
+      ],
+    );
   });
 });
