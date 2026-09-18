@@ -88,6 +88,24 @@ export function sameIdentity(
   );
 }
 
+/**
+ * The newest row written to each table before a position, by its dedup key.
+ *
+ * ILP is one ordered stream, and QuestDB applies a table's WAL in order, so if
+ * this row can be read back, every row written to that table before it has
+ * been committed and applied — which is what a saved position promises.
+ */
+export interface WrittenTail {
+  context: string;
+  source: string;
+  numeric?: { path: string; tsNanos: bigint };
+  string?: { path: string; tsNanos: bigint };
+  position?: { tsNanos: bigint };
+}
+
+/** Whether every row of a WrittenTail can be read back from QuestDB. */
+export type ConfirmStored = (tail: WrittenTail) => Promise<boolean>;
+
 /** What runMigration needs of a store; the file store below is the real one. */
 export interface CheckpointStore {
   save(checkpoint: MigrationCheckpoint): Promise<void>;
@@ -255,10 +273,15 @@ export interface SettlementSource {
  * Persists positions only once they are safe to resume from.
  *
  * A position offered now is held as the candidate. It is written later, by a
- * subsequent offer, once two things hold: every line enqueued up to it has
- * left the writer, and it is at least `lagMs` old. Positions offered while a
- * candidate is waiting are passed over, so what reaches disk is always a
- * position that was reached at least `lagMs` ago.
+ * subsequent offer, once three things hold: every line enqueued up to it has
+ * left the writer, it is at least `lagMs` old, and — where a `confirmStored`
+ * is given — QuestDB can read back the newest row written before it. The
+ * first two are local knowledge and bound only the writer and the commit
+ * delay; the third is QuestDB's own word that the rows are committed and
+ * applied, which no lag can stand in for when the server is stalled. A
+ * position that cannot be confirmed simply waits for a later offer. Positions
+ * offered while a candidate is waiting are passed over, so what reaches disk
+ * is always a position that was reached at least `lagMs` ago.
  *
  * If the writer drops lines the tracker stops for good. The cap discards the
  * OLDEST buffered lines, which may predate any position taken since, so none
@@ -269,6 +292,7 @@ export interface SettlementSource {
 export class CheckpointTracker {
   private candidate: {
     checkpoint: MigrationCheckpoint;
+    tail: WrittenTail;
     mark: number;
     takenAt: number;
   } | null = null;
@@ -279,15 +303,20 @@ export class CheckpointTracker {
     private readonly writer: SettlementSource,
     private readonly lagMs: number = CHECKPOINT_LAG_MS,
     private readonly now: () => number = Date.now,
+    private readonly confirmStored?: ConfirmStored,
   ) {
     this.droppedAtStart = writer.droppedLineCount ?? 0;
   }
 
   /**
-   * Offer the position just reached. `snapshot` is only called if the position
-   * is taken up, so passing over one costs nothing.
+   * Offer the position just reached, with the newest rows written before it.
+   * `snapshot` is only called if the position is taken up, so passing over
+   * one costs nothing.
    */
-  async offer(snapshot: () => MigrationCheckpoint): Promise<void> {
+  async offer(
+    snapshot: () => MigrationCheckpoint,
+    tail: WrittenTail,
+  ): Promise<void> {
     const dropped = this.writer.droppedLineCount ?? 0;
     if (dropped !== this.droppedAtStart) {
       this.candidate = null;
@@ -303,13 +332,25 @@ export class CheckpointTracker {
       const left = settled + dropped;
       const ripe = this.now() - this.candidate.takenAt >= this.lagMs;
       if (!ripe || left < this.candidate.mark) return;
+      if (this.confirmStored && !(await this.stored(this.candidate.tail)))
+        return;
       await this.store.save(this.candidate.checkpoint);
       this.candidate = null;
     }
     this.candidate = {
       checkpoint: snapshot(),
+      tail: { ...tail },
       mark: enqueued,
       takenAt: this.now(),
     };
+  }
+
+  /** A confirmation that fails to answer is a "no": the position waits. */
+  private async stored(tail: WrittenTail): Promise<boolean> {
+    try {
+      return await this.confirmStored!(tail);
+    } catch {
+      return false;
+    }
   }
 }

@@ -237,14 +237,15 @@ for any: the source and range are remembered, credentials never are. Starting
 the identical import again the ordinary way continues it too. **Discard saved
 position** starts over.
 
-The saved position deliberately trails the import by about a minute, and is
-only advanced once the rows behind it have left the plugin. QuestDB does not
-acknowledge rows sent this way, so that margin is what keeps the position behind
-what QuestDB has actually committed: it covers the commit interval lost to a
-crash of Signal K or of QuestDB. On a power cut it also covers the kernel's
-default write-back timing for a QuestDB running on its default `nosync` — an
-assumption, not a guarantee, which is why an external QuestDB should run with
-`sync` like the managed container does (see
+A position is saved only once QuestDB has been asked for the newest row written
+before it and has it — ILP gives no acknowledgment, so the plugin reads the row
+back — and once the position is about a minute old. The first keeps a stalled
+or restarted QuestDB from letting the position past rows it never took, however
+long the stall. The minute covers what a committed row still has to survive: a
+crash of either process, and on a power cut the kernel's default write-back
+timing for a QuestDB running on its default `nosync` — an assumption, not a
+guarantee, which is why an external QuestDB should run with `sync` like the
+managed container does (see
 [Durability on power loss](#durability-on-power-loss)). The position file is
 synced and renamed into place, so a power cut leaves the previous position or
 the new one, never a damaged one; should none survive, the import starts again,

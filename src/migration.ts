@@ -24,7 +24,9 @@ import {
 } from "./migration-checkpoint.js";
 import type {
   CheckpointStore,
+  ConfirmStored,
   MigrationCheckpoint,
+  WrittenTail,
 } from "./migration-checkpoint.js";
 import type {
   MigrationBucket,
@@ -808,6 +810,12 @@ export async function runMigration(
     /** Injected so tests don't wait out the real checkpoint lag. */
     checkpointLagMs?: number;
     now?: () => number;
+    /**
+     * QuestDB's confirmation that rows can be read back, consulted before a
+     * position is saved. Without it a position rests on the writer's counters
+     * and the lag alone.
+     */
+    confirmStored?: ConfirmStored;
   } = {},
 ): Promise<void> {
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -889,26 +897,33 @@ export async function runMigration(
           writer,
           deps.checkpointLagMs,
           now,
+          deps.confirmStored,
         )
       : undefined;
+    // The newest row written to each table, kept up to date by writeRow: what
+    // a position offered after it is confirmed against.
+    const tail: WrittenTail = { context, source };
     // A checkpoint that cannot be written costs a later resume, nothing more.
     // It must not cost the import that is running.
     const offerCheckpoint = async (
       current?: MigrationCheckpoint["current"],
     ): Promise<void> => {
       try {
-        await tracker?.offer(() => ({
-          version: 1,
-          identity,
-          done: [...done],
-          current,
-          progress: {
-            read: run.progress.read,
-            written: run.progress.written,
-            skipped: run.progress.skipped,
-          },
-          updatedAt: new Date(now()).toISOString(),
-        }));
+        await tracker?.offer(
+          () => ({
+            version: 1,
+            identity,
+            done: [...done],
+            current,
+            progress: {
+              read: run.progress.read,
+              written: run.progress.written,
+              skipped: run.progress.skipped,
+            },
+            updatedAt: new Date(now()).toISOString(),
+          }),
+          tail,
+        );
       } catch (err) {
         debug(
           `migration: checkpoint not written: ${err instanceof Error ? err.message : String(err)}`,
@@ -1016,7 +1031,14 @@ export async function runMigration(
               await awaitDrain();
             }
             run.progress.read++;
-            const written = writeRow(row, measurement, context, source, writer);
+            const written = writeRow(
+              row,
+              measurement,
+              context,
+              source,
+              writer,
+              tail,
+            );
             if (written) run.progress.written++;
             else run.progress.skipped++;
           }
@@ -1097,6 +1119,7 @@ function writeRow(
     ILPWriter,
     "writeAtNanos" | "writeStringAtNanos" | "writePositionAtNanos"
   >,
+  tail: WrittenTail,
 ): boolean {
   const path = toSignalKPath(measurement, row.field);
   if (!path) return false;
@@ -1110,6 +1133,7 @@ function writeRow(
         row.tsNanos,
         source,
       );
+      tail.numeric = { path, tsNanos: row.tsNanos };
       return true;
     case "string":
       writer.writeStringAtNanos(
@@ -1120,6 +1144,7 @@ function writeRow(
         undefined,
         source,
       );
+      tail.string = { path, tsNanos: row.tsNanos };
       return true;
     case "boolean":
       writer.writeStringAtNanos(
@@ -1130,10 +1155,12 @@ function writeRow(
         "boolean",
         source,
       );
+      tail.string = { path, tsNanos: row.tsNanos };
       return true;
     case "position": {
       const v = row.value as { latitude: number; longitude: number };
       writer.writePositionAtNanos(context, v, row.tsNanos, source);
+      tail.position = { tsNanos: row.tsNanos };
       return true;
     }
     case "flatten": {
@@ -1153,6 +1180,7 @@ function writeRow(
             row.tsNanos,
             source,
           );
+          tail.numeric = { path: leaf.path, tsNanos: row.tsNanos };
         } else if (typeof leaf.value === "boolean") {
           writer.writeStringAtNanos(
             leaf.path,
@@ -1162,6 +1190,7 @@ function writeRow(
             "boolean",
             source,
           );
+          tail.string = { path: leaf.path, tsNanos: row.tsNanos };
         } else {
           writer.writeStringAtNanos(
             leaf.path,
@@ -1171,6 +1200,7 @@ function writeRow(
             undefined,
             source,
           );
+          tail.string = { path: leaf.path, tsNanos: row.tsNanos };
         }
         any = true;
       }

@@ -38,7 +38,10 @@ import {
   migrationIdentity,
   sameIdentity,
 } from "./migration-checkpoint.js";
-import type { MigrationCheckpoint } from "./migration-checkpoint.js";
+import type {
+  MigrationCheckpoint,
+  WrittenTail,
+} from "./migration-checkpoint.js";
 import {
   WalMonitor,
   buildPendingSegmentsSQL,
@@ -2552,6 +2555,46 @@ export default (app: App) => {
         path.join(app.getDataDirPath(), "influx-import-checkpoint.json"),
       );
 
+      const CONFIRM_STORED_TIMEOUT_MS = 5_000;
+      // QuestDB's word that the rows behind a position are committed and
+      // applied: the newest row written to each table can be read back. ILP
+      // carries nanoseconds and QuestDB stores microseconds, so the row is
+      // looked up at the truncated instant.
+      const instantLiteral = (tsNanos: bigint): string => {
+        const micros = tsNanos / 1000n;
+        const iso = new Date(Number(micros / 1000n)).toISOString();
+        return `'${iso.replace("Z", `${String(micros % 1000n).padStart(3, "0")}Z`)}'`;
+      };
+      const stringLiteral = (s: string): string => `'${s.replace(/'/g, "''")}'`;
+      const confirmStored = async (tail: WrittenTail): Promise<boolean> => {
+        if (!queryClient) return false;
+        const context = stringLiteral(tail.context);
+        const source = stringLiteral(tail.source);
+        const lookups: string[] = [];
+        if (tail.numeric) {
+          lookups.push(
+            `SELECT count() FROM signalk WHERE ts = ${instantLiteral(tail.numeric.tsNanos)} AND path = ${stringLiteral(tail.numeric.path)} AND context = ${context} AND source = ${source}`,
+          );
+        }
+        if (tail.string) {
+          lookups.push(
+            `SELECT count() FROM signalk_str WHERE ts = ${instantLiteral(tail.string.tsNanos)} AND path = ${stringLiteral(tail.string.path)} AND context = ${context} AND source = ${source}`,
+          );
+        }
+        if (tail.position) {
+          lookups.push(
+            `SELECT count() FROM signalk_position WHERE ts = ${instantLiteral(tail.position.tsNanos)} AND context = ${context} AND source = ${source}`,
+          );
+        }
+        // Short-fused: a QuestDB that does not answer is a "no" — the position
+        // waits — rather than a stall of the import behind an open request.
+        for (const sql of lookups) {
+          const result = await queryClient.exec(sql, CONFIRM_STORED_TIMEOUT_MS);
+          if (Number(result.dataset[0]?.[0] ?? 0) < 1) return false;
+        }
+        return true;
+      };
+
       const interruptedView = (
         cp: MigrationCheckpoint,
       ): MigrationInterrupted => ({
@@ -2879,6 +2922,7 @@ export default (app: App) => {
           debug: (msg) => app.debug(msg),
           checkpoints,
           resumeFrom,
+          confirmStored,
         })
           .catch((err: unknown) => {
             // runMigration traps its own failures, but a few statements run
