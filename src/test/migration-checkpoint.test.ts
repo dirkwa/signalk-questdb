@@ -141,6 +141,9 @@ describe("checkpoint file", () => {
       await store.save(checkpoint());
       await store.clear();
       assert.strictEqual(await store.load(), null);
+      await new FileCheckpointStore(
+        path.join(dir, "never", "made", "cp.json"),
+      ).clear();
     }));
 
   // Starting over is always safe; resuming from a position that was never

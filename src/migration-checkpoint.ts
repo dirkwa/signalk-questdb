@@ -137,29 +137,39 @@ export class FileCheckpointStore implements CheckpointStore {
       await fh.close();
     }
     await rename(tmp, this.file);
-    try {
-      const dh = await open(dir, "r");
-      try {
-        await dh.sync();
-      } finally {
-        await dh.close();
-      }
-    } catch (err) {
-      // Not every platform lets a directory be opened and synced; any other
-      // failure is a real one and is not hidden behind a successful save.
-      const code =
-        typeof err === "object" &&
-        err !== null &&
-        "code" in err &&
-        typeof err.code === "string"
-          ? err.code
-          : "";
-      if (!DIRECTORY_SYNC_UNSUPPORTED.has(code)) throw err;
-    }
+    await syncDirectory(dir);
   }
 
+  /** Synced like a save: a cleared checkpoint must not come back after a power cut. */
   async clear(): Promise<void> {
     await rm(this.file, { force: true });
+    await syncDirectory(path.dirname(this.file));
+  }
+}
+
+/**
+ * Put a directory's entries on disk, so a rename or removal in it survives a
+ * power cut. A directory that does not exist has nothing to sync, and not
+ * every platform lets one be opened and synced; any other failure is a real
+ * one and is not hidden.
+ */
+async function syncDirectory(dir: string): Promise<void> {
+  try {
+    const dh = await open(dir, "r");
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  } catch (err) {
+    const code =
+      typeof err === "object" &&
+      err !== null &&
+      "code" in err &&
+      typeof err.code === "string"
+        ? err.code
+        : "";
+    if (code !== "ENOENT" && !DIRECTORY_SYNC_UNSUPPORTED.has(code)) throw err;
   }
 }
 
