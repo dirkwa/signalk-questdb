@@ -744,7 +744,29 @@ you had chosen, and on servers with security enabled it never worked at all.
 
 ## Data Storage
 
-QuestDB data is stored at `~/.signalk/plugin-config-data/signalk-questdb/` on the host, mounted into the container at `/var/lib/questdb`. Data survives container restarts, image upgrades, and plugin disable/enable cycles.
+QuestDB's data root is the plugin's own data directory,
+`<config>/plugin-config-data/signalk-questdb`, whatever the deployment. Data
+survives container restarts, image upgrades, and plugin disable/enable cycles.
+How it reaches the container differs:
+
+- **Bare-metal Signal K**: that directory, mounted at `/var/lib/questdb`.
+- **Signal K in a container with its config directory bind-mounted**: the
+  exact host path of that directory, mounted at `/var/lib/questdb`.
+- **Signal K in a container with its config directory on a named volume**:
+  the volume cannot be mounted from a subdirectory, so it is mounted whole at
+  `/signalk-vols/<volume>` and QuestDB is pointed at the plugin's directory
+  inside it (`QUESTDB_DATA_DIR`). A database found at the volume's root — where
+  a whole-volume mount put it — is moved into the plugin's directory on start;
+  both are the same volume, so nothing is copied. A purge deletes the
+  directory from the Signal K process, since the runtime cannot mount the
+  volume by Signal K's path; where QuestDB's user owns it and the Signal K
+  user cannot delete it, the purge says so and the directory is deleted by
+  hand.
+
+QuestDB's entrypoint makes its data root its own on start, so the plugin keeps
+the one file it writes alongside — the import checkpoint,
+`signalk-questdb.influx-import-checkpoint.json` — next to the directory rather
+than in it. A purge removes it, whether or not the data could be deleted.
 
 ## Grafana Integration
 

@@ -1,4 +1,3 @@
-import path from "node:path";
 import { IRouter } from "express";
 import { waitForContainerManager } from "signalk-container-helper";
 import type {
@@ -48,6 +47,12 @@ import {
   countLegacyImportRows,
   removeLegacyImportRows,
 } from "./migration-cleanup.js";
+import {
+  adoptDatabaseFromVolumeRoot,
+  wipeDataInSignalk,
+  resolveQuestdbMount,
+} from "./questdb-mount.js";
+import type { DataDirFs, QuestdbMount } from "./questdb-mount.js";
 import {
   WalMonitor,
   buildPendingSegmentsSQL,
@@ -466,34 +471,13 @@ export default (app: App) => {
     mountPath: "/plugins/signalk-questdb/console",
   });
 
-  /**
-   * Compute the bind-mount source for QuestDB's /var/lib/questdb volume.
-   *
-   * `app.getDataDirPath()` returns the path from SK's own perspective. On
-   * bare-metal that is the host path and the runtime can use it directly.
-   * When SK runs inside a container the same string is the SK-container-
-   * internal path, and the host's runtime daemon — which is on the host,
-   * not inside SK — cannot resolve it. signalk-container 1.9.0+ exposes
-   * `resolveHostPath()` to translate such paths back to the host source;
-   * if it returns null (older signalk-container or no covering mount) we
-   * fall back to the original path, preserving bare-metal behaviour.
-   */
-  async function resolveQuestdbVolumeSource(
+  /** The mount for QuestDB's data directory — see questdb-mount.ts. */
+  async function resolveQuestdbDataMount(
     containers: ContainerManagerApi,
-  ): Promise<string> {
-    const dataPath = app.getDataDirPath();
-    if (typeof containers.resolveHostPath !== "function") return dataPath;
-    // signalk-container's resolveHostPath is documented as non-throwing, but
-    // we consume it through a runtime cross-plugin API (cast through `any`),
-    // so an unexpected throw from a future or older version must not abort
-    // startup — fall back to the original path instead.
-    try {
-      const resolved = await containers.resolveHostPath(dataPath);
-      return resolved?.source ?? dataPath;
-    } catch (err) {
-      app.debug("resolveHostPath threw, falling back to dataPath:", err);
-      return dataPath;
-    }
+  ): Promise<QuestdbMount> {
+    return resolveQuestdbMount(containers, app.getDataDirPath(), (msg) =>
+      app.debug(msg),
+    );
   }
 
   /**
@@ -923,15 +907,44 @@ export default (app: App) => {
       try {
         const containerEnv = buildContainerEnv(config);
 
-        const volumeSource = await resolveQuestdbVolumeSource(containers);
+        const mount = await resolveQuestdbDataMount(containers);
         if (signal.aborted) return;
+        // A volume-backed data directory: what QuestDB wrote at the volume's
+        // root while the offset went unhonoured is its database, and would be
+        // left behind. Both places are one volume, so it is renamed across.
+        if (mount.volumeRootInSignalk) {
+          const fs = await import("fs/promises");
+          const dataFs: DataDirFs = {
+            exists: (p) =>
+              fs.access(p).then(
+                () => true,
+                () => false,
+              ),
+            rename: (from, to) => fs.rename(from, to),
+            mkdir: (p) => fs.mkdir(p, { recursive: true }).then(() => {}),
+          };
+          const moved = await adoptDatabaseFromVolumeRoot(
+            dataFs,
+            mount.volumeRootInSignalk,
+            app.getDataDirPath(),
+            // The container from before may still be running on that root,
+            // and QuestDB writes to paths under its root, so it is stopped
+            // before its directories move — once the move is known to go
+            // ahead; ensureRunning below brings it back on the new mount.
+            () => containers.stop(QUESTDB_CONTAINER_NAME),
+          );
+          if (signal.aborted) return;
+          if (moved.length > 0) {
+            app.debug(
+              `moved QuestDB's database from the volume root into the data directory: ${moved.join(", ")}`,
+            );
+          }
+        }
         const containerConfig: ContainerConfig = {
           image: "questdb/questdb",
           tag: config.questdbVersion ?? "latest",
-          volumes: {
-            "/var/lib/questdb": volumeSource,
-          },
-          env: containerEnv,
+          volumes: mount.volumes,
+          env: { ...containerEnv, ...mount.env },
           restart: "unless-stopped",
           resources: buildResourceLimits(config),
           ulimits: QUESTDB_ULIMITS,
@@ -1981,16 +1994,16 @@ export default (app: App) => {
             // the plugin claim a version the still-running old container is not
             // actually on, surviving restarts.
 
-            const updateVolumeSource =
-              await resolveQuestdbVolumeSource(containers);
+            const updateMount = await resolveQuestdbDataMount(containers);
             app.setPluginStatus(`Starting QuestDB ${newTag}...`);
             const updateConfig: ContainerConfig = {
               image: "questdb/questdb",
               tag: newTag,
-              volumes: {
-                "/var/lib/questdb": updateVolumeSource,
+              volumes: updateMount.volumes,
+              env: {
+                ...buildContainerEnv(currentConfig ?? {}),
+                ...updateMount.env,
               },
-              env: buildContainerEnv(currentConfig ?? {}),
               restart: "unless-stopped",
               resources: currentConfig
                 ? buildResourceLimits(currentConfig)
@@ -2432,6 +2445,14 @@ export default (app: App) => {
         }
       });
 
+      // One import runs at a time, so one checkpoint is all there is to keep.
+      // Beside the data directory, not in it: QuestDB's entrypoint chowns its
+      // data root to its own uid on start, after which the Signal K user can
+      // no longer create a file there.
+      const checkpoints = new FileCheckpointStore(
+        `${app.getDataDirPath()}.influx-import-checkpoint.json`,
+      );
+
       router.post("/api/purge-data", async (_req, res) => {
         try {
           // Not under a rebuild of the string table: it holds the writer
@@ -2460,7 +2481,10 @@ export default (app: App) => {
             res.status(503).json({ error: "Container manager not available" });
             return;
           }
-          if (!containers.removeManagedData) {
+          // A volume is purged from this process; only a host path needs
+          // signalk-container's in-userns wipe.
+          const mount = await resolveQuestdbDataMount(containers);
+          if (mount.wipe === "runtime" && !containers.removeManagedData) {
             res.status(501).json({
               error:
                 "Data removal requires signalk-container 1.19.0 or newer. Update it, or delete the QuestDB data directory manually.",
@@ -2505,13 +2529,34 @@ export default (app: App) => {
             }
             queryClient = null;
 
-            const hostPath = await resolveQuestdbVolumeSource(containers);
             app.setPluginStatus("Removing QuestDB container and data...");
-            await containers.removeManagedData!(
-              QUESTDB_CONTAINER_NAME,
-              hostPath,
-              { ownerPluginId: "signalk-questdb" },
-            );
+            try {
+              if (mount.wipe === "runtime") {
+                await containers.removeManagedData!(
+                  QUESTDB_CONTAINER_NAME,
+                  mount.wipePath,
+                  { ownerPluginId: "signalk-questdb" },
+                );
+              } else {
+                // A volume: the runtime cannot mount it by Signal K's path,
+                // so signalk-container's in-userns wipe would mount the wrong
+                // directory. Delete from here, the one process that reaches
+                // it.
+                await containers.remove(QUESTDB_CONTAINER_NAME);
+                const fs = await import("fs/promises");
+                await wipeDataInSignalk(
+                  (p) => fs.rm(p, { recursive: true, force: true }),
+                  mount.wipePath,
+                );
+              }
+            } finally {
+              // The checkpoint names a position in the database being
+              // deleted; a fresh one must not be offered a resume into it.
+              // Cleared even when the delete is refused: the purge was asked
+              // for, and the position would outlive the database once it is
+              // deleted by hand.
+              await checkpoints.clear();
+            }
           };
 
           // Purge is the RECOVERY action, so it must make progress even when a
@@ -2602,11 +2647,6 @@ export default (app: App) => {
         error: run.error,
         resumedFrom: run.resumedFrom,
       });
-
-      // One import runs at a time, so one checkpoint is all there is to keep.
-      const checkpoints = new FileCheckpointStore(
-        path.join(app.getDataDirPath(), "influx-import-checkpoint.json"),
-      );
 
       const CONFIRM_STORED_TIMEOUT_MS = 5_000;
       // QuestDB's word that the rows behind a position are committed and
