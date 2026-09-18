@@ -1101,6 +1101,37 @@ export async function runMigration(
 
     failOnDrops();
 
+    // "Done" is a claim about QuestDB, not about the writer. The last rows
+    // are still on their way when the loop ends, so wait for them to leave
+    // the writer and, where QuestDB can be asked, for it to read the newest
+    // of them back — the same standard a saved position is held to. A run
+    // that cannot get that within the drain timeout fails and keeps its
+    // checkpoint, so the last windows are done again rather than assumed.
+    if (!run.isCancelled) {
+      const mark = writer.enqueuedLineCount;
+      let waited = 0;
+      for (;;) {
+        failOnDrops();
+        const settled =
+          mark === undefined ||
+          writer.settledLineCount === undefined ||
+          writer.settledLineCount + (writer.droppedLineCount ?? 0) >= mark;
+        const confirmed =
+          settled &&
+          (!deps.confirmStored ||
+            (await deps.confirmStored(tail).catch(() => false)));
+        if (confirmed) break;
+        if (waited >= WRITER_DRAIN_TIMEOUT_MS) {
+          throw new Error(
+            `QuestDB has not confirmed the last rows after ${Math.round(WRITER_DRAIN_TIMEOUT_MS / 1000)}s. ` +
+              `Re-run the import once QuestDB is healthy (already-imported rows are not duplicated).`,
+          );
+        }
+        await sleep(200);
+        waited += 200;
+      }
+    }
+
     run.state = run.isCancelled ? "cancelled" : "done";
     // Nothing left to resume. Kept on a cancel or a failure, which is exactly
     // when a later run wants it.

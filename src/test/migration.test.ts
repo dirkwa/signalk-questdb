@@ -2394,6 +2394,69 @@ describe("resuming an import", () => {
     );
   });
 
+  // "Done" must mean QuestDB has the rows, not that the writer was handed
+  // them: the last minute's rows are still in flight when the loop ends, and
+  // a cleared checkpoint would leave nothing to resume if they were lost.
+  test("done waits for the last rows to be confirmed", async () => {
+    const checkpoints = new MemoryCheckpoints();
+    let answers = 0;
+    const run = new MigrationRun("r", "http://x", "db");
+    await runMigration(resumeRequest(), new SettledWriter(), run, {
+      fetchImpl: dailySource().fetchImpl,
+      checkpoints,
+      sleep: async () => {},
+      // QuestDB says no twice, then has the rows.
+      confirmStored: async () => ++answers > 2,
+    });
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(answers, 3);
+    assert.strictEqual(checkpoints.current, null);
+  });
+
+  test("a run whose last rows are never confirmed fails and keeps its position", async () => {
+    const checkpoints = new MemoryCheckpoints();
+    const run = new MigrationRun("r", "http://x", "db");
+    let slept = 0;
+    let answers = 0;
+    await runMigration(resumeRequest(), new SettledWriter(), run, {
+      fetchImpl: dailySource().fetchImpl,
+      checkpoints,
+      checkpointLagMs: 0,
+      sleep: async () => {
+        slept++;
+      },
+      // QuestDB confirms the first positions, then stops answering yes.
+      confirmStored: async () => ++answers <= 3,
+    });
+    assert.strictEqual(run.state, "failed");
+    assert.match(run.error ?? "", /not confirmed the last rows/);
+    assert.ok(slept > 0, "gave up without waiting");
+    // The last position that was confirmed is still there to resume from;
+    // a false "done" would have cleared it.
+    assert.ok(checkpoints.current, "the saved position was cleared");
+    assert.ok(checkpoints.current.done.length < 3);
+  });
+
+  test("done waits for the last rows to leave the writer", async () => {
+    const writer = new SettledWriter();
+    // Everything enqueued is still in the writer until a sleep lets it go.
+    let held = true;
+    Object.defineProperty(writer, "settledLineCount", {
+      get: () => (held ? 0 : writer.enqueuedLineCount),
+    });
+    const run = new MigrationRun("r", "http://x", "db");
+    let slept = 0;
+    await runMigration(resumeRequest(), writer, run, {
+      fetchImpl: dailySource().fetchImpl,
+      sleep: async () => {
+        slept++;
+        held = false;
+      },
+    });
+    assert.strictEqual(run.state, "done");
+    assert.strictEqual(slept, 1);
+  });
+
   test("a checkpoint that cannot be written does not fail the import", async () => {
     const failing: CheckpointStore = {
       save: async () => {
