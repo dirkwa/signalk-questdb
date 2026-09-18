@@ -158,25 +158,26 @@ Registered via `app.registerHistoryProvider()`. Supports playback at configurabl
 
 All mounted at `/plugins/signalk-questdb/api/`:
 
-| Method | Path                                     | Description                                                                              |
-| ------ | ---------------------------------------- | ---------------------------------------------------------------------------------------- |
-| GET    | `/status`                                | QuestDB health, row counts, active paths                                                 |
-| GET    | `/query?sql=...`                         | Read-only SQL proxy (DDL/DML blocked)                                                    |
-| GET    | `/paths`                                 | All recorded paths with row counts and time range                                        |
-| GET    | `/versions`                              | QuestDB releases from GitHub (for version picker)                                        |
-| GET    | `/update/check`                          | Compare running version against latest release                                           |
-| POST   | `/update/apply`                          | Pull latest image, recreate container, reconnect                                         |
-| POST   | `/purge-data`                            | Remove the QuestDB container and delete all its data (rootless-Podman-safe)              |
-| GET    | `/migration/detect`                      | Detect InfluxDB (supports `?url=` for remote)                                            |
-| POST   | `/migration/buckets`                     | List buckets (2.x) or databases (1.x); credentials in the body, never the query string   |
-| POST   | `/migration/measurements`                | List measurements and their field keys in a bucket/database                              |
-| POST   | `/migration/start`                       | Start an import, or continue a stopped one with `{"resume": true}`; returns immediately  |
-| GET    | `/migration/status`                      | Progress and state of the current/last import, and any stopped import that can resume    |
-| POST   | `/migration/cancel`                      | Cancel the running import; any saved position is kept                                    |
-| POST   | `/migration/discard`                     | Forget a stopped import's saved position, so the next start begins again                 |
-| GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)               |
-| GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                   |
-| GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet. Optional half-open `[from, to)` range for slicing into shards |
+| Method | Path                                     | Description                                                                               |
+| ------ | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
+| GET    | `/status`                                | QuestDB health, row counts, active paths                                                  |
+| GET    | `/query?sql=...`                         | Read-only SQL proxy (DDL/DML blocked)                                                     |
+| GET    | `/paths`                                 | All recorded paths with row counts and time range                                         |
+| GET    | `/versions`                              | QuestDB releases from GitHub (for version picker)                                         |
+| GET    | `/update/check`                          | Compare running version against latest release                                            |
+| POST   | `/update/apply`                          | Pull latest image, recreate container, reconnect                                          |
+| POST   | `/purge-data`                            | Remove the QuestDB container and delete all its data (rootless-Podman-safe)               |
+| GET    | `/migration/detect`                      | Detect InfluxDB (supports `?url=` for remote)                                             |
+| POST   | `/migration/buckets`                     | List buckets (2.x) or databases (1.x); credentials in the body, never the query string    |
+| POST   | `/migration/measurements`                | List measurements and their field keys in a bucket/database                               |
+| POST   | `/migration/contexts`                    | List the vessels (`context` tag values) a bucket/database holds, and which is this server |
+| POST   | `/migration/start`                       | Start an import, or continue a stopped one with `{"resume": true}`; returns immediately   |
+| GET    | `/migration/status`                      | Progress and state of the current/last import, and any stopped import that can resume     |
+| POST   | `/migration/cancel`                      | Cancel the running import; any saved position is kept                                     |
+| POST   | `/migration/discard`                     | Forget a stopped import's saved position, so the next start begins again                  |
+| GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)                |
+| GET    | `/full-export/tables`                    | List tables exposed by the per-table full-export route                                    |
+| GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet. Optional half-open `[from, to)` range for slicing into shards  |
 
 ### `/full-export/:table` (since 0.4.0)
 
@@ -217,6 +218,14 @@ How the data maps:
 - Positions go to `signalk_position`, whether stored as a `jsonValue`
   (signalk-to-influxdb 1.x) or as a `lat`/`lon` or `latitude`/`longitude` field
   pair (signalk-to-influxdb2).
+- Both writers tag every point with the **context** of the vessel it belongs
+  to, so a source that recorded other vessels holds several. The panel lists
+  them and asks which is yours — preselected when the source knows this
+  server's identity, or holds only one vessel — and that vessel's history is
+  imported as `self`. The others are imported under their own contexts, as the
+  history API serves them, or left out if you untick that. The recording
+  server's identity is usually not this server's (a new install has a new
+  one), which is why it is chosen rather than matched.
 - Rows keep their **original nanosecond timestamps**, so imported history sorts
   and aggregates alongside live data.
 - History is **streamed**: read in batches and written before more is asked

@@ -15,6 +15,7 @@ import type {
   UpdateApplyResponse,
   UpdateInfo,
   WalDiagnosis,
+  MigrationContextsResponse,
 } from "../api-contract.js";
 import type { SkipPlan } from "../wal-monitor.js";
 import {
@@ -31,6 +32,7 @@ import { S } from "./styles.js";
 import {
   formatDateTime,
   toMigrationBuckets,
+  toMigrationContexts,
   toMigrationInterrupted,
   toMigrationRange,
   toMigrationMeasurements,
@@ -203,6 +205,15 @@ export default function PluginConfigurationPanel({
     MigrationMeasurement[] | null
   >(null);
   const [migrationLoadingMeta, setMigrationLoadingMeta] = useState(false);
+  // The vessels the source holds, and which of them is ours. The source tags
+  // every point with the context the recording server used, which is not
+  // necessarily this server's, so it is chosen rather than matched.
+  const [migrationContexts, setMigrationContexts] = useState<Pick<
+    MigrationContextsResponse,
+    "contexts" | "self"
+  > | null>(null);
+  const [migrationSelfContext, setMigrationSelfContext] = useState("");
+  const [migrationOthers, setMigrationOthers] = useState(true);
   const [migrationFrom, setMigrationFrom] = useState("");
   const [migrationTo, setMigrationTo] = useState("");
   const [migrationRun, setMigrationRun] = useState<
@@ -553,6 +564,62 @@ export default function PluginConfigurationPanel({
     [migrationAuthBody],
   );
 
+  // Read through a ref so that editing a credential does not re-run the
+  // discovery below and throw away a vessel the user has already chosen; the
+  // credentials that listed the bucket are the ones that describe it.
+  const migrationAuthRef = useRef(migrationAuthBody);
+  useEffect(() => {
+    migrationAuthRef.current = migrationAuthBody;
+  }, [migrationAuthBody]);
+
+  // Asked as soon as a bucket is chosen: it is one cheap query, and the
+  // answer decides how the import files its rows.
+  useEffect(() => {
+    setMigrationContexts(null);
+    setMigrationSelfContext("");
+    if (!migrationSelected || !migrationBucket) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(
+          "/plugins/signalk-questdb/api/migration/contexts",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: migrationSelected.url,
+              type: migrationSelected.type,
+              bucket: migrationBucket,
+              ...migrationAuthRef.current(),
+            }),
+          },
+        );
+        const body = await res.json().catch(() => null);
+        if (cancelled) return;
+        if (!res.ok) {
+          // Said now, not at Start: a rejected token shows up here first.
+          setActionStatus(
+            (body as ApiError | null)?.error ?? "Could not list the vessels.",
+          );
+          setStatusError(true);
+          return;
+        }
+        const found = toMigrationContexts(body);
+        setMigrationContexts(found);
+        // Our vessel if the source knows it; the only one if there is one;
+        // otherwise the user has to say.
+        setMigrationSelfContext(
+          found.self ?? (found.contexts.length === 1 ? found.contexts[0] : ""),
+        );
+      } catch {
+        // Left unknown: the import then treats the source as one vessel.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [migrationSelected, migrationBucket]);
+
   const loadMeasurements = useCallback(async () => {
     if (!migrationSelected || !migrationBucket) return;
     setMigrationLoadingMeta(true);
@@ -612,6 +679,8 @@ export default function PluginConfigurationPanel({
           ...migrationAuthBody(),
           from: range.from,
           to: range.to,
+          sourceSelfContext: migrationSelfContext || undefined,
+          others: migrationOthers ? "keep" : "skip",
         }),
       });
       const body = await res.json().catch(() => null);
@@ -1932,6 +2001,51 @@ export default function PluginConfigurationPanel({
               </div>
             )}
 
+            {migrationContexts && migrationContexts.contexts.length > 0 && (
+              <>
+                <div style={S.fieldRow}>
+                  <span style={S.label}>Your vessel</span>
+                  <select
+                    style={S.select}
+                    aria-label="Which vessel in the source is this one"
+                    value={migrationSelfContext}
+                    onChange={(e) => setMigrationSelfContext(e.target.value)}
+                  >
+                    {migrationContexts.contexts.length > 1 && (
+                      <option value="">Select...</option>
+                    )}
+                    {migrationContexts.contexts.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                        {c === migrationContexts.self ? " (this server)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {migrationContexts.contexts.length > 1 && (
+                  <>
+                    {!migrationContexts.self && (
+                      <div style={S.fieldHelp}>
+                        The source holds {migrationContexts.contexts.length}{" "}
+                        vessels and none of them is this server&apos;s own
+                        identity. Pick the one the recording server used for
+                        this boat; its history is imported as this vessel.
+                      </div>
+                    )}
+                    <label style={{ ...S.fieldHelp, display: "block" }}>
+                      <input
+                        type="checkbox"
+                        checked={migrationOthers}
+                        onChange={(e) => setMigrationOthers(e.target.checked)}
+                      />{" "}
+                      Also import the other vessels (AIS targets), each under
+                      its own context
+                    </label>
+                  </>
+                )}
+              </>
+            )}
+
             {migrationMeasurements && (
               <div style={S.fieldHelp}>
                 {migrationMeasurements.length} measurement
@@ -1986,6 +2100,8 @@ export default function PluginConfigurationPanel({
                   !migrationBucket ||
                   !migrationFrom ||
                   !migrationTo ||
+                  ((migrationContexts?.contexts.length ?? 0) > 1 &&
+                    !migrationSelfContext) ||
                   migrationRun?.state === "running"
                 }
                 onClick={startMigration}

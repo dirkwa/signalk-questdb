@@ -215,6 +215,14 @@ export interface MigrationMeasurementsResponse extends ApiError {
   measurements: MigrationMeasurement[];
 }
 
+/** POST /api/migration/contexts: the vessels a bucket/database holds. */
+export interface MigrationContextsResponse extends ApiError {
+  /** Distinct `context` tag values, sorted. Empty for a non-Signal K schema. */
+  contexts: string[];
+  /** The one that is this server's own vessel, when it is among them. */
+  self?: string;
+}
+
 /** Per-run counters, also the shape the panel renders as progress. */
 export interface MigrationProgress {
   /** Rows read from InfluxDB. */

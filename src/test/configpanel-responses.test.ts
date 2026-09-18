@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   formatDateTime,
   toMigrationBuckets,
+  toMigrationContexts,
   toMigrationInterrupted,
   toMigrationMeasurements,
   toMigrationRange,
@@ -326,5 +327,39 @@ describe("formatDateTime", () => {
     );
     assert.equal(formatDateTime("not a date"), "not a date");
     assert.equal(formatDateTime(""), "");
+  });
+});
+
+describe("toMigrationContexts", () => {
+  const SELF = "vessels.urn:mrn:signalk:uuid:aaaa";
+  const OTHER = "vessels.urn:mrn:imo:mmsi:211000001";
+
+  it("reads the vessels and which one is this server", () => {
+    assert.deepEqual(
+      toMigrationContexts({ contexts: [OTHER, SELF], self: SELF }),
+      { contexts: [OTHER, SELF], self: SELF },
+    );
+  });
+
+  it("only trusts a self that is among the vessels", () => {
+    assert.equal(
+      toMigrationContexts({ contexts: [OTHER], self: SELF }).self,
+      undefined,
+    );
+  });
+
+  it("reads anything else as no vessels found", () => {
+    for (const body of [
+      null,
+      "<html>",
+      {},
+      { contexts: "all" },
+      { contexts: [1, ""] },
+    ]) {
+      assert.deepEqual(toMigrationContexts(body), {
+        contexts: [],
+        self: undefined,
+      });
+    }
   });
 });

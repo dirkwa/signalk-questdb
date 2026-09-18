@@ -27,7 +27,9 @@ import { buildFullExportWhere } from "./full-export-range.js";
 import { detectInflux, validateInfluxUrl } from "./influx-detect.js";
 import {
   DEFAULT_WINDOW_MS,
+  isSignalKContext,
   listBuckets,
+  listContexts,
   listMeasurements,
   runMigration,
   MigrationRun,
@@ -67,6 +69,7 @@ import type {
   DbStatus,
   MigrationDetectResponse,
   MigrationBucketsResponse,
+  MigrationContextsResponse,
   MigrationInterrupted,
   MigrationMeasurementsResponse,
   MigrationStatusResponse,
@@ -2568,22 +2571,21 @@ export default (app: App) => {
       const stringLiteral = (s: string): string => `'${s.replace(/'/g, "''")}'`;
       const confirmStored = async (tail: WrittenTail): Promise<boolean> => {
         if (!queryClient) return false;
-        const context = stringLiteral(tail.context);
         const source = stringLiteral(tail.source);
         const lookups: string[] = [];
         if (tail.numeric) {
           lookups.push(
-            `SELECT count() FROM signalk WHERE ts = ${instantLiteral(tail.numeric.tsNanos)} AND path = ${stringLiteral(tail.numeric.path)} AND context = ${context} AND source = ${source}`,
+            `SELECT count() FROM signalk WHERE ts = ${instantLiteral(tail.numeric.tsNanos)} AND path = ${stringLiteral(tail.numeric.path)} AND context = ${stringLiteral(tail.numeric.context)} AND source = ${source}`,
           );
         }
         if (tail.string) {
           lookups.push(
-            `SELECT count() FROM signalk_str WHERE ts = ${instantLiteral(tail.string.tsNanos)} AND path = ${stringLiteral(tail.string.path)} AND context = ${context} AND source = ${source}`,
+            `SELECT count() FROM signalk_str WHERE ts = ${instantLiteral(tail.string.tsNanos)} AND path = ${stringLiteral(tail.string.path)} AND context = ${stringLiteral(tail.string.context)} AND source = ${source}`,
           );
         }
         if (tail.position) {
           lookups.push(
-            `SELECT count() FROM signalk_position WHERE ts = ${instantLiteral(tail.position.tsNanos)} AND context = ${context} AND source = ${source}`,
+            `SELECT count() FROM signalk_position WHERE ts = ${instantLiteral(tail.position.tsNanos)} AND context = ${stringLiteral(tail.position.context)} AND source = ${source}`,
           );
         }
         // Short-fused: a QuestDB that does not answer is a "no" — the position
@@ -2724,6 +2726,43 @@ export default (app: App) => {
         }
       });
 
+      // POST like /buckets and /measurements: the credentials travel in the
+      // body. Answers with the vessels the source holds, and which of them is
+      // this server's own vessel, if any is.
+      router.post("/api/migration/contexts", async (req, res) => {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const baseUrl = validateInfluxUrl(
+          typeof body.url === "string" ? body.url : "http://localhost:8086",
+        );
+        const bucket = typeof body.bucket === "string" ? body.bucket : "";
+        if (!baseUrl || !bucket) {
+          res.status(400).json({
+            error: "Missing or invalid url/bucket",
+            contexts: [],
+          } satisfies MigrationContextsResponse);
+          return;
+        }
+        try {
+          const contexts = await listContexts({
+            url: baseUrl,
+            type: typeof body.type === "string" ? body.type : "influxdb2",
+            bucket,
+            auth: readAuth(body),
+          });
+          res.json({
+            contexts,
+            self: contexts.includes(app.selfContext)
+              ? app.selfContext
+              : undefined,
+          } satisfies MigrationContextsResponse);
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+            contexts: [],
+          } satisfies MigrationContextsResponse);
+        }
+      });
+
       router.post("/api/migration/start", async (req, res) => {
         // One import at a time. Two concurrent runs would interleave on the
         // single ILP writer and race each other for its buffer, and there is
@@ -2820,9 +2859,7 @@ export default (app: App) => {
           rawContext === `vessels.${app.selfId}`
         ) {
           importContext = "self";
-        } else if (
-          /^(vessels|atons|aircraft|sar)\.[A-Za-z0-9:._-]+$/.test(rawContext)
-        ) {
+        } else if (isSignalKContext(rawContext)) {
           importContext = rawContext;
         } else {
           res.status(400).json({
@@ -2831,6 +2868,67 @@ export default (app: App) => {
           } satisfies MigrationStatusResponse);
           return;
         }
+
+        // Which of the source's vessels is the own one. The source tags every
+        // point with the context the recording server used, and that is not
+        // necessarily this server's — a new install has a new identity — so
+        // it is chosen rather than matched. Absent, a single-vessel source is
+        // unambiguous; a source holding several vessels is refused rather
+        // than filed wholesale under one of them.
+        // A supplied choice is checked against the source too: one that is
+        // not a vessel there would make nothing the own vessel, and the whole
+        // import would land under other contexts without a word.
+        const rawSelf =
+          typeof body.sourceSelfContext === "string"
+            ? body.sourceSelfContext.trim()
+            : "";
+        // A resume of a checkpoint from before vessels were told apart keeps
+        // its meaning — every row the own vessel — rather than being given a
+        // choice it never made, which would make it a different import and
+        // start it over.
+        const legacyResume =
+          posted.resume === true &&
+          stored !== null &&
+          stored.identity.sourceSelfContext === undefined;
+        let found: string[] = [];
+        if (!legacyResume) {
+          try {
+            found = await listContexts({
+              url: baseUrl,
+              type: typeof body.type === "string" ? body.type : "influxdb2",
+              bucket,
+              auth: readAuth(body),
+            });
+          } catch (err) {
+            res.status(502).json({
+              error: err instanceof Error ? err.message : "Unknown error",
+            } satisfies MigrationStatusResponse);
+            return;
+          }
+        }
+        let sourceSelfContext: string | undefined;
+        if (found.length === 0) {
+          // No vessels to tell apart: every row is the own vessel.
+          sourceSelfContext = undefined;
+        } else if (rawSelf) {
+          if (!found.includes(rawSelf)) {
+            res.status(400).json({
+              error: `\`${rawSelf}\` is not a vessel in the source; it holds ${found.join(", ")}`,
+            } satisfies MigrationStatusResponse);
+            return;
+          }
+          sourceSelfContext = rawSelf;
+        } else if (found.length === 1) {
+          sourceSelfContext = found[0];
+        } else {
+          res.status(400).json({
+            error:
+              "The source holds several vessels; say which is yours with `sourceSelfContext`",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        const others: "keep" | "skip" =
+          body.others === "skip" ? "skip" : "keep";
 
         // Kept deliberately narrow: a label is a short identifier, not free
         // text. Anything else falls back to the default.
@@ -2854,6 +2952,8 @@ export default (app: App) => {
           // a SYMBOL value on every imported row and is what the history API
           // queries by, so a malformed one writes history nothing can read.
           context: importContext,
+          sourceSelfContext,
+          others,
           measurements: Array.isArray(body.measurements)
             ? (body.measurements as unknown[]).filter(
                 (m): m is string => typeof m === "string",
