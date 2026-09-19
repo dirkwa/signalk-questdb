@@ -560,11 +560,12 @@ export function createHistoryProviderV2(
           sql = `SELECT ts, lat, lon FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
         }
         const result = await queryClient.exec(sql);
+        // A position goes out as a `[longitude, latitude]` pair — GeoJSON
+        // order, as the History API's OpenAPI schema defines and the other
+        // providers emit — not as the data model's `{latitude, longitude}`.
         const rows: [string, unknown][] = result.dataset.map((row) => [
           row[0] as string,
-          row[1] !== null && row[2] !== null
-            ? { latitude: row[1], longitude: row[2] }
-            : null,
+          row[1] !== null && row[2] !== null ? [row[2], row[1]] : null,
         ]);
         columnData.set(specIndex, rows);
         continue;

@@ -189,6 +189,40 @@ describe("history-v2 navigation.position aggregate", () => {
   });
 });
 
+describe("history-v2 navigation.position value shape", () => {
+  // The History API's schema, and the other providers, hand a position out
+  // as a [longitude, latitude] pair in GeoJSON order; a consumer written to
+  // the docs reads it that way. A bucket without a fix is null.
+  it("emits a [longitude, latitude] pair, null for a bucket without a fix", async () => {
+    const client = {
+      exec: async () => ({
+        columns: [],
+        dataset: [
+          ["2024-01-01T00:00:00.000000Z", 60.17, 24.94],
+          ["2024-01-01T00:01:00.000000Z", null, null],
+        ],
+        count: 2,
+        timestamp: 0,
+      }),
+    } as any;
+    const provider = createHistoryProviderV2(client, SELF_CONTEXT);
+
+    const result = await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-01-01T01:00:00Z" },
+      resolution: 60,
+      pathSpecs: [
+        { path: "navigation.position", aggregate: "first", parameter: [] },
+      ],
+    } as any);
+
+    assert.deepEqual(result.data, [
+      ["2024-01-01T00:00:00.000000Z", [24.94, 60.17]],
+      ["2024-01-01T00:01:00.000000Z", null],
+    ]);
+  });
+});
+
 describe("history-v2 sample bucket guard", () => {
   it("rejects a resolution that would fabricate millions of FILL(NULL) rows", async () => {
     const captured: CapturedQuery[] = [];

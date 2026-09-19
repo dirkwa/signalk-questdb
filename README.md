@@ -97,6 +97,12 @@ GET /signalk/v2/api/history/values?paths=navigation.position|gps.main,navigation
 
 Without a sourceRef a path returns all sources mixed, as before.
 
+A `navigation.position` value is a `[longitude, latitude]` pair — GeoJSON
+order, as the History API defines it and as signalk-to-influxdb2 and
+signalk-parquet return it — not the `{latitude, longitude}` object of the data
+model; a bucket without a fix is `null`. The v1 playback API is unaffected: it
+replays deltas, which carry the object.
+
 > **Breaking change in the v2 values response.** The per-column source is
 > reported as `$source`, not `sourceRef`. That is the key
 > [signalk-server#2817](https://github.com/SignalK/signalk-server/pull/2817)
