@@ -151,7 +151,7 @@ export function toLegacyImportRows(body: unknown): {
  */
 export function toMigrationContexts(
   body: unknown,
-): Pick<MigrationContextsResponse, "contexts" | "self"> {
+): Pick<MigrationContextsResponse, "contexts" | "self" | "selfBy"> {
   const contexts =
     isRecord(body) && Array.isArray(body.contexts)
       ? body.contexts.filter((c): c is string => typeof c === "string" && !!c)
@@ -162,7 +162,13 @@ export function toMigrationContexts(
     contexts.includes(body.self)
       ? body.self
       : undefined;
-  return { contexts, self };
+  const selfBy =
+    self !== undefined &&
+    isRecord(body) &&
+    (body.selfBy === "tag" || body.selfBy === "identity")
+      ? body.selfBy
+      : undefined;
+  return { contexts, self, selfBy };
 }
 
 /**

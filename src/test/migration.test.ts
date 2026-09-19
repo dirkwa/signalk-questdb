@@ -6,6 +6,7 @@ import {
   isSignalKContext,
   listBuckets,
   listContexts,
+  listSelfContexts,
   listMeasurements,
   targetContext,
   mergePositionRows,
@@ -2630,6 +2631,51 @@ describe("vessels in the source", () => {
 
   // Two vessels' fixes at one instant are two positions. Paired by instant
   // alone, one's latitude would meet the other's longitude.
+  // signalk-to-influxdb2 tags the recording server's own vessel with
+  // `self=true`, so the own vessel is known from the data whatever this
+  // server's identity is. The same schema.tagValues shape, narrowed by that
+  // tag.
+  test("2.x names the vessel the source recorded as its own", async () => {
+    let sent = "";
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      sent = String(init?.body ?? "");
+      return new Response(
+        [
+          "#datatype,string,long,string",
+          "#group,false,false,false",
+          "#default,_result,,",
+          ",result,table,_value",
+          `,,0,${SELF}`,
+          "",
+        ].join("\r\n"),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const own = await listSelfContexts(
+      { url: "http://x", type: "influxdb2", bucket: "b" },
+      fakeFetch,
+    );
+    assert.deepStrictEqual(own, [SELF]);
+    assert.match(sent, /schema\.tagValues/);
+    assert.match(sent, /predicate: \(r\) => r\.self == \\"true\\"/);
+  });
+
+  test("1.x carries no such tag, so nothing is claimed", async () => {
+    let called = false;
+    const fakeFetch = (async () => {
+      called = true;
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    assert.deepStrictEqual(
+      await listSelfContexts(
+        { url: "http://x", type: "influxdb1", bucket: "b" },
+        fakeFetch,
+      ),
+      [],
+    );
+    assert.equal(called, false);
+  });
+
   test("positions are paired per vessel, not per instant", () => {
     const merged = mergePositionRows("navigation.position", [
       { tsNanos: 1n, field: "lat", value: 60.1, context: SELF },

@@ -29,6 +29,7 @@ import {
   isSignalKContext,
   listBuckets,
   listContexts,
+  listSelfContexts,
   listMeasurements,
   runMigration,
   MigrationRun,
@@ -470,6 +471,27 @@ export default (app: App) => {
     debug: (msg) => app.debug(msg),
     mountPath: "/plugins/signalk-questdb/console",
   });
+
+  /**
+   * Which of a source's vessels is the own one, when that can be told:
+   * the one the source recorded as its own vessel (signalk-to-influxdb2's
+   * `self` tag), else the one that is this server's identity. A source that
+   * recorded more than one vessel as its own — the recording server's
+   * identity changed — is as undecidable as one that says nothing.
+   */
+  async function ownVessel(
+    source: Parameters<typeof listSelfContexts>[0],
+    contexts: string[],
+  ): Promise<Pick<MigrationContextsResponse, "self" | "selfBy">> {
+    const tagged = await listSelfContexts(source);
+    if (tagged.length === 1 && contexts.includes(tagged[0])) {
+      return { self: tagged[0], selfBy: "tag" };
+    }
+    if (contexts.includes(app.selfContext)) {
+      return { self: app.selfContext, selfBy: "identity" };
+    }
+    return {};
+  }
 
   /** The mount for QuestDB's data directory — see questdb-mount.ts. */
   async function resolveQuestdbDataMount(
@@ -2833,17 +2855,16 @@ export default (app: App) => {
           return;
         }
         try {
-          const contexts = await listContexts({
+          const source = {
             url: baseUrl,
             type: typeof body.type === "string" ? body.type : "influxdb2",
             bucket,
             auth: readAuth(body),
-          });
+          };
+          const contexts = await listContexts(source);
           res.json({
             contexts,
-            self: contexts.includes(app.selfContext)
-              ? app.selfContext
-              : undefined,
+            ...(await ownVessel(source, contexts)),
           } satisfies MigrationContextsResponse);
         } catch (err) {
           res.status(502).json({
@@ -3017,10 +3038,30 @@ export default (app: App) => {
         } else if (found.length === 1) {
           sourceSelfContext = found[0];
         } else {
-          res.status(400).json({
-            error: `The source holds ${found.length} vessels (${found.join(", ")}); say which is yours — "Your vessel" in the panel, or \`sourceSelfContext\` here`,
-          } satisfies MigrationStatusResponse);
-          return;
+          let own: Pick<MigrationContextsResponse, "self" | "selfBy">;
+          try {
+            own = await ownVessel(
+              {
+                url: baseUrl,
+                type: typeof body.type === "string" ? body.type : "influxdb2",
+                bucket,
+                auth: readAuth(body),
+              },
+              found,
+            );
+          } catch (err) {
+            res.status(502).json({
+              error: err instanceof Error ? err.message : "Unknown error",
+            } satisfies MigrationStatusResponse);
+            return;
+          }
+          if (!own.self) {
+            res.status(400).json({
+              error: `The source holds ${found.length} vessels (${found.join(", ")}); say which is yours — "Your vessel" in the panel, or \`sourceSelfContext\` here`,
+            } satisfies MigrationStatusResponse);
+            return;
+          }
+          sourceSelfContext = own.self;
         }
         const others: "keep" | "skip" =
           body.others === "skip" ? "skip" : "keep";
