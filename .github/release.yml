@@ -1,8 +1,23 @@
-# What GitHub's release-notes generator leaves out. release-please builds
-# each release's notes with it (changelog-type: github), so its own release
-# PR — merged right before the tag — would otherwise list itself.
 changelog:
   exclude:
     labels:
+      - skip-changelog
+      # release-please's own release PR, merged right before each tag —
+      # it would otherwise list itself.
       - "autorelease: pending"
       - "autorelease: tagged"
+  categories:
+    - title: 🚀 Features
+      labels:
+        - feature
+        - enhancement
+    - title: 🐛 Fixes
+      labels:
+        - bug
+        - fix
+    - title: 📦 Dependencies
+      labels:
+        - dependencies
+    - title: Other
+      labels:
+        - "*"
