@@ -3018,8 +3018,7 @@ export default (app: App) => {
           sourceSelfContext = found[0];
         } else {
           res.status(400).json({
-            error:
-              "The source holds several vessels; say which is yours with `sourceSelfContext`",
+            error: `The source holds ${found.length} vessels (${found.join(", ")}); say which is yours — "Your vessel" in the panel, or \`sourceSelfContext\` here`,
           } satisfies MigrationStatusResponse);
           return;
         }
