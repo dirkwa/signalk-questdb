@@ -4,25 +4,34 @@ on:
   push:
     branches: [master]
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
+permissions: {}
 
 jobs:
   release-please:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.rp.outputs.releases_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: rp
 
-      # The tag release-please just pushed does not start publish.yml by
-      # itself: an event raised with GITHUB_TOKEN starts no workflow, with
-      # workflow_dispatch as the exception. So publish.yml is dispatched on
-      # the tag — it has to stay the file that publishes, since npm's
-      # trusted publishing is bound to that workflow file.
-      - name: Publish the release
-        if: ${{ steps.rp.outputs.releases_created == 'true' }}
-        env:
+  # The tag release-please just pushed does not start publish.yml by itself:
+  # an event raised with GITHUB_TOKEN starts no workflow, with
+  # workflow_dispatch as the exception. So publish.yml is dispatched on the
+  # tag — it has to stay the file that publishes, since npm's trusted
+  # publishing is bound to that workflow file. Its own job, so that the
+  # right to start workflows is held by nothing but this one command.
+  publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref "${{ steps.rp.outputs.tag_name }}"
+        run: gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref "${{ needs.release-please.outputs.tag_name }}"
