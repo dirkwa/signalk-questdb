@@ -70,16 +70,16 @@ existed have `source` null; they replay unattributed and cannot be filtered.
 
 Registered via `app.registerHistoryApiProvider()`. Supports all aggregate methods:
 
-| Method    | QuestDB mapping                                                                                  |
-| --------- | ------------------------------------------------------------------------------------------------ |
-| `average` | `avg(value)`                                                                                     |
-| `min`     | `min(value)`                                                                                     |
-| `max`     | `max(value)`                                                                                     |
-| `first`   | `first(value)`                                                                                   |
-| `last`    | `last(value)`                                                                                    |
-| `mid`     | `(min + max) / 2`                                                                                |
-| `sma`     | `avg(value)` per bucket, then a moving window over N buckets in the plugin (`sma:N`, default 5)  |
-| `ema`     | `avg(value)` per bucket, then an exponential moving average in the plugin (`ema:α`, default 0.2) |
+| Method    | QuestDB mapping                                                                 |
+| --------- | ------------------------------------------------------------------------------- |
+| `average` | `avg(value)`                                                                    |
+| `min`     | `min(value)`                                                                    |
+| `max`     | `max(value)`                                                                    |
+| `first`   | `first(value)`                                                                  |
+| `last`    | `last(value)`                                                                   |
+| `mid`     | `(min + max) / 2`                                                               |
+| `sma`     | the `average` bucket, then a moving window over N buckets (`sma:N`, default 5)  |
+| `ema`     | the `average` bucket, then an exponential moving average (`ema:α`, default 0.2) |
 
 A sample for `sma` and `ema` is one row of the series the window runs over: a resolution bucket (its average) when the request names a resolution, a raw row otherwise. So `sma:5` at `resolution=180` is a 15-minute moving average, on the same grid as every other column in the response. An empty bucket keeps its place in the window: the average there is of what the window still holds, and a value leaves it N buckets after it arrived. `ema` carries its last value across an empty bucket instead.
 

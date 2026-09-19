@@ -1592,9 +1592,7 @@ describe("history-v2 sourcePolicy=all", () => {
 describe("history-v2 moving averages", () => {
   // A sample is one row of the series the window runs over: a resolution
   // bucket (its average) when the request names a resolution, a raw row
-  // otherwise. Before this the window ran over raw rows whatever the
-  // resolution said, so sma:5 at 180s was a ten-second average on
-  // timestamps no other column shared.
+  // otherwise.
   function client(captured: CapturedQuery[], dataset: unknown[][]) {
     return {
       exec: async (sql: string) => {
@@ -1776,11 +1774,13 @@ describe("history-v2 moving averages", () => {
     }
   });
 
-  it("stays null on a text path instead of reading the string table", async () => {
+  it("does not read the string table for a text path", async () => {
+    // A text path has no rows in the numeric table; SAMPLE BY over none
+    // yields none. The column is then empty rather than filled from
+    // signalk_str, as average would be — text has no moving average.
     const captured: CapturedQuery[] = [];
-    const empty: unknown[][] = [0, 1, 2].map((i) => [ts(i), null]);
     const provider = createHistoryProviderV2(
-      client(captured, empty),
+      client(captured, []),
       SELF_CONTEXT,
     );
     const response = await provider.getValues({
@@ -1791,10 +1791,8 @@ describe("history-v2 moving averages", () => {
     });
 
     assert.equal(captured.length, 1, "expected no signalk_str fallback");
+    assert.ok(!captured[0].sql.includes("signalk_str"), captured[0].sql);
     assert.equal(response.values[0].method, "sma");
-    assert.deepEqual(
-      response.data.map((r) => r[1]),
-      [null, null, null],
-    );
+    assert.deepEqual(response.data, []);
   });
 });

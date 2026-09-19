@@ -97,7 +97,11 @@ function aggregateToSql(method: string): string {
   }
 }
 
-/** Reads every raw row in range, whatever resolution the request names. */
+/**
+ * middle_index is one value, the middle raw row of the whole range, so it
+ * reads every raw row whatever resolution the request names; it has no
+ * per-bucket form.
+ */
 function readsRawRows(method: string): boolean {
   return method === "middle_index";
 }
