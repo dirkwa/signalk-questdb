@@ -228,12 +228,16 @@ How the data maps:
   pair (signalk-to-influxdb2).
 - Both writers tag every point with the **context** of the vessel it belongs
   to, so a source that recorded other vessels holds several. The panel lists
-  them and asks which is yours — preselected when the source knows this
-  server's identity, or holds only one vessel — and that vessel's history is
-  imported as `self`. The others are imported under their own contexts, as the
-  history API serves them, or left out if you untick that. The recording
-  server's identity is usually not this server's (a new install has a new
-  one), which is why it is chosen rather than matched.
+  them and asks which is yours, and that vessel's history is imported as
+  `self`; the others are imported under their own contexts, as the history
+  API serves them, or left out if you untick that. The choice is made for you
+  when the source says: signalk-to-influxdb2 tags its own vessel's points with
+  `self=true`, so that vessel is preselected — as is the one matching this
+  server's identity, or the only one there is. A signalk-to-influxdb 1.x
+  source carries no such tag, so there the choice is yours whenever it holds
+  several vessels and none is this server's identity — the usual case, since
+  the recording server's identity is usually not this server's (a new install
+  has a new one).
 - Rows keep their **original nanosecond timestamps**, so imported history sorts
   and aggregates alongside live data.
 - History is **streamed**: read in batches and written before more is asked

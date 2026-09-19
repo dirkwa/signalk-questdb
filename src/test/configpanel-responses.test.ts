@@ -335,18 +335,43 @@ describe("toMigrationContexts", () => {
   const SELF = "vessels.urn:mrn:signalk:uuid:aaaa";
   const OTHER = "vessels.urn:mrn:imo:mmsi:211000001";
 
-  it("reads the vessels and which one is this server", () => {
+  it("reads the vessels and which one is the own one, and how that is known", () => {
     assert.deepEqual(
-      toMigrationContexts({ contexts: [OTHER, SELF], self: SELF }),
-      { contexts: [OTHER, SELF], self: SELF },
+      toMigrationContexts({
+        contexts: [OTHER, SELF],
+        self: SELF,
+        selfBy: "identity",
+      }),
+      { contexts: [OTHER, SELF], self: SELF, selfBy: "identity" },
+    );
+    assert.equal(
+      toMigrationContexts({
+        contexts: [OTHER, SELF],
+        self: SELF,
+        selfBy: "tag",
+      }).selfBy,
+      "tag",
+    );
+    // A server without the field, or one saying something else.
+    assert.equal(
+      toMigrationContexts({ contexts: [SELF], self: SELF }).selfBy,
+      undefined,
+    );
+    assert.equal(
+      toMigrationContexts({ contexts: [SELF], self: SELF, selfBy: "guess" })
+        .selfBy,
+      undefined,
     );
   });
 
   it("only trusts a self that is among the vessels", () => {
-    assert.equal(
-      toMigrationContexts({ contexts: [OTHER], self: SELF }).self,
-      undefined,
-    );
+    const read = toMigrationContexts({
+      contexts: [OTHER],
+      self: SELF,
+      selfBy: "tag",
+    });
+    assert.equal(read.self, undefined);
+    assert.equal(read.selfBy, undefined);
   });
 
   it("reads anything else as no vessels found", () => {
@@ -360,6 +385,7 @@ describe("toMigrationContexts", () => {
       assert.deepEqual(toMigrationContexts(body), {
         contexts: [],
         self: undefined,
+        selfBy: undefined,
       });
     }
   });

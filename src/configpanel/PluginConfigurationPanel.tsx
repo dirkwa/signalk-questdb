@@ -215,7 +215,7 @@ export default function PluginConfigurationPanel({
   // necessarily this server's, so it is chosen rather than matched.
   const [migrationContexts, setMigrationContexts] = useState<Pick<
     MigrationContextsResponse,
-    "contexts" | "self"
+    "contexts" | "self" | "selfBy"
   > | null>(null);
   const [migrationSelfContext, setMigrationSelfContext] = useState("");
   const [migrationOthers, setMigrationOthers] = useState(true);
@@ -2142,7 +2142,11 @@ export default function PluginConfigurationPanel({
                     {migrationContexts.contexts.map((c) => (
                       <option key={c} value={c}>
                         {c}
-                        {c === migrationContexts.self ? " (this server)" : ""}
+                        {c === migrationContexts.self
+                          ? migrationContexts.selfBy === "tag"
+                            ? " (recorded as the own vessel)"
+                            : " (this server)"
+                          : ""}
                       </option>
                     ))}
                   </select>
@@ -2152,9 +2156,10 @@ export default function PluginConfigurationPanel({
                     {!migrationContexts.self && (
                       <div style={S.fieldHelp}>
                         The source holds {migrationContexts.contexts.length}{" "}
-                        vessels and none of them is this server&apos;s own
-                        identity. Pick the one the recording server used for
-                        this boat; its history is imported as this vessel.
+                        vessels, does not say which was its own, and none of
+                        them is this server&apos;s identity. Pick the one the
+                        recording server used for this boat; its history is
+                        imported as this vessel.
                       </div>
                     )}
                     <label style={{ ...S.fieldHelp, display: "block" }}>

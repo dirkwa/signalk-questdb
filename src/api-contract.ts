@@ -219,8 +219,14 @@ export interface MigrationMeasurementsResponse extends ApiError {
 export interface MigrationContextsResponse extends ApiError {
   /** Distinct `context` tag values, sorted. Empty for a non-Signal K schema. */
   contexts: string[];
-  /** The one that is this server's own vessel, when it is among them. */
+  /** The one that is the own vessel, when that can be told. */
   self?: string;
+  /**
+   * How it can be told: `tag` — the source recorded it as its own vessel
+   * (signalk-to-influxdb2's `self` tag); `identity` — it is this server's
+   * own identity.
+   */
+  selfBy?: "tag" | "identity";
 }
 
 /**

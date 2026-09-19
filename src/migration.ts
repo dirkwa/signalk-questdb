@@ -335,6 +335,37 @@ schema.tagValues(bucket: ${JSON.stringify(req.bucket)}, tag: "context", start: 1
 }
 
 /**
+ * The contexts the source recorded as its own vessel.
+ *
+ * signalk-to-influxdb2 tags every point of the recording server's own vessel
+ * with `self=true` — its own History API answers `vessels.self` by that tag,
+ * not by identity — so the own vessel is known from the data even when the
+ * recording server's identity is not this server's. One context is the
+ * normal answer; more than one means the recording server's identity
+ * changed over time, and the choice is the user's again. signalk-to-influxdb
+ * 1.x writes no such tag, so nothing is claimed for it.
+ */
+export async function listSelfContexts(
+  req: { url: string; type: string; bucket: string; auth?: InfluxAuth },
+  fetchImpl: typeof fetch = fetch,
+): Promise<string[]> {
+  if (req.type !== "influxdb2") return [];
+  const flux = `import "influxdata/influxdb/schema"
+schema.tagValues(bucket: ${JSON.stringify(req.bucket)}, tag: "context", predicate: (r) => r.self == "true", start: 1970-01-01T00:00:00Z)`;
+  const rows = await runFlux(
+    req,
+    flux,
+    authHeaders(req.type, req.auth),
+    fetchImpl,
+  );
+  return [
+    ...new Set(
+      rows.map((r) => r.values["_value"]).filter((v): v is string => !!v),
+    ),
+  ].sort();
+}
+
+/**
  * Whether a string is a Signal K context this plugin will file history under:
  * a vessel, aton, aircraft or SAR target with a well-formed identifier.
  */
