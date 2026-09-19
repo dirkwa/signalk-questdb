@@ -7,7 +7,36 @@ on:
 permissions: {}
 
 jobs:
+  # GitHub's release notes are never empty, so release-please would propose
+  # a release after every merge, a docs or ci change included. Only a push
+  # carrying a change users get — or the merge of the release PR itself,
+  # which is what creates the tag — goes on to it. The subject is each
+  # message's first line; a breaking change counts whatever its type, a
+  # dependency bump when it is a runtime one (dependabot scopes those
+  # `deps`, dev ones `deps-dev`), and a revert because what it undoes has
+  # shipped. The release PR's own title is pull-request-title-pattern in
+  # release-please-config.json. The payload holds at most 2048 commits, so a
+  # push that fills it may hide more and is let through.
+  gate:
+    runs-on: ubuntu-24.04
+    outputs:
+      releasable: ${{ steps.check.outputs.releasable }}
+    steps:
+      - id: check
+        env:
+          MESSAGES: ${{ toJSON(github.event.commits.*.message) }}
+          RELEASABLE: '^((feat|fix|perf|revert)(\([^)]*\))?!?: |[a-z]+(\([^)]*\))?!: |build\(deps\): |Revert |chore(\([^)]*\))?: release v?[0-9])'
+        run: |
+          if jq -e --arg re "$RELEASABLE" '(length >= 2048) or ([.[] | (split("\n")[0] | test($re)) or test("\nBREAKING[- ]CHANGE: ")] | any)' <<< "$MESSAGES" > /dev/null; then
+            echo "releasable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "releasable=false" >> "$GITHUB_OUTPUT"
+            echo "No releasable commit in this push; release-please not run."
+          fi
+
   release-please:
+    needs: gate
+    if: ${{ needs.gate.outputs.releasable == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
