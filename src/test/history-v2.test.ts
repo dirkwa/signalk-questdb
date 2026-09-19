@@ -1771,16 +1771,26 @@ describe("history-v2 moving averages", () => {
 describe("history-v2 middle_index", () => {
   // The middle row of each resolution bucket, by time — a recorded row,
   // not a computed value — and of the whole range without a resolution.
-  function client(captured: CapturedQuery[], dataset: unknown[][]) {
+  type QueryClientArg = Parameters<typeof createHistoryProviderV2>[0];
+  type ValuesArg = Parameters<
+    ReturnType<typeof createHistoryProviderV2>["getValues"]
+  >[0];
+  function client(
+    captured: CapturedQuery[],
+    dataset: unknown[][],
+  ): QueryClientArg {
     return {
       exec: async (sql: string) => {
         captured.push({ sql });
         return { columns: [], dataset, count: dataset.length, timestamp: 0 };
       },
-    } as any;
+    } as unknown as QueryClientArg;
   }
-  const request = (path: string, extra: Record<string, unknown> = {}): any => ({
-    from: { toString: () => "2024-01-01T00:00:00Z" },
+  const request = (
+    path: string,
+    extra: Partial<ValuesArg> = {},
+  ): ValuesArg => ({
+    from: { toString: () => "2024-01-01T00:00:00Z", add: () => undefined },
     to: { toString: () => "2024-01-01T01:00:00Z" },
     resolution: 180,
     pathSpecs: [{ path, aggregate: "middle_index", parameter: [] }],
@@ -1868,16 +1878,20 @@ describe("history-v2 position method", () => {
   // Only first, last and middle_index keep a point the vessel was at.
   // Anything else runs first (the SQL is asserted above), and the column
   // says which method ran.
-  function client(captured: CapturedQuery[]) {
+  type QueryClientArg = Parameters<typeof createHistoryProviderV2>[0];
+  type ValuesArg = Parameters<
+    ReturnType<typeof createHistoryProviderV2>["getValues"]
+  >[0];
+  function client(captured: CapturedQuery[]): QueryClientArg {
     return {
       exec: async (sql: string) => {
         captured.push({ sql });
         return { columns: [], dataset: [], count: 0, timestamp: 0 };
       },
-    } as any;
+    } as unknown as QueryClientArg;
   }
-  const request = (aggregate: string): any => ({
-    from: { toString: () => "2024-01-01T00:00:00Z" },
+  const request = (aggregate: string): ValuesArg => ({
+    from: { toString: () => "2024-01-01T00:00:00Z", add: () => undefined },
     to: { toString: () => "2024-01-01T01:00:00Z" },
     resolution: 60,
     pathSpecs: [{ path: "navigation.position", aggregate, parameter: [] }],
