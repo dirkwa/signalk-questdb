@@ -1,5 +1,9 @@
 name: Publish Package
 
+# Every v* tag publishes to npm. Release tags come from release-please
+# (merging its release PR creates the tag and the GitHub release);
+# pre-release tags are pushed by hand, and only those get their GitHub
+# release created here.
 on:
   push:
     tags:
@@ -7,6 +11,7 @@ on:
 
 jobs:
   release:
+    if: ${{ contains(github.ref_name, '-beta.') || contains(github.ref_name, '-rc.') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -26,7 +31,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish:
-    needs: release
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
