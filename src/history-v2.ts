@@ -97,21 +97,75 @@ function aggregateToSql(method: string): string {
   }
 }
 
-function needsClientSideAggregation(method: string): boolean {
-  return method === "middle_index" || method === "sma" || method === "ema";
+/**
+ * middle_index is one value, the middle raw row of the whole range, so it
+ * reads every raw row whatever resolution the request names; it has no
+ * per-bucket form.
+ */
+function readsRawRows(method: string): boolean {
+  return method === "middle_index";
 }
 
+function isMovingAverage(method: string): boolean {
+  return method === "sma" || method === "ema";
+}
+
+/**
+ * The window of a moving average, from `path:method:parameter`. A sample is
+ * one row of the series the window runs over: a resolution bucket when the
+ * request names a resolution, a raw row otherwise. Defaults are the ones the
+ * server's API docs suggest.
+ */
+function movingAverageWindow(
+  spec: PathSpec,
+): { samples: number } | { alpha: number } {
+  const raw = spec.parameter[0];
+  if (spec.aggregate === "sma") {
+    if (raw === undefined) return { samples: 5 };
+    const samples = Number(raw);
+    if (!Number.isInteger(samples) || samples < 1) {
+      throw new Error(
+        `sma:${raw} — the window is a whole number of samples, at least 1; ` +
+          `without a parameter it is 5`,
+      );
+    }
+    return { samples };
+  }
+  if (raw === undefined) return { alpha: 0.2 };
+  const alpha = Number(raw);
+  if (!(alpha > 0 && alpha <= 1)) {
+    throw new Error(
+      `ema:${raw} — alpha is a number above 0 and up to 1; ` +
+        `without a parameter it is 0.2`,
+    );
+  }
+  return { alpha };
+}
+
+/**
+ * Moving average over the last `n` samples of a series. An empty sample
+ * (null) still takes its place in the window — on a resolution grid it is a
+ * bucket in time — so a value drops out `n` samples after it arrived whether
+ * or not anything followed it. The result at a sample is the mean of the
+ * non-empty ones the window holds, null when it holds none.
+ */
 function computeSMA(values: (number | null)[], n: number): (number | null)[] {
   const result: (number | null)[] = [];
-  const window: number[] = [];
-  for (const v of values) {
-    if (v === null) {
-      result.push(null);
-      continue;
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < values.length; i++) {
+    const arrived = values[i];
+    if (arrived !== null) {
+      sum += arrived;
+      count += 1;
     }
-    window.push(v);
-    if (window.length > n) window.shift();
-    result.push(window.reduce((a, b) => a + b, 0) / window.length);
+    // The sample that was in the window one step ago and is not any more.
+    const gone = i >= n ? values[i - n] : null;
+    if (gone !== null) {
+      sum -= gone;
+      count -= 1;
+    }
+    result.push(count > 0 ? sum / count : null);
   }
   return result;
 }
@@ -403,6 +457,12 @@ export function createHistoryProviderV2(
     const expandBySource =
       sourcePolicyAllEnabled && query.sourcePolicy === "all";
 
+    // Checked before any query runs, so a bad window fails the request whole
+    // instead of after the columns ahead of it were already read.
+    for (const spec of query.pathSpecs) {
+      if (isMovingAverage(spec.aggregate)) movingAverageWindow(spec);
+    }
+
     const requestedContext = query.context ?? "vessels.self";
     const storedContext = normalizeContext(requestedContext, selfContext);
     const safeContext = validateIdentifier(storedContext);
@@ -486,8 +546,7 @@ export function createHistoryProviderV2(
     // the case the cap is for.
     //
     // Only columns that actually run a SAMPLE BY query fabricate buckets:
-    // client-side aggregates (sma/ema/middle_index) read raw rows under a
-    // LIMIT and must not trip the cap.
+    // middle_index reads raw rows under a LIMIT and must not trip the cap.
     //
     // A non-numeric path costs TWO such queries: the numeric one comes back
     // empty and the string-table fallback repeats it against signalk_str.
@@ -497,14 +556,15 @@ export function createHistoryProviderV2(
     // run at twice the ceiling.
     const sampledSpecs = columns.filter(
       (spec) =>
-        spec.path === "navigation.position" ||
-        !needsClientSideAggregation(spec.aggregate),
+        spec.path === "navigation.position" || !readsRawRows(spec.aggregate),
     ).length;
-    // navigation.position is served by its own table and never falls back.
+    // navigation.position is served by its own table and never falls back,
+    // and a moving average has no text to fall back to.
     const fallbackCapableSpecs = columns.filter(
       (spec) =>
         spec.path !== "navigation.position" &&
-        !needsClientSideAggregation(spec.aggregate),
+        !readsRawRows(spec.aggregate) &&
+        !isMovingAverage(spec.aggregate),
     ).length;
 
     if (sampledSpecs > 0 && query.resolution && query.resolution > 0) {
@@ -573,27 +633,42 @@ export function createHistoryProviderV2(
 
       const where = `${buildRangeWhere(range, safeContext)} AND path = '${safePath}'${sourceWhere}`;
 
-      if (needsClientSideAggregation(spec.aggregate)) {
+      if (isMovingAverage(spec.aggregate)) {
+        // The window runs over the series at the requested resolution — one
+        // averaged bucket per sample, the grid every other column is on — so
+        // sma:5 at 180s is a 15-minute average and the rows line up with the
+        // rest of the response. With no resolution the series is the raw
+        // rows, as it is for every method. A text path has nothing to
+        // average, so this column never falls back to the string table.
+        // An empty bucket stays a sample of the window (see computeSMA), so a
+        // gap ages values out instead of stretching the window across it.
+        const window = movingAverageWindow(spec);
+        const sql =
+          query.resolution && query.resolution > 0
+            ? `SELECT ts, avg(value) as agg_value FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`
+            : `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
+        const result = await queryClient.exec(sql);
+        const series = result.dataset.map((r) => r[1] as number | null);
+        const computed =
+          "samples" in window
+            ? computeSMA(series, window.samples)
+            : computeEMA(series, window.alpha);
+        const rows: [string, unknown][] = result.dataset.map((r, i) => [
+          r[0] as string,
+          computed[i],
+        ]);
+        columnData.set(specIndex, rows);
+        continue;
+      }
+
+      if (readsRawRows(spec.aggregate)) {
         const sql = `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 50000`;
         const result = await queryClient.exec(sql);
-        const timestamps = result.dataset.map((r) => r[0] as string);
         const rawValues = result.dataset.map((r) => r[1] as number | null);
-
-        let computed: (number | null)[];
-        if (spec.aggregate === "sma") {
-          const n = parseInt(spec.parameter[0] ?? "5", 10);
-          computed = computeSMA(rawValues, n);
-        } else if (spec.aggregate === "ema") {
-          const alpha = parseFloat(spec.parameter[0] ?? "0.2");
-          computed = computeEMA(rawValues, alpha);
-        } else {
-          const mid = Math.floor(rawValues.length / 2);
-          computed = rawValues.map((_, i) => (i === mid ? rawValues[i] : null));
-        }
-
-        const rows: [string, unknown][] = timestamps.map((ts, i) => [
-          ts,
-          computed[i],
+        const mid = Math.floor(rawValues.length / 2);
+        const rows: [string, unknown][] = result.dataset.map((r, i) => [
+          r[0] as string,
+          i === mid ? rawValues[i] : null,
         ]);
         columnData.set(specIndex, rows);
         continue;

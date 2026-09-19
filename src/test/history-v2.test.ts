@@ -383,36 +383,62 @@ describe("history-v2 sample bucket guard", () => {
     assert.ok(captured.length >= 1, "expected the position query to run");
   });
 
-  it("does not reject client-side aggregates, which never SAMPLE BY", async () => {
-    // 60 days at 1s would be 5.18M buckets — but every client-side aggregate
-    // reads raw rows under a LIMIT, so the cap must not apply to any of them.
-    const cases: [string, string[]][] = [
+  it("does not reject middle_index, which never SAMPLE BY", async () => {
+    // 60 days at 1s would be 5.18M buckets — but middle_index reads raw rows
+    // under a LIMIT, so the cap must not apply to it.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getValues({
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2024-03-01T00:00:00Z" },
+      resolution: 1,
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "middle_index",
+          parameter: [],
+        },
+      ],
+    } as any);
+
+    assert.equal(captured.length, 1, "no query captured for middle_index");
+    assert.ok(
+      captured[0].sql.includes("LIMIT 50000") &&
+        !captured[0].sql.includes("SAMPLE BY"),
+      `expected raw-row LIMIT query, got: ${captured[0].sql}`,
+    );
+  });
+
+  it("counts a moving average as a sampled column", async () => {
+    // Its window runs over resolution buckets, so it fabricates them like
+    // average does and the cap applies to it the same way.
+    for (const [aggregate, parameter] of [
       ["sma", ["5"]],
       ["ema", ["0.2"]],
-      ["middle_index", []],
-    ];
-    for (const [aggregate, parameter] of cases) {
+    ] as [string, string[]][]) {
       const captured: CapturedQuery[] = [];
       const provider = createHistoryProviderV2(
         makeMockClient(captured),
         SELF_CONTEXT,
       );
 
-      await provider.getValues({
-        from: { toString: () => "2024-01-01T00:00:00Z" },
-        to: { toString: () => "2024-03-01T00:00:00Z" },
-        resolution: 1,
-        pathSpecs: [
-          { path: "navigation.speedOverGround", aggregate, parameter },
-        ],
-      } as any);
-
-      assert.equal(captured.length, 1, `no query captured for '${aggregate}'`);
-      assert.ok(
-        captured[0].sql.includes("LIMIT 50000") &&
-          !captured[0].sql.includes("SAMPLE BY"),
-        `expected raw-row LIMIT query for '${aggregate}', got: ${captured[0].sql}`,
+      await assert.rejects(
+        provider.getValues({
+          from: { toString: () => "2024-01-01T00:00:00Z" },
+          to: { toString: () => "2024-03-01T00:00:00Z" },
+          resolution: 1,
+          pathSpecs: [
+            { path: "navigation.speedOverGround", aggregate, parameter },
+          ],
+        } as any),
+        /sample buckets/,
+        `expected the cap to reject '${aggregate}'`,
       );
+      assert.equal(captured.length, 0, `'${aggregate}' queried before the cap`);
     }
   });
 });
@@ -1560,5 +1586,213 @@ describe("history-v2 sourcePolicy=all", () => {
       captured.some((c) => /DISTINCT source FROM signalk_position/.test(c.sql)),
       "position must be probed in its own table, not signalk",
     );
+  });
+});
+
+describe("history-v2 moving averages", () => {
+  // A sample is one row of the series the window runs over: a resolution
+  // bucket (its average) when the request names a resolution, a raw row
+  // otherwise.
+  function client(captured: CapturedQuery[], dataset: unknown[][]) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+    } as any;
+  }
+  const ts = (i: number) =>
+    `2024-01-01T00:${String(i * 3).padStart(2, "0")}:00.000000Z`;
+  const buckets: unknown[][] = [1, 2, 3, null, 5, 6].map((v, i) => [ts(i), v]);
+  const request = (
+    aggregate: string,
+    parameter: string[],
+    extra: Record<string, unknown> = { resolution: 180 },
+  ): any => ({
+    from: { toString: () => "2024-01-01T00:00:00Z" },
+    to: { toString: () => "2024-01-01T00:18:00Z" },
+    pathSpecs: [{ path: "navigation.speedOverGround", aggregate, parameter }],
+    ...extra,
+  });
+  const close = (actual: unknown[], expected: (number | null)[]) => {
+    assert.equal(actual.length, expected.length);
+    expected.forEach((e, i) => {
+      const a = actual[i];
+      if (e === null) assert.equal(a, null, `row ${i}`);
+      else
+        assert.ok(Math.abs((a as number) - e) < 1e-9, `row ${i}: ${a} ≠ ${e}`);
+    });
+  };
+
+  it("runs sma over averaged resolution buckets, not raw rows", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      client(captured, buckets),
+      SELF_CONTEXT,
+    );
+    const response = await provider.getValues(request("sma", ["3"]));
+
+    assert.equal(captured.length, 1);
+    assert.ok(
+      captured[0].sql.includes("avg(value)") &&
+        captured[0].sql.includes("SAMPLE BY 180s") &&
+        !captured[0].sql.includes("LIMIT"),
+      `expected a SAMPLE BY average, got: ${captured[0].sql}`,
+    );
+    assert.deepEqual(response.values, [
+      { path: "navigation.speedOverGround", method: "sma" },
+    ]);
+    assert.deepEqual(
+      response.data.map((r) => r[0]),
+      buckets.map((b) => b[0]),
+    );
+    // An empty bucket takes its place in the window: the result there is
+    // the mean of what the window still holds.
+    close(
+      response.data.map((r) => r[1]),
+      [1, 1.5, 2, 2.5, 4, 5.5],
+    );
+  });
+
+  it("runs ema over the same buckets, alpha per bucket", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      client(captured, buckets),
+      SELF_CONTEXT,
+    );
+    const response = await provider.getValues(request("ema", ["0.5"]));
+
+    assert.ok(captured[0].sql.includes("SAMPLE BY 180s"), captured[0].sql);
+    close(
+      response.data.map((r) => r[1]),
+      [1, 1.5, 2.25, 2.25, 3.625, 4.8125],
+    );
+  });
+
+  it("ages a value out of the sma window across empty buckets", async () => {
+    // A gap must not stretch the window back in time: n samples after a
+    // value arrived it is gone, whether or not anything followed it.
+    const gap: unknown[][] = [4, null, null, null, null].map((v, i) => [
+      ts(i),
+      v,
+    ]);
+    const response = await createHistoryProviderV2(
+      client([], gap),
+      SELF_CONTEXT,
+    ).getValues(request("sma", ["3"]));
+    close(
+      response.data.map((r) => r[1]),
+      [4, 4, 4, null, null],
+    );
+  });
+
+  it("defaults to sma:5 and ema:0.2", async () => {
+    const series: unknown[][] = [1, 2, 3, 4, 5, 6].map((v, i) => [ts(i), v]);
+    const sma = await createHistoryProviderV2(
+      client([], series),
+      SELF_CONTEXT,
+    ).getValues(request("sma", []));
+    close(
+      sma.data.map((r) => r[1]),
+      [1, 1.5, 2, 2.5, 3, 4],
+    );
+    const ema = await createHistoryProviderV2(
+      client([], series),
+      SELF_CONTEXT,
+    ).getValues(request("ema", []));
+    close(
+      ema.data.map((r) => r[1]),
+      [1, 1.2, 1.56, 2.048, 2.6384, 3.31072],
+    );
+  });
+
+  it("lines up with the other columns of the same request", async () => {
+    const provider = createHistoryProviderV2(client([], buckets), SELF_CONTEXT);
+    const response = await provider.getValues({
+      ...request("average", []),
+      pathSpecs: [
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "average",
+          parameter: [],
+        },
+        {
+          path: "navigation.speedOverGround",
+          aggregate: "sma",
+          parameter: ["2"],
+        },
+      ],
+    });
+
+    assert.equal(response.data.length, buckets.length);
+    for (const row of response.data) {
+      assert.equal(row.length, 3, `row ${row[0]} is missing a column`);
+    }
+    close(
+      response.data.map((r) => r[2]),
+      [1, 1.5, 2.5, 3, 5, 5.5],
+    );
+  });
+
+  it("reads raw rows when no resolution is given, like every method", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      client(captured, buckets),
+      SELF_CONTEXT,
+    );
+    await provider.getValues(request("sma", ["2"], {}));
+
+    assert.ok(
+      captured[0].sql.includes("LIMIT 10000") &&
+        !captured[0].sql.includes("SAMPLE BY") &&
+        !captured[0].sql.includes("avg("),
+      `expected the raw-row query, got: ${captured[0].sql}`,
+    );
+  });
+
+  it("rejects a bad window before any query runs", async () => {
+    for (const [aggregate, parameter, reason] of [
+      ["sma", ["0"], /whole number of samples/],
+      ["sma", ["2.5"], /whole number of samples/],
+      ["sma", ["abc"], /whole number of samples/],
+      ["sma", [""], /whole number of samples/],
+      ["ema", ["0"], /above 0 and up to 1/],
+      ["ema", ["1.5"], /above 0 and up to 1/],
+      ["ema", ["x"], /above 0 and up to 1/],
+    ] as [string, string[], RegExp][]) {
+      const captured: CapturedQuery[] = [];
+      const provider = createHistoryProviderV2(
+        client(captured, buckets),
+        SELF_CONTEXT,
+      );
+      await assert.rejects(
+        provider.getValues(request(aggregate, parameter)),
+        reason,
+        `${aggregate}:${parameter[0]} was accepted`,
+      );
+      assert.equal(captured.length, 0, `${aggregate}:${parameter[0]} queried`);
+    }
+  });
+
+  it("does not read the string table for a text path", async () => {
+    // A text path has no rows in the numeric table; SAMPLE BY over none
+    // yields none. The column is then empty rather than filled from
+    // signalk_str, as average would be — text has no moving average.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      client(captured, []),
+      SELF_CONTEXT,
+    );
+    const response = await provider.getValues({
+      ...request("sma", ["2"]),
+      pathSpecs: [
+        { path: "navigation.state", aggregate: "sma", parameter: ["2"] },
+      ],
+    });
+
+    assert.equal(captured.length, 1, "expected no signalk_str fallback");
+    assert.ok(!captured[0].sql.includes("signalk_str"), captured[0].sql);
+    assert.equal(response.values[0].method, "sma");
+    assert.deepEqual(response.data, []);
   });
 });
