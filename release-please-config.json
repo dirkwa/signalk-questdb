@@ -4,7 +4,7 @@
   "include-component-in-tag": false,
   "versioning": "always-bump-patch",
   "changelog-type": "github",
-  "changelog-path": "CHANGELOG.md",
+  "skip-changelog": true,
   "pull-request-title-pattern": "chore: release ${version}",
   "packages": {
     ".": {}
