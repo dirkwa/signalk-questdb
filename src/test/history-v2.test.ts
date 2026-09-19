@@ -200,8 +200,11 @@ describe("history-v2 navigation.position value shape", () => {
         dataset: [
           ["2024-01-01T00:00:00.000000Z", 60.17, 24.94],
           ["2024-01-01T00:01:00.000000Z", null, null],
+          // The equator and the prime meridian are positions, not gaps.
+          ["2024-01-01T00:02:00.000000Z", 0, 0],
+          ["2024-01-01T00:03:00.000000Z", 51.48, 0],
         ],
-        count: 2,
+        count: 4,
         timestamp: 0,
       }),
     } as any;
@@ -219,6 +222,8 @@ describe("history-v2 navigation.position value shape", () => {
     assert.deepEqual(result.data, [
       ["2024-01-01T00:00:00.000000Z", [24.94, 60.17]],
       ["2024-01-01T00:01:00.000000Z", null],
+      ["2024-01-01T00:02:00.000000Z", [0, 0]],
+      ["2024-01-01T00:03:00.000000Z", [0, 51.48]],
     ]);
   });
 });
