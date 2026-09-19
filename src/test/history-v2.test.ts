@@ -179,7 +179,7 @@ describe("history-v2 navigation.position aggregate", () => {
   });
 
   it("falls back to first for non-pair-preserving aggregates", async () => {
-    for (const aggregate of ["average", "min", "max", "mid", "middle_index"]) {
+    for (const aggregate of ["average", "min", "max", "mid"]) {
       const sql = await capturePositionSql(aggregate);
       assert.ok(
         sql.includes("first(lat)") && sql.includes("first(lon)"),
@@ -383,42 +383,13 @@ describe("history-v2 sample bucket guard", () => {
     assert.ok(captured.length >= 1, "expected the position query to run");
   });
 
-  it("does not reject middle_index, which never SAMPLE BY", async () => {
-    // 60 days at 1s would be 5.18M buckets — but middle_index reads raw rows
-    // under a LIMIT, so the cap must not apply to it.
-    const captured: CapturedQuery[] = [];
-    const provider = createHistoryProviderV2(
-      makeMockClient(captured),
-      SELF_CONTEXT,
-    );
-
-    await provider.getValues({
-      from: { toString: () => "2024-01-01T00:00:00Z" },
-      to: { toString: () => "2024-03-01T00:00:00Z" },
-      resolution: 1,
-      pathSpecs: [
-        {
-          path: "navigation.speedOverGround",
-          aggregate: "middle_index",
-          parameter: [],
-        },
-      ],
-    } as any);
-
-    assert.equal(captured.length, 1, "no query captured for middle_index");
-    assert.ok(
-      captured[0].sql.includes("LIMIT 50000") &&
-        !captured[0].sql.includes("SAMPLE BY"),
-      `expected raw-row LIMIT query, got: ${captured[0].sql}`,
-    );
-  });
-
-  it("counts a moving average as a sampled column", async () => {
-    // Its window runs over resolution buckets, so it fabricates them like
-    // average does and the cap applies to it the same way.
+  it("counts a moving average and middle_index as sampled columns", async () => {
+    // A moving average runs over resolution buckets and middle_index picks
+    // one row per bucket, so the cap applies to them as it does to average.
     for (const [aggregate, parameter] of [
       ["sma", ["5"]],
       ["ema", ["0.2"]],
+      ["middle_index", []],
     ] as [string, string[]][]) {
       const captured: CapturedQuery[] = [];
       const provider = createHistoryProviderV2(
@@ -1795,4 +1766,140 @@ describe("history-v2 moving averages", () => {
     assert.equal(response.values[0].method, "sma");
     assert.deepEqual(response.data, []);
   });
+});
+
+describe("history-v2 middle_index", () => {
+  // The middle row of each resolution bucket, by time — a recorded row,
+  // not a computed value — and of the whole range without a resolution.
+  function client(captured: CapturedQuery[], dataset: unknown[][]) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+    } as any;
+  }
+  const request = (path: string, extra: Record<string, unknown> = {}): any => ({
+    from: { toString: () => "2024-01-01T00:00:00Z" },
+    to: { toString: () => "2024-01-01T01:00:00Z" },
+    resolution: 180,
+    pathSpecs: [{ path, aggregate: "middle_index", parameter: [] }],
+    ...extra,
+  });
+
+  it("picks the middle row of each bucket in one query", async () => {
+    const captured: CapturedQuery[] = [];
+    const rows: unknown[][] = [
+      ["2024-01-01T00:00:00.000000Z", 3],
+      ["2024-01-01T00:03:00.000000Z", 4],
+    ];
+    const response = await createHistoryProviderV2(
+      client(captured, rows),
+      SELF_CONTEXT,
+    ).getValues(request("navigation.speedOverGround"));
+
+    assert.equal(captured.length, 1);
+    const sql = captured[0].sql;
+    assert.ok(
+      sql.includes("row_number() OVER (PARTITION BY b ORDER BY ts)") &&
+        sql.includes("count(*) OVER (PARTITION BY b)") &&
+        sql.includes("timestamp_floor('180s', ts)") &&
+        sql.includes("rn = n / 2 + 1") &&
+        sql.includes("FROM signalk ") &&
+        !sql.includes("LIMIT"),
+      `expected a per-bucket middle-row query, got: ${sql}`,
+    );
+    assert.deepEqual(response.values, [
+      { path: "navigation.speedOverGround", method: "middle_index" },
+    ]);
+    assert.deepEqual(response.data, rows);
+  });
+
+  it("picks the middle row of the whole range without a resolution", async () => {
+    const captured: CapturedQuery[] = [];
+    await createHistoryProviderV2(client(captured, []), SELF_CONTEXT).getValues(
+      request("navigation.speedOverGround", { resolution: undefined }),
+    );
+
+    const sql = captured[0].sql;
+    assert.ok(
+      sql.includes("row_number() OVER (ORDER BY ts)") &&
+        sql.includes("count(*) OVER ()") &&
+        !sql.includes("PARTITION BY") &&
+        !sql.includes("LIMIT"),
+      `expected a whole-range middle-row query, got: ${sql}`,
+    );
+  });
+
+  it("answers it for navigation.position from the position table", async () => {
+    const captured: CapturedQuery[] = [];
+    const response = await createHistoryProviderV2(
+      client(captured, [["2024-01-01T00:00:00.000000Z", 60.17, 24.94]]),
+      SELF_CONTEXT,
+    ).getValues(request("navigation.position"));
+
+    const sql = captured[0].sql;
+    assert.ok(
+      sql.includes("FROM signalk_position ") &&
+        sql.includes("row_number() OVER (PARTITION BY b ORDER BY ts)") &&
+        sql.includes("lat, lon"),
+      `expected the position table's middle row, got: ${sql}`,
+    );
+    assert.equal(response.values[0].method, "middle_index");
+    assert.deepEqual(response.data, [
+      ["2024-01-01T00:00:00.000000Z", [24.94, 60.17]],
+    ]);
+  });
+
+  it("does not read the string table for a text path", async () => {
+    const captured: CapturedQuery[] = [];
+    const response = await createHistoryProviderV2(
+      client(captured, []),
+      SELF_CONTEXT,
+    ).getValues(request("navigation.state"));
+
+    assert.equal(captured.length, 1, "expected no signalk_str fallback");
+    assert.ok(!captured[0].sql.includes("signalk_str"), captured[0].sql);
+    assert.deepEqual(response.data, []);
+  });
+});
+
+describe("history-v2 position method", () => {
+  // Only first, last and middle_index keep a point the vessel was at.
+  // Anything else runs first (the SQL is asserted above), and the column
+  // says which method ran.
+  function client(captured: CapturedQuery[]) {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        return { columns: [], dataset: [], count: 0, timestamp: 0 };
+      },
+    } as any;
+  }
+  const request = (aggregate: string): any => ({
+    from: { toString: () => "2024-01-01T00:00:00Z" },
+    to: { toString: () => "2024-01-01T01:00:00Z" },
+    resolution: 60,
+    pathSpecs: [{ path: "navigation.position", aggregate, parameter: [] }],
+  });
+
+  for (const [aggregate, ran] of [
+    ["first", "first"],
+    ["last", "last"],
+    ["middle_index", "middle_index"],
+    ["average", "first"],
+    ["mid", "first"],
+    ["max", "first"],
+  ] as [string, string][]) {
+    it(`reports ${ran} for ${aggregate}`, async () => {
+      const response = await createHistoryProviderV2(
+        client([]),
+        SELF_CONTEXT,
+      ).getValues(request(aggregate));
+
+      assert.deepEqual(response.values, [
+        { path: "navigation.position", method: ran },
+      ]);
+    });
+  }
 });
