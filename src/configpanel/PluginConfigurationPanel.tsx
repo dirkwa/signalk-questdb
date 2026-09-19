@@ -206,6 +206,10 @@ export default function PluginConfigurationPanel({
     MigrationMeasurement[] | null
   >(null);
   const [migrationLoadingMeta, setMigrationLoadingMeta] = useState(false);
+  // True while the vessels a bucket holds are being listed: the import
+  // must not start before the answer, since it decides how rows are filed.
+  const [migrationContextsLoading, setMigrationContextsLoading] =
+    useState(false);
   // The vessels the source holds, and which of them is ours. The source tags
   // every point with the context the recording server used, which is not
   // necessarily this server's, so it is chosen rather than matched.
@@ -582,8 +586,13 @@ export default function PluginConfigurationPanel({
   useEffect(() => {
     setMigrationContexts(null);
     setMigrationSelfContext("");
+    // Reset here, not only in the request's own finally: that one is
+    // skipped for a request cancelled by a bucket change, and with no
+    // bucket there is nothing to list.
+    setMigrationContextsLoading(false);
     if (!migrationSelected || !migrationBucket) return;
     let cancelled = false;
+    setMigrationContextsLoading(true);
     void (async () => {
       try {
         const res = await fetch(
@@ -616,8 +625,14 @@ export default function PluginConfigurationPanel({
         setMigrationSelfContext(
           found.self ?? (found.contexts.length === 1 ? found.contexts[0] : ""),
         );
-      } catch {
-        // Left unknown: the import then treats the source as one vessel.
+      } catch (e) {
+        if (cancelled) return;
+        // Said, not swallowed: without the list the start is refused for a
+        // source that holds several vessels, and that would be a puzzle.
+        setActionStatus("Could not list the vessels: " + errorMessage(e));
+        setStatusError(true);
+      } finally {
+        if (!cancelled) setMigrationContextsLoading(false);
       }
     })();
     return () => {
@@ -2105,6 +2120,12 @@ export default function PluginConfigurationPanel({
               </div>
             )}
 
+            {migrationContextsLoading && (
+              <div style={S.fieldHelp}>
+                Listing the vessels in the bucket... On a large bucket this
+                takes a while; the import waits for it.
+              </div>
+            )}
             {migrationContexts && migrationContexts.contexts.length > 0 && (
               <>
                 <div style={S.fieldRow}>
@@ -2204,6 +2225,7 @@ export default function PluginConfigurationPanel({
                   !migrationBucket ||
                   !migrationFrom ||
                   !migrationTo ||
+                  migrationContextsLoading ||
                   ((migrationContexts?.contexts.length ?? 0) > 1 &&
                     !migrationSelfContext) ||
                   migrationRun?.state === "running"
