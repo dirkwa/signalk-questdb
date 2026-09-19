@@ -7,25 +7,22 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
   release-please:
     runs-on: ubuntu-24.04
     steps:
-      # The tag release-please pushes on merging its release PR is what
-      # triggers publish.yml, and npm's trusted publishing is bound to that
-      # workflow file. A tag pushed with GITHUB_TOKEN triggers nothing, so
-      # a personal access token (contents + pull-requests) is required —
-      # better to fail here than to cut a release that never reaches npm.
-      - name: Require RELEASE_PLEASE_TOKEN
-        env:
-          TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::error::RELEASE_PLEASE_TOKEN is not set; a tag pushed with GITHUB_TOKEN would not trigger publish.yml"
-            exit 1
-          fi
-
       - uses: googleapis/release-please-action@v5
-        with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        id: rp
+
+      # The tag release-please just pushed does not start publish.yml by
+      # itself: an event raised with GITHUB_TOKEN starts no workflow, with
+      # workflow_dispatch as the exception. So publish.yml is dispatched on
+      # the tag — it has to stay the file that publishes, since npm's
+      # trusted publishing is bound to that workflow file.
+      - name: Publish the release
+        if: ${{ steps.rp.outputs.releases_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref "${{ steps.rp.outputs.tag_name }}"
