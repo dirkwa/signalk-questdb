@@ -131,7 +131,7 @@ export const ConfigSchema = Type.Object({
     default: "sk-network",
     title: "Container network",
     description:
-      "Shared Podman/Docker network for QuestDB. Only applied when 'Bind to 0.0.0.0' is on (so a separate-Docker Grafana can reach QuestDB by DNS).",
+      "Shared Podman/Docker network QuestDB joins in managed mode, so the companion signalk-grafana reaches it by container DNS. Host-port publication is separate: 'Bind to 0.0.0.0' publishes the ports on all host interfaces.",
   }),
 
   exposeToContainers: Type.Boolean({
