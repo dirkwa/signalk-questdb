@@ -18,6 +18,7 @@ import {
   routeDeltaValue,
   UnstorableTracker,
 } from "./delta-routing.js";
+import { unitsResolver } from "./history-units.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
 import { startRetention } from "./retention.js";
@@ -113,6 +114,7 @@ interface App {
   registerHistoryProvider: (provider: unknown) => void;
   registerHistoryApiProvider: (provider: HistoryApi.HistoryProvider) => void;
   getMetadata?: (path: string) => { units?: string } | undefined;
+  getPath?: (path: string) => unknown;
   getDataDirPath: () => string;
   savePluginOptions: (config: unknown, cb: (err?: Error) => void) => void;
   [key: string]: unknown;
@@ -1086,12 +1088,7 @@ export default (app: App) => {
       app.selfContext,
       config.historySourcePolicyAll ?? false,
       (msg) => app.debug(msg),
-      // The own vessel may be asked for as vessels.self, as self, or by its
-      // identity; the metadata knows it as vessels.self.
-      (path, context) =>
-        app.getMetadata?.(
-          `${context === "self" || context === app.selfContext ? "vessels.self" : context}.${path}`,
-        )?.units,
+      unitsResolver(app),
     );
     app.registerHistoryApiProvider(v2Provider);
 
