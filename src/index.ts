@@ -112,6 +112,7 @@ interface App {
   };
   registerHistoryProvider: (provider: unknown) => void;
   registerHistoryApiProvider: (provider: HistoryApi.HistoryProvider) => void;
+  getMetadata?: (path: string) => { units?: string } | undefined;
   getDataDirPath: () => string;
   savePluginOptions: (config: unknown, cb: (err?: Error) => void) => void;
   [key: string]: unknown;
@@ -1085,6 +1086,12 @@ export default (app: App) => {
       app.selfContext,
       config.historySourcePolicyAll ?? false,
       (msg) => app.debug(msg),
+      // The own vessel may be asked for as vessels.self, as self, or by its
+      // identity; the metadata knows it as vessels.self.
+      (path, context) =>
+        app.getMetadata?.(
+          `${context === "self" || context === app.selfContext ? "vessels.self" : context}.${path}`,
+        )?.units,
     );
     app.registerHistoryApiProvider(v2Provider);
 

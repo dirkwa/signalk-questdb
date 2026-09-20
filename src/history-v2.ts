@@ -177,6 +177,101 @@ function computeEMA(
   return result;
 }
 
+/**
+ * Circular statistics for a path recorded in radians — headings, courses,
+ * wind angles. The linear mean of 359° and 1° is 180°; the vector mean, the
+ * angle of the mean sine and cosine, is 0°. A result goes back into the
+ * convention the samples came in: [0, 2π) when none was negative, (−π, π]
+ * otherwise — Signal K uses both, by path.
+ */
+const TWO_PI = 2 * Math.PI;
+
+function isAngular(units: string | undefined): boolean {
+  return units === "rad";
+}
+
+function normaliseAngle(mean: number, nonNegative: boolean): number {
+  // Modulo rather than one addition: a mean a hair below zero must read as
+  // 0, not as 2π less a hair. atan2 can return exactly −π, which the signed
+  // convention (−π, π] reports as π.
+  if (nonNegative) return ((mean % TWO_PI) + TWO_PI) % TWO_PI;
+  return mean <= -Math.PI ? mean + TWO_PI : mean;
+}
+
+/**
+ * The bucket's vector mean, and its lowest sample for the convention.
+ * Samples that cancel — 0° and 180° in equal measure — leave no direction
+ * to report, so a resultant shorter than the guard is null rather than
+ * whatever atan2 makes of two zeros.
+ */
+const NO_DIRECTION = 1e-9;
+const ANGULAR_BUCKET_SQL = `CASE WHEN sqrt(avg(sin(value)) * avg(sin(value)) + avg(cos(value)) * avg(cos(value))) < ${NO_DIRECTION} THEN NULL ELSE atan2(avg(sin(value)), avg(cos(value))) END as agg_value, min(value) as agg_floor`;
+
+/** The angle of a mean sine and cosine, or null when they cancel. */
+function meanAngle(
+  sin: number,
+  cos: number,
+  nonNegative: boolean,
+): number | null {
+  return Math.hypot(sin, cos) < NO_DIRECTION
+    ? null
+    : normaliseAngle(Math.atan2(sin, cos), nonNegative);
+}
+
+function computeAngularSMA(
+  values: (number | null)[],
+  n: number,
+  nonNegative: boolean,
+): (number | null)[] {
+  const result: (number | null)[] = [];
+  let sumSin = 0;
+  let sumCos = 0;
+  let count = 0;
+  for (let i = 0; i < values.length; i++) {
+    const arrived = values[i];
+    if (arrived !== null) {
+      sumSin += Math.sin(arrived);
+      sumCos += Math.cos(arrived);
+      count += 1;
+    }
+    const gone = i >= n ? values[i - n] : null;
+    if (gone !== null) {
+      sumSin -= Math.sin(gone);
+      sumCos -= Math.cos(gone);
+      count -= 1;
+    }
+    result.push(
+      count > 0 ? meanAngle(sumSin / count, sumCos / count, nonNegative) : null,
+    );
+  }
+  return result;
+}
+
+function computeAngularEMA(
+  values: (number | null)[],
+  alpha: number,
+  nonNegative: boolean,
+): (number | null)[] {
+  const result: (number | null)[] = [];
+  let sin: number | null = null;
+  let cos: number | null = null;
+  for (const v of values) {
+    if (v !== null) {
+      if (sin === null || cos === null) {
+        sin = Math.sin(v);
+        cos = Math.cos(v);
+      } else {
+        sin = alpha * Math.sin(v) + (1 - alpha) * sin;
+        cos = alpha * Math.cos(v) + (1 - alpha) * cos;
+      }
+    }
+    result.push(
+      sin === null || cos === null ? null : meanAngle(sin, cos, nonNegative),
+    );
+  }
+  return result;
+}
+
 function buildRangeWhere(range: ResolvedRange, context?: string): string {
   const from = validateTimestamp(range.from);
   const to = validateTimestamp(range.to);
@@ -262,6 +357,10 @@ export function createHistoryProviderV2(
   // Degrading must be visible. Defaults to a no-op so existing callers and
   // tests need no change.
   debug: (msg: string) => void = () => {},
+  // A path's units per the server's metadata, in the request's context.
+  // Unknown means linear, which is right for everything but radians.
+  unitsOf: (path: string, context: string) => string | undefined = () =>
+    undefined,
 ): HistoryApi.HistoryProvider {
   /**
    * Distinct sources that recorded `path` inside the range.
@@ -637,14 +736,30 @@ export function createHistoryProviderV2(
         // An empty bucket stays a sample of the window (see computeSMA), so a
         // gap ages values out instead of stretching the window across it.
         const window = movingAverageWindow(spec);
+        const angular = isAngular(unitsOf(spec.path, requestedContext));
+        const bucket = angular ? ANGULAR_BUCKET_SQL : "avg(value) as agg_value";
         const sql =
           query.resolution && query.resolution > 0
-            ? `SELECT ts, avg(value) as agg_value FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`
+            ? `SELECT ts, ${bucket} FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`
             : `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
         const result = await queryClient.exec(sql);
-        const series = result.dataset.map((r) => r[1] as number | null);
-        const computed =
-          "samples" in window
+        // An angular series keeps one convention throughout: [0, 2π) unless
+        // a sample (or a bucket's lowest sample) was negative.
+        const floors = result.dataset.map((r) =>
+          r.length > 2 ? (r[2] as number | null) : (r[1] as number | null),
+        );
+        const nonNegative = floors.every((f) => f === null || f >= 0);
+        const series = result.dataset.map((r) => {
+          const v = r[1] as number | null;
+          return v !== null && angular && r.length > 2
+            ? normaliseAngle(v, (r[2] as number) >= 0)
+            : v;
+        });
+        const computed = angular
+          ? "samples" in window
+            ? computeAngularSMA(series, window.samples, nonNegative)
+            : computeAngularEMA(series, window.alpha, nonNegative)
+          : "samples" in window
             ? computeSMA(series, window.samples)
             : computeEMA(series, window.alpha);
         const rows: [string, unknown][] = result.dataset.map((r, i) => [
@@ -669,10 +784,17 @@ export function createHistoryProviderV2(
         continue;
       }
 
-      const aggExpr = aggregateToSql(spec.aggregate);
+      // Only average has a circular form; min, max and mid on an angle are
+      // the caller's choice, and first, last and middle_index are samples.
+      const angularMean =
+        spec.aggregate === "average" &&
+        isAngular(unitsOf(spec.path, requestedContext));
+      const aggExpr = angularMean
+        ? ANGULAR_BUCKET_SQL
+        : `${aggregateToSql(spec.aggregate)} as agg_value`;
       let sql: string;
       if (query.resolution && query.resolution > 0) {
-        sql = `SELECT ts, ${aggExpr} as agg_value FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`;
+        sql = `SELECT ts, ${aggExpr} FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`;
       } else {
         sql = `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
       }
@@ -680,7 +802,9 @@ export function createHistoryProviderV2(
       const result = await queryClient.exec(sql);
       const rows: [string, unknown][] = result.dataset.map((row) => [
         row[0] as string,
-        row[1],
+        angularMean && row.length > 2 && row[1] !== null
+          ? normaliseAngle(row[1] as number, (row[2] as number) >= 0)
+          : row[1],
       ]);
 
       // Non-numeric paths (strings, and booleans stored as "true"/"false")

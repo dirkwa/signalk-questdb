@@ -205,6 +205,14 @@ in the window: the average there is of what the window still holds, and a value
 leaves it N buckets after it arrived. `ema` carries its last value across an
 empty bucket instead.
 
+A path recorded in radians — a heading, a course, a wind angle; `units: rad` in
+the server's metadata for the path — is averaged as a vector: `average`, `sma`
+and `ema` take the angle of the mean sine and cosine, so 359° and 1° average to
+0°, not 180°. The result keeps the path's convention, `[0, 2π)` for a heading or
+`(−π, π]` for an apparent wind angle; samples that cancel, 0° and 180° in equal
+measure, have no mean direction and give `null`. `min`, `max` and `mid` stay
+arithmetic.
+
 `navigation.position` answers `first`, `last` and `middle_index` — each a point
 the vessel was at. Any other method runs `first`, and the column's `method` says
 so. A text path (rows in `signalk_str`) answers `first` and `last`;

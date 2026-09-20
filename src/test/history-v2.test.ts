@@ -1923,3 +1923,233 @@ describe("history-v2 position method", () => {
     });
   }
 });
+
+describe("history-v2 angular paths", () => {
+  // A path recorded in radians is averaged as a vector — the angle of the
+  // mean sine and cosine — and put back into the convention its samples
+  // used: [0, 2π) unless one was negative.
+  type QueryClientArg = Parameters<typeof createHistoryProviderV2>[0];
+  type ValuesArg = Parameters<
+    ReturnType<typeof createHistoryProviderV2>["getValues"]
+  >[0];
+  const rad = (degrees: number) => (degrees * Math.PI) / 180;
+  const ts = (i: number) =>
+    `2024-01-01T00:${String(i * 3).padStart(2, "0")}:00.000000Z`;
+  function client(
+    captured: CapturedQuery[],
+    dataset: unknown[][],
+  ): QueryClientArg {
+    return {
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+    } as unknown as QueryClientArg;
+  }
+  const unitsOf = (path: string) =>
+    path === "navigation.headingTrue" ||
+    path === "environment.wind.angleApparent"
+      ? "rad"
+      : "m/s";
+  const provider = (
+    captured: CapturedQuery[],
+    dataset: unknown[][],
+    seen: string[] = [],
+  ) =>
+    createHistoryProviderV2(
+      client(captured, dataset),
+      SELF_CONTEXT,
+      false,
+      () => {},
+      (path, context) => {
+        seen.push(`${context} ${path}`);
+        return unitsOf(path);
+      },
+    );
+  const request = (
+    path: string,
+    aggregate: HistoryApi.AggregateMethod,
+    parameter: string[] = [],
+    extra: { context?: string; resolution?: number } = {},
+  ): ValuesArg => ({
+    from: Temporal.Instant.from("2024-01-01T00:00:00Z"),
+    to: Temporal.Instant.from("2024-01-01T01:00:00Z"),
+    resolution: 180,
+    pathSpecs: [{ path: path as Path, aggregate, parameter }],
+    ...(extra as object),
+  });
+  const close = (actual: unknown[], expected: (number | null)[]) => {
+    assert.equal(actual.length, expected.length);
+    expected.forEach((e, i) => {
+      const a = actual[i];
+      if (e === null) assert.equal(a, null, `row ${i}`);
+      else
+        assert.ok(Math.abs((a as number) - e) < 1e-9, `row ${i}: ${a} ≠ ${e}`);
+    });
+  };
+  const VECTOR_SQL =
+    "ELSE atan2(avg(sin(value)), avg(cos(value))) END as agg_value, min(value) as agg_floor";
+
+  it("averages a radian path as a vector, in its own convention", async () => {
+    const captured: CapturedQuery[] = [];
+    // [ts, the bucket's vector mean, its lowest sample]
+    const rows: unknown[][] = [
+      [ts(0), rad(-1), rad(355)],
+      [ts(1), rad(-1), rad(-5)],
+      [ts(2), null, null],
+    ];
+    const response = await provider(captured, rows).getValues(
+      request("navigation.headingTrue", "average"),
+    );
+
+    assert.ok(
+      captured[0].sql.includes(VECTOR_SQL) &&
+        captured[0].sql.includes("SAMPLE BY 180s"),
+      captured[0].sql,
+    );
+    // Lowest sample 355°: the mean is 359°, not −1°. Lowest −5°: −1° stays.
+    close(
+      response.data.map((r) => r[1]),
+      [rad(359), rad(-1), null],
+    );
+    assert.equal(response.values[0].method, "average");
+  });
+
+  it("leaves a linear path to avg(value)", async () => {
+    const captured: CapturedQuery[] = [];
+    await provider(captured, []).getValues(
+      request("navigation.speedOverGround", "average"),
+    );
+    assert.ok(
+      captured[0].sql.includes("avg(value) as agg_value") &&
+        !captured[0].sql.includes("atan2"),
+      captured[0].sql,
+    );
+  });
+
+  it("keeps min, max and mid arithmetic on a radian path", async () => {
+    for (const [aggregate, expr] of [
+      ["max", "max(value)"],
+      ["min", "min(value)"],
+      ["mid", "(min(value) + max(value)) / 2"],
+    ] as [HistoryApi.AggregateMethod, string][]) {
+      const captured: CapturedQuery[] = [];
+      await provider(captured, []).getValues(
+        request("navigation.headingTrue", aggregate),
+      );
+      assert.ok(
+        captured[0].sql.includes(expr) && !captured[0].sql.includes("atan2"),
+        `${aggregate}: ${captured[0].sql}`,
+      );
+    }
+  });
+
+  it("asks the metadata for the path in the request's context", async () => {
+    const seen: string[] = [];
+    await provider([], [], seen).getValues(
+      request("navigation.headingTrue", "average"),
+    );
+    await provider([], [], seen).getValues(
+      request("navigation.headingTrue", "average", [], {
+        context: "vessels.urn:mrn:imo:mmsi:244813009",
+      }),
+    );
+    assert.deepEqual(seen, [
+      "vessels.self navigation.headingTrue",
+      "vessels.urn:mrn:imo:mmsi:244813009 navigation.headingTrue",
+    ]);
+  });
+
+  it("runs sma over the vector means, across north", async () => {
+    const captured: CapturedQuery[] = [];
+    const buckets = [355, 3, 10].map((d, i) => [ts(i), rad(d), rad(d)]);
+    const response = await provider(captured, buckets).getValues(
+      request("navigation.headingTrue", "sma", ["2"]),
+    );
+
+    assert.ok(captured[0].sql.includes(VECTOR_SQL), captured[0].sql);
+    const vector = (...degrees: number[]) => {
+      const s = degrees.reduce((a, d) => a + Math.sin(rad(d)), 0);
+      const c = degrees.reduce((a, d) => a + Math.cos(rad(d)), 0);
+      const m = Math.atan2(s / degrees.length, c / degrees.length);
+      return m < 0 ? m + 2 * Math.PI : m;
+    };
+    // 355° and 3° average to 359°, not 179°.
+    close(
+      response.data.map((r) => r[1]),
+      [rad(355), vector(355, 3), vector(3, 10)],
+    );
+    assert.ok(Math.abs(vector(355, 3) - rad(359)) < 1e-9);
+  });
+
+  it("runs ema over sine and cosine, holding across an empty bucket", async () => {
+    const captured: CapturedQuery[] = [];
+    const buckets: unknown[][] = [
+      [ts(0), rad(350), rad(350)],
+      [ts(1), rad(10), rad(10)],
+      [ts(2), null, null],
+    ];
+    const response = await provider(captured, buckets).getValues(
+      request("navigation.headingTrue", "ema", ["0.5"]),
+    );
+    // Equal weights on 350° and 10° meet at 0°, and the empty bucket keeps it.
+    close(
+      response.data.map((r) => r[1]),
+      [rad(350), 0, 0],
+    );
+  });
+
+  it("keeps a negative convention for a path that uses one", async () => {
+    const captured: CapturedQuery[] = [];
+    const buckets = [-170, 170].map((d, i) => [ts(i), rad(d), rad(d)]);
+    const response = await provider(captured, buckets).getValues(
+      request("environment.wind.angleApparent", "sma", ["2"]),
+    );
+    // −170° and 170° average to 180°, reported as 180° in (−π, π].
+    close(
+      response.data.map((r) => r[1]),
+      [rad(-170), Math.PI],
+    );
+  });
+
+  it("has no mean direction for samples that cancel", async () => {
+    // 0° and 180° in equal measure: no direction, so null — in the SQL
+    // (a guard on the resultant's length) and in the window.
+    const captured: CapturedQuery[] = [];
+    const sma = await provider(
+      captured,
+      [0, 180].map((d, i) => [ts(i), rad(d), rad(d)]),
+    ).getValues(request("navigation.headingTrue", "sma", ["2"]));
+    assert.ok(
+      captured[0].sql.includes(
+        "CASE WHEN sqrt(avg(sin(value)) * avg(sin(value)) + avg(cos(value)) * avg(cos(value))) < 1e-9 THEN NULL",
+      ),
+      captured[0].sql,
+    );
+    close(
+      sma.data.map((r) => r[1]),
+      [0, null],
+    );
+    const ema = await provider(
+      [],
+      [90, 270].map((d, i) => [ts(i), rad(d), rad(d)]),
+    ).getValues(request("navigation.headingTrue", "ema", ["0.5"]));
+    close(
+      ema.data.map((r) => r[1]),
+      [rad(90), null],
+    );
+  });
+
+  it("reports a mean of exactly 180° as π, never −π", async () => {
+    // A hair of negative sine makes atan2 return −π; the convention says π.
+    const captured: CapturedQuery[] = [];
+    const rows: unknown[][] = [[ts(0), -Math.PI, rad(-179)]];
+    const response = await provider(captured, rows).getValues(
+      request("environment.wind.angleApparent", "average"),
+    );
+    close(
+      response.data.map((r) => r[1]),
+      [Math.PI],
+    );
+  });
+});
