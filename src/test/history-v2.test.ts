@@ -2140,6 +2140,26 @@ describe("history-v2 angular paths", () => {
     );
   });
 
+  it("does not read the string table when every bucket cancelled", async () => {
+    // All-null is what a linear path with no numeric rows looks like, and
+    // that falls back to signalk_str; here the nulls are cancelled buckets.
+    const captured: CapturedQuery[] = [];
+    const rows: unknown[][] = [
+      [ts(0), null, 0],
+      [ts(1), null, 0],
+    ];
+    const response = await provider(captured, rows).getValues(
+      request("navigation.headingTrue", "average"),
+    );
+    assert.equal(captured.length, 1, "expected no signalk_str fallback");
+    assert.ok(!captured[0].sql.includes("signalk_str"), captured[0].sql);
+    assert.equal(response.values[0].method, "average");
+    assert.deepEqual(
+      response.data.map((r) => r[1]),
+      [null, null],
+    );
+  });
+
   it("reports a mean of exactly 180° as π, never −π", async () => {
     // A hair of negative sine makes atan2 return −π; the convention says π.
     const captured: CapturedQuery[] = [];

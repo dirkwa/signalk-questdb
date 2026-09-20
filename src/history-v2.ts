@@ -813,8 +813,10 @@ export function createHistoryProviderV2(
       // string table when the numeric one held nothing for this path.
       // Emptiness is judged on VALUES, not row count: a SAMPLE BY with
       // FILL(NULL) fabricates a row per bucket, so an all-null result is
-      // still "no numeric data here".
-      if (!rows.some(([, value]) => value !== null)) {
+      // still "no numeric data here". Not for an angular mean, though: its
+      // null is a bucket whose samples cancelled, and the string table
+      // holds no angles to fall back to.
+      if (!angularMean && !rows.some(([, value]) => value !== null)) {
         // Report the aggregate that was actually applied. Downsampled string
         // rows always use last() — averaging text is meaningless — so leaving
         // the caller's requested method in the response would label the
