@@ -67,9 +67,10 @@ route needs a Signal K admin session; prefer it.
   the column existed have no source.
 - **`path`** — the Signal K path, e.g. `navigation.speedOverGround` or
   `environment.wind.speedApparent`.
-- **`value_str`** / **`value_kind`** (`signalk_str` only) — the text, and
-  `'boolean'` when it is a boolean recorded as `true`/`false`; plain text leaves
-  `value_kind` empty.
+- **`value_str`** / **`value_kind`** (`signalk_str` only) — the text, and what
+  it is when that matters: `'boolean'` for a boolean recorded as `true`/`false`,
+  `'identity'` for a vessel's name (stored under the path `name`); plain text
+  leaves `value_kind` empty.
 - **`context`** — which vessel. Your own boat is `self`. Other vessels only
   appear if you enabled **Record AIS targets**. The examples below filter on
   `context = 'self'` where it matters, so they show only your own boat either

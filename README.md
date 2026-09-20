@@ -151,8 +151,10 @@ existed have `source` null; they replay unattributed and cannot be filtered.
 
 Every value on the stream is routed by its type: numbers go to `signalk`,
 strings and booleans to `signalk_str` (booleans tagged `value_kind=boolean`),
-and `navigation.position` — that path only — to `signalk_position`. An object
-value is recorded as its scalar leaves, one level deep:
+and `navigation.position` — that path only — to `signalk_position`. A vessel's
+name, which arrives as an empty-path `{name}` delta, is stored in `signalk_str`
+under the path `name` with `value_kind=identity`, and replayed in its original
+shape. An object value is recorded as its scalar leaves, one level deep:
 `navigation.attitude {roll, pitch, yaw}` becomes `navigation.attitude.roll` and
 so on, and another lat/lon object such as `navigation.anchor.position` becomes
 `.latitude` and `.longitude` leaves rather than rows in the track table. Nested
