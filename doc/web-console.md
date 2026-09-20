@@ -60,12 +60,16 @@ route needs a Signal K admin session; prefer it.
 | `signalk_str`      | Text values    | `ts`, `path`, `context`, `source`, `value_str`, `value_kind` |
 | `signalk_position` | GPS positions  | `ts`, `context`, `source`, `lat`, `lon`                      |
 
-- **`ts`** — when the server received the sample (UTC).
+- **`ts`** — when the server received the sample (UTC). Rows imported from
+  InfluxDB keep the timestamps they had there instead.
 - **`source`** — which receiver produced it, e.g. `n2k.115` or `gps.main`;
   `influxdb-import` for rows brought over from InfluxDB. Rows recorded before
   the column existed have no source.
 - **`path`** — the Signal K path, e.g. `navigation.speedOverGround` or
   `environment.wind.speedApparent`.
+- **`value_str`** / **`value_kind`** (`signalk_str` only) — the text, and
+  `'boolean'` when it is a boolean recorded as `true`/`false`; plain text leaves
+  `value_kind` empty.
 - **`context`** — which vessel. Your own boat is `self`. Other vessels only
   appear if you enabled **Record AIS targets**. The examples below filter on
   `context = 'self'` where it matters, so they show only your own boat either
