@@ -549,13 +549,14 @@ whether Signal K runs on bare metal or is itself containerized:
   companion [signalk-grafana](https://github.com/dirkwa/signalk-grafana) plugin
   still reaches it by container DNS. This is the recommended setup and fixes
   connectivity for Signal K in a container.
-- **Bind to 0.0.0.0 = on.** QuestDB's HTTP/ILP/PostgreSQL ports are published on
-  all interfaces using the configured port numbers, on the shared
-  `Container network`. Enable this only to reach QuestDB from another machine or
-  from a Grafana running in a separate Docker instance. When Signal K itself is
-  containerized, the plugin probes which address reaches the published ports —
-  its own loopback first, then the runtime's `host.containers.internal` gateway
-  — and uses the one QuestDB answers on.
+- **Bind to 0.0.0.0 = on.** QuestDB stays attached to the shared
+  `Container network`; the setting publishes its HTTP/ILP/PostgreSQL ports on
+  all host interfaces, using the configured port numbers. Enable this only to
+  reach QuestDB from another machine or from a Grafana running in a separate
+  Docker instance. When Signal K itself is containerized, the plugin probes
+  which address reaches the published ports — its own loopback first, then the
+  runtime's `host.containers.internal` gateway — and uses the one QuestDB
+  answers on.
 
 In **external mode** (`Manage QuestDB container` off) the plugin connects to the
 QuestDB you point it at via `QuestDB host` and the HTTP/ILP ports.
