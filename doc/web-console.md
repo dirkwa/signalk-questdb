@@ -1,57 +1,76 @@
 # Exploring Your Data with the QuestDB Web Console
 
 QuestDB ships with a built-in web interface — the **Web Console** — where you
-can browse everything the plugin has recorded and run SQL queries against it.
-No extra software needed, just a browser.
+can browse everything the plugin has recorded and run SQL queries against it. No
+extra software needed, just a browser.
 
 This guide is for end users: it shows you how to open the console, what your
 data looks like, and gives you a set of ready-to-paste queries you can adapt.
 
 ## Opening the Web Console
 
-The console runs on QuestDB's HTTP port (default **9000**).
+With **QuestDB console webapp** enabled in the plugin's settings (it is by
+default), the console is in Signal K's webapp list: open the admin UI, go to
+**Webapps** and pick **signalk-questdb**. It runs inside the admin UI, admin
+users only — a non-admin sees an authorization error instead of the console.
 
-- **On the Signal K host itself:** open <http://localhost:9000>
-- **From another computer** (e.g. your laptop), you have two options:
-  - Tunnel over SSH (keeps QuestDB private):
+The console is also served directly on QuestDB's HTTP port. In managed mode on a
+bare-metal Signal K with "Bind to 0.0.0.0" off, signalk-container binds that
+port to the host's loopback at the address the plugin's status card shows; the
+port is the one it bound, which is 9000 only with "Bind to 0.0.0.0" on. When
+Signal K itself runs in a container, QuestDB is reached over the container
+network and no host port exists unless "Bind to 0.0.0.0" is on — use the webapp
+instead. In external mode the console is at the configured QuestDB host and HTTP
+port, whatever the deployment. The examples below use 9000; substitute yours.
 
-    ```shell
-    ssh -L 9000:127.0.0.1:9000 <user>@<signalk-host>
-    ```
+- **On the Signal K host itself:** open the loopback address the status card
+  shows, e.g. <http://127.0.0.1:9000>
+- **From another computer** (e.g. your laptop), tunnel over SSH:
 
-    then open <http://localhost:9000> on your laptop.
+  ```shell
+  ssh -L 9000:127.0.0.1:9000 <user>@<signalk-host>
+  ```
 
-  - Or enable **"Bind to 0.0.0.0"** in the plugin config and open
-    `http://<signalk-host-ip>:9000`. This exposes QuestDB to your whole
-    network: port 9000 carries not just this console but also QuestDB's REST
-    API and data ingestion, with no authentication by default — anyone who
-    can reach it can read, **modify or delete** your history. The SSH tunnel
-    is the safer default; only bind to 0.0.0.0 behind a firewall you trust.
+  then open <http://localhost:9000> on your laptop.
+
+Enabling **"Bind to 0.0.0.0"** in the plugin config would also make
+`http://<signalk-host-ip>:9000` reachable — but port 9000 carries not just the
+console but QuestDB's REST API and data ingestion, with no authentication, so
+anyone who can reach it can read, **modify or delete** your history. The webapp
+route needs a Signal K admin session; prefer it.
 
 ## A Quick Tour
 
 - The **left panel** lists the tables. Click a table to see its columns.
-- The **editor** at the top is where you type SQL. Put the cursor on a query
-  and press **Run** (or `Ctrl+Enter` / `F9`) to execute it. You can keep many
+- The **editor** at the top is where you type SQL. Put the cursor on a query and
+  press **Run** (or `Ctrl+Enter` / `F9`) to execute it. You can keep many
   queries in the editor — only the one under the cursor runs.
-- Results appear in the **grid** below. Use the **chart** view to plot a
-  result (pick your time column as the X axis), and the **download** button to
-  save results as CSV.
+- Results appear in the **grid** below. Use the **chart** view to plot a result
+  (pick your time column as the X axis), and the **download** button to save
+  results as CSV.
 
 > **Careful:** the console is not read-only. Stick to `SELECT` queries —
 > statements like `DROP TABLE` will really delete your history.
 
 ## Your Data: Three Tables
 
-| Table              | What's in it   | Columns                              |
-| ------------------ | -------------- | ------------------------------------ |
-| `signalk`          | Numeric values | `ts`, `path`, `context`, `value`     |
-| `signalk_str`      | Text values    | `ts`, `path`, `context`, `value_str` |
-| `signalk_position` | GPS positions  | `ts`, `context`, `lat`, `lon`        |
+| Table              | What's in it   | Columns                                                      |
+| ------------------ | -------------- | ------------------------------------------------------------ |
+| `signalk`          | Numeric values | `ts`, `path`, `context`, `source`, `value`                   |
+| `signalk_str`      | Text values    | `ts`, `path`, `context`, `source`, `value_str`, `value_kind` |
+| `signalk_position` | GPS positions  | `ts`, `context`, `source`, `lat`, `lon`                      |
 
-- **`ts`** — timestamp of the sample (UTC).
+- **`ts`** — when the server received the sample (UTC). Rows imported from
+  InfluxDB keep the timestamps they had there instead.
+- **`source`** — which receiver produced it, e.g. `n2k.115` or `gps.main`;
+  `influxdb-import` for rows brought over from InfluxDB. Rows recorded before
+  the column existed have no source.
 - **`path`** — the Signal K path, e.g. `navigation.speedOverGround` or
   `environment.wind.speedApparent`.
+- **`value_str`** / **`value_kind`** (`signalk_str` only) — the text, and what
+  it is when that matters: `'boolean'` for a boolean recorded as `true`/`false`,
+  `'identity'` for a vessel's name (stored under the path `name`); plain text
+  leaves `value_kind` empty.
 - **`context`** — which vessel. Your own boat is `self`. Other vessels only
   appear if you enabled **Record AIS targets**. The examples below filter on
   `context = 'self'` where it matters, so they show only your own boat either
@@ -78,10 +97,10 @@ minutes.
 
 ### What is being recorded?
 
-Lists every recorded numeric path with its sample count and time range — a
-good first query to discover the exact path names on _your_ boat (this one
-deliberately has no `context` filter, so with AIS recording enabled the
-counts include all vessels):
+Lists every recorded numeric path with its sample count and time range — a good
+first query to discover the exact path names on _your_ boat (this one
+deliberately has no `context` filter, so with AIS recording enabled the counts
+include all vessels):
 
 ```sql
 SELECT path, count() AS samples,
@@ -96,8 +115,8 @@ Run the same query against `signalk_str` to list the recorded text paths
 
 ### Current snapshot of every numeric value
 
-The most recent sample of each path (QuestDB's `LATEST ON` finds the newest
-row per group very efficiently):
+The most recent sample of each path (QuestDB's `LATEST ON` finds the newest row
+per group very efficiently):
 
 ```sql
 SELECT path, value, ts
@@ -232,8 +251,8 @@ GROUP BY value_str;
 
 ### How much data is stored?
 
-Samples per day — unlike the examples above, this one deliberately scans
-**all** retained history, so it can take a few seconds on a large database:
+Samples per day — unlike the examples above, this one deliberately scans **all**
+retained history, so it can take a few seconds on a large database:
 
 ```sql
 SELECT ts, count() AS samples
@@ -252,16 +271,16 @@ ORDER BY name DESC;
 
 ## Tips
 
-- **Always narrow by `path` and time.** The `signalk` table can hold hundreds
-  of millions of rows; `WHERE path = '...' AND ts > dateadd(...)` keeps
-  queries fast. Add `LIMIT 100` while experimenting.
+- **Always narrow by `path` and time.** The `signalk` table can hold hundreds of
+  millions of rows; `WHERE path = '...' AND ts > dateadd(...)` keeps queries
+  fast. Add `LIMIT 100` while experimenting.
 - **`SAMPLE BY` is your friend.** Raw data arrives every couple of seconds;
   bucketing to `1m`, `1h` or `1d` with `avg()`/`min()`/`max()` gives readable
   results and nice charts.
 - **Timestamps are UTC.** Convert for display with e.g.
   `to_timezone(ts, 'Pacific/Fiji')`.
-- **Prefer dashboards for daily use.** The console is great for ad-hoc
-  digging; for permanent charts use the companion
+- **Prefer dashboards for daily use.** The console is great for ad-hoc digging;
+  for permanent charts use the companion
   [signalk-grafana](https://github.com/dirkwa/signalk-grafana) plugin.
 - The full SQL reference is in the
   [QuestDB documentation](https://questdb.com/docs/reference/sql/overview/).
