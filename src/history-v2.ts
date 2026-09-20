@@ -102,7 +102,9 @@ function aggregateToSql(method: string): string {
  * when the request names no resolution. A recorded row, not a computed
  * value, which is what makes it meaningful for navigation.position too.
  * There is no aggregate for it, so row_number and count over the bucket
- * pick it in one pass; an empty bucket yields no row.
+ * pick it in one pass; an empty bucket yields no row. Without a resolution
+ * the range is read under the LIMIT every raw read here has, so a long
+ * range is not staged whole for a single row.
  */
 function middleRowSql(
   table: string,
@@ -114,7 +116,7 @@ function middleRowSql(
     const bucket = `timestamp_floor('${effectiveResolution(resolution)}s', ts)`;
     return `SELECT b AS ts, ${columns} FROM (SELECT b, ts, ${columns}, row_number() OVER (PARTITION BY b ORDER BY ts) AS rn, count(*) OVER (PARTITION BY b) AS n FROM (SELECT ${bucket} AS b, ts, ${columns} FROM ${table} WHERE ${where})) WHERE rn = n / 2 + 1 ORDER BY ts`;
   }
-  return `SELECT ts, ${columns} FROM (SELECT ts, ${columns}, row_number() OVER (ORDER BY ts) AS rn, count(*) OVER () AS n FROM ${table} WHERE ${where}) WHERE rn = n / 2 + 1`;
+  return `SELECT ts, ${columns} FROM (SELECT ts, ${columns}, row_number() OVER (ORDER BY ts) AS rn, count(*) OVER () AS n FROM (SELECT ts, ${columns} FROM ${table} WHERE ${where} ORDER BY ts LIMIT 50000)) WHERE rn = n / 2 + 1`;
 }
 
 function isMovingAverage(method: string): boolean {

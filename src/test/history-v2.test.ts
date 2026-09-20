@@ -1832,12 +1832,13 @@ describe("history-v2 middle_index", () => {
     );
 
     const sql = captured[0].sql;
+    // Bounded like every raw read: the middle of the first 50000 rows.
     assert.ok(
       sql.includes("row_number() OVER (ORDER BY ts)") &&
         sql.includes("count(*) OVER ()") &&
         !sql.includes("PARTITION BY") &&
-        !sql.includes("LIMIT"),
-      `expected a whole-range middle-row query, got: ${sql}`,
+        sql.includes("ORDER BY ts LIMIT 50000)"),
+      `expected a bounded whole-range middle-row query, got: ${sql}`,
     );
   });
 
