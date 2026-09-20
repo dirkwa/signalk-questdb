@@ -1,3 +1,4 @@
+import type { history as HistoryApi } from "@signalk/server-api";
 import { IRouter } from "express";
 import { waitForContainerManager } from "signalk-container-helper";
 import type {
@@ -110,7 +111,7 @@ interface App {
     };
   };
   registerHistoryProvider: (provider: unknown) => void;
-  registerHistoryApiProvider: (provider: unknown) => void;
+  registerHistoryApiProvider: (provider: HistoryApi.HistoryProvider) => void;
   getDataDirPath: () => string;
   savePluginOptions: (config: unknown, cb: (err?: Error) => void) => void;
   [key: string]: unknown;
