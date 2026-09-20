@@ -1430,8 +1430,7 @@ describe("history-v2 sourcePolicy=all", () => {
 
   // The bucket cap only bites when a resolution was named. An unresolved
   // request runs one raw query per source with nothing else bounding it.
-  it("caps how many columns one path may expand into", async () => {
-    const warnings: string[] = [];
+  it("refuses a path that would expand into more columns than one may", async () => {
     const captured: CapturedQuery[] = [];
     const many = Array.from(
       { length: 40 },
@@ -1441,23 +1440,23 @@ describe("history-v2 sourcePolicy=all", () => {
       makeSourceAwareClient(captured, { signalk: many, signalk_str: [] }),
       SELF_CONTEXT,
       true,
-      (m) => warnings.push(m),
     );
 
-    const result = await provider.getValues({
-      ...RANGE,
-      sourcePolicy: "all",
-      pathSpecs: [SPEC],
-    } as any);
-
-    assert.equal(result.values.length, 16, `got ${result.values.length}`);
+    await assert.rejects(
+      provider.getValues({
+        ...RANGE,
+        sourcePolicy: "all",
+        pathSpecs: [SPEC],
+      } as any),
+      /40 sources[\s\S]*16[\s\S]*paths=<path>\|<sourceRef>/,
+      "the request must fail, naming the count, the ceiling and the way out",
+    );
+    // Only the DISTINCT probes ran: no per-source series was read for a
+    // response that is not going to be sent.
     assert.ok(
-      warnings.some((w) => /40 sources/.test(w)),
-      "truncation must be reported, not silent",
+      captured.every((q) => /SELECT DISTINCT source/.test(q.sql)),
+      `expected only source probes, got: ${captured.map((q) => q.sql).join(" | ")}`,
     );
-    // Deterministic: the FIRST 16 sorted, not an arbitrary 16.
-    assert.equal(result.values[0].$source, "src00");
-    assert.equal(result.values[15].$source, "src15");
   });
 
   it("survives a database where no value table exists yet", async () => {

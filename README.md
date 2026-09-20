@@ -276,13 +276,13 @@ becomes four queries and four columns, which on a Pi-class host turns a cheap
 request into an expensive one. The sample-bucket cap counts expanded columns, so
 a resolution that is fine unexpanded may be rejected once expanded.
 
-Two ceilings bound the fan-out. A single path expands into at most 16 columns;
-if more sources recorded it in range, the first 16 in sorted order are returned
-and the rest are dropped, which is reported in the plugin debug log only. A
-whole request is bounded at 64 columns, and one that exceeds that is rejected
-outright rather than truncated — returning some of the asked-for series without
-saying so would be worse than refusing a request that is too broad. The error
-names the limit that was hit.
+Two ceilings bound the fan-out, and a request past either is rejected rather
+than truncated — returning some of the asked-for series without saying so would
+be worse than refusing a request that is too broad. A single path may expand
+into at most 16 columns: recorded by more sources in range, it fails the
+request, and the error names the count, the ceiling and the way out (name the
+sources with `path|sourceRef`, or ask for a shorter range). A whole request is
+bounded at 64 columns, with its own error naming the limit.
 
 An explicit `path|sourceRef` stays a filter and takes precedence over the
 policy, matching the upstream contract. Requests that name their sources are
