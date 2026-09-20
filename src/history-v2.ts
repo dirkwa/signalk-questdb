@@ -98,12 +98,25 @@ function aggregateToSql(method: string): string {
 }
 
 /**
- * middle_index is one value, the middle raw row of the whole range, so it
- * reads every raw row whatever resolution the request names; it has no
- * per-bucket form.
+ * The middle row of each resolution bucket, by time — of the whole range
+ * when the request names no resolution. A recorded row, not a computed
+ * value, which is what makes it meaningful for navigation.position too.
+ * There is no aggregate for it, so row_number and count over the bucket
+ * pick it in one pass; an empty bucket yields no row. Without a resolution
+ * the range is read under the LIMIT every raw read here has, so a long
+ * range is not staged whole for a single row.
  */
-function readsRawRows(method: string): boolean {
-  return method === "middle_index";
+function middleRowSql(
+  table: string,
+  columns: string,
+  where: string,
+  resolution?: number,
+): string {
+  if (resolution && resolution > 0) {
+    const bucket = `timestamp_floor('${effectiveResolution(resolution)}s', ts)`;
+    return `SELECT b AS ts, ${columns} FROM (SELECT b, ts, ${columns}, row_number() OVER (PARTITION BY b ORDER BY ts) AS rn, count(*) OVER (PARTITION BY b) AS n FROM (SELECT ${bucket} AS b, ts, ${columns} FROM ${table} WHERE ${where})) WHERE rn = n / 2 + 1 ORDER BY ts`;
+  }
+  return `SELECT ts, ${columns} FROM (SELECT ts, ${columns}, row_number() OVER (ORDER BY ts) AS rn, count(*) OVER () AS n FROM (SELECT ts, ${columns} FROM ${table} WHERE ${where} ORDER BY ts LIMIT 50000)) WHERE rn = n / 2 + 1`;
 }
 
 function isMovingAverage(method: string): boolean {
@@ -545,8 +558,8 @@ export function createHistoryProviderV2(
     // run at four times the ceiling this cap exists to enforce — precisely
     // the case the cap is for.
     //
-    // Only columns that actually run a SAMPLE BY query fabricate buckets:
-    // middle_index reads raw rows under a LIMIT and must not trip the cap.
+    // Every column runs a query bounded by the bucket count: SAMPLE BY
+    // fabricates one row per bucket, middle_index picks at most one.
     //
     // A non-numeric path costs TWO such queries: the numeric one comes back
     // empty and the string-table fallback repeats it against signalk_str.
@@ -554,17 +567,14 @@ export function createHistoryProviderV2(
     // assumes the worst case — every sampled column falling back — rather
     // than letting a request built entirely of boolean/string paths quietly
     // run at twice the ceiling.
-    const sampledSpecs = columns.filter(
-      (spec) =>
-        spec.path === "navigation.position" || !readsRawRows(spec.aggregate),
-    ).length;
-    // navigation.position is served by its own table and never falls back,
-    // and a moving average has no text to fall back to.
+    const sampledSpecs = columns.length;
+    // navigation.position is served by its own table and never falls back;
+    // a moving average and middle_index have no text to fall back to.
     const fallbackCapableSpecs = columns.filter(
       (spec) =>
         spec.path !== "navigation.position" &&
-        !readsRawRows(spec.aggregate) &&
-        !isMovingAverage(spec.aggregate),
+        !isMovingAverage(spec.aggregate) &&
+        spec.aggregate !== "middle_index",
     ).length;
 
     if (sampledSpecs > 0 && query.resolution && query.resolution > 0) {
@@ -608,13 +618,20 @@ export function createHistoryProviderV2(
 
       if (isPosition) {
         const where = buildRangeWhere(range, safeContext) + sourceWhere;
-        // Position is an object-valued lat/lon pair. Only first/last keep a
-        // real, co-recorded coordinate; per-axis avg/min/max/mid would
-        // fabricate a point the vessel never occupied, so they fall back to
-        // first. A silent caller also gets first (the server default).
-        const posAgg = spec.aggregate === "last" ? "last" : "first";
+        // Position is a co-recorded lat/lon pair. first, last and
+        // middle_index keep a point the vessel was at; a per-axis
+        // avg/min/max/mid would fabricate one it never occupied, so anything
+        // else runs first — and the column says so, as the string fallback
+        // does. A silent caller also gets first (the server default).
+        const posAgg =
+          spec.aggregate === "last" || spec.aggregate === "middle_index"
+            ? spec.aggregate
+            : "first";
+        if (posAgg !== spec.aggregate) valuesList[specIndex].method = "first";
         let sql: string;
-        if (query.resolution && query.resolution > 0) {
+        if (posAgg === "middle_index") {
+          sql = middleRowSql(table, "lat, lon", where, query.resolution);
+        } else if (query.resolution && query.resolution > 0) {
           sql = `SELECT ts, ${posAgg}(lat) as lat, ${posAgg}(lon) as lon FROM ${table} WHERE ${where} SAMPLE BY ${effectiveResolution(query.resolution)}s FILL(NULL) ORDER BY ts`;
         } else {
           sql = `SELECT ts, lat, lon FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
@@ -661,14 +678,15 @@ export function createHistoryProviderV2(
         continue;
       }
 
-      if (readsRawRows(spec.aggregate)) {
-        const sql = `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 50000`;
-        const result = await queryClient.exec(sql);
-        const rawValues = result.dataset.map((r) => r[1] as number | null);
-        const mid = Math.floor(rawValues.length / 2);
-        const rows: [string, unknown][] = result.dataset.map((r, i) => [
+      if (spec.aggregate === "middle_index") {
+        // A text path has rows in signalk_str only; this reads the numeric
+        // table and leaves the column empty for one, like a moving average.
+        const result = await queryClient.exec(
+          middleRowSql(table, "value", where, query.resolution),
+        );
+        const rows: [string, unknown][] = result.dataset.map((r) => [
           r[0] as string,
-          i === mid ? rawValues[i] : null,
+          r[1],
         ]);
         columnData.set(specIndex, rows);
         continue;
