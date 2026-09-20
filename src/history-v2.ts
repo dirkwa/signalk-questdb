@@ -344,13 +344,17 @@ export function createHistoryProviderV2(
     // caller asked for a resolution; an unresolved request runs one raw query
     // per source with no cap at all, so a path that accumulated dozens of
     // sourceRefs (a bus with many transmitters, or churn in generated refs)
-    // would schedule dozens of queries from a single HTTP request.
+    // would schedule dozens of queries from a single HTTP request. Past the
+    // ceiling the request fails, as it does past the request-wide one:
+    // returning some of the asked-for series without saying so would be
+    // worse than refusing a request that is too broad.
     if (all.length > MAX_EXPANDED_SOURCES) {
-      debug(
-        `sourcePolicy=all: ${path} has ${all.length} sources in range; ` +
-          `expanding the first ${MAX_EXPANDED_SOURCES} (sorted) only.`,
+      throw new Error(
+        `sourcePolicy=all: ${path} was recorded by ${all.length} sources in ` +
+          `range, more than the ${MAX_EXPANDED_SOURCES} one path may expand ` +
+          `into — name the sources with paths=<path>|<sourceRef>, or ask ` +
+          `for a shorter range`,
       );
-      return all.slice(0, MAX_EXPANDED_SOURCES);
     }
     return all;
   }
