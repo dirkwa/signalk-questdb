@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { Temporal } from "@js-temporal/polyfill";
+import type { Path, history as HistoryApi } from "@signalk/server-api";
 import { createHistoryProviderV2 } from "../history-v2.js";
 
 interface CapturedQuery {
@@ -632,8 +634,8 @@ describe("history-v2 path and context discovery", () => {
   }
 
   const range: RangeArg = {
-    from: { toString: () => "2024-01-01T00:00:00Z", add: () => undefined },
-    to: { toString: () => "2024-01-01T01:00:00Z" },
+    from: Temporal.Instant.from("2024-01-01T00:00:00Z"),
+    to: Temporal.Instant.from("2024-01-01T01:00:00Z"),
   };
 
   it("advertises navigation.position in getPaths", async () => {
@@ -1788,12 +1790,14 @@ describe("history-v2 middle_index", () => {
   }
   const request = (
     path: string,
-    extra: Partial<ValuesArg> = {},
+    extra: { resolution?: number } = {},
   ): ValuesArg => ({
-    from: { toString: () => "2024-01-01T00:00:00Z", add: () => undefined },
-    to: { toString: () => "2024-01-01T01:00:00Z" },
+    from: Temporal.Instant.from("2024-01-01T00:00:00Z"),
+    to: Temporal.Instant.from("2024-01-01T01:00:00Z"),
     resolution: 180,
-    pathSpecs: [{ path, aggregate: "middle_index", parameter: [] }],
+    pathSpecs: [
+      { path: path as Path, aggregate: "middle_index", parameter: [] },
+    ],
     ...extra,
   });
 
@@ -1891,11 +1895,13 @@ describe("history-v2 position method", () => {
       },
     } as unknown as QueryClientArg;
   }
-  const request = (aggregate: string): ValuesArg => ({
-    from: { toString: () => "2024-01-01T00:00:00Z", add: () => undefined },
-    to: { toString: () => "2024-01-01T01:00:00Z" },
+  const request = (aggregate: HistoryApi.AggregateMethod): ValuesArg => ({
+    from: Temporal.Instant.from("2024-01-01T00:00:00Z"),
+    to: Temporal.Instant.from("2024-01-01T01:00:00Z"),
     resolution: 60,
-    pathSpecs: [{ path: "navigation.position", aggregate, parameter: [] }],
+    pathSpecs: [
+      { path: "navigation.position" as Path, aggregate, parameter: [] },
+    ],
   });
 
   for (const [aggregate, ran] of [
@@ -1905,7 +1911,7 @@ describe("history-v2 position method", () => {
     ["average", "first"],
     ["mid", "first"],
     ["max", "first"],
-  ] as [string, string][]) {
+  ] as [HistoryApi.AggregateMethod, HistoryApi.AggregateMethod][]) {
     it(`reports ${ran} for ${aggregate}`, async () => {
       const response = await createHistoryProviderV2(
         client([]),

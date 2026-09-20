@@ -6,20 +6,25 @@ import {
 } from "./query-client.js";
 import type { QuestDBResult } from "./query-client.js";
 import { resolveTimeRange, ResolvedRange } from "./time-range.js";
+import type {
+  Context,
+  Path,
+  SourceRef,
+  Timestamp,
+  history as HistoryApi,
+} from "@signalk/server-api";
 import {
   isMissingKindColumn,
   isMissingSourceColumn,
   isMissingTable,
 } from "./schema-errors.js";
 
-interface PathSpec {
-  path: string;
-  aggregate: string;
-  parameter: string[];
-  // Delivered by the server for `paths=<path>|<sourceRef>` requests
-  // (signalk-server #2737): restrict the series to rows recorded from that
-  // source. Absent = all sources mixed, the pre-source behaviour.
-  sourceRef?: string;
+/**
+ * The server's PathSpec — `sourceRef` (signalk-server #2737) restricts the
+ * series to rows recorded from that source, absent = all sources mixed —
+ * plus one flag of this provider's own.
+ */
+type PathSpec = HistoryApi.PathSpec & {
   // Set only by sourcePolicy=all expansion, for the column that carries rows
   // whose `source` is NULL (recorded before the column existed, or from a
   // delta with no sourceRef).
@@ -29,56 +34,24 @@ interface PathSpec {
   // duplicated all the others under a "no source" label — verified against a
   // live QuestDB, where it returned 60 rows instead of its own 20.
   unattributed?: boolean;
-}
-
-interface ValuesRequest {
-  from?: {
-    toString(): string;
-    add(d: unknown): unknown;
-    subtract?(d: unknown): unknown;
-  };
-  to?: { toString(): string; subtract?(d: unknown): unknown };
-  duration?: unknown;
-  context?: string;
-  resolution?: number;
-  // signalk-server #2817. Only "all" is defined; the server rejects anything
-  // else before the request reaches a provider, so an unknown value here is
-  // treated the same as absent rather than guessed at.
-  sourcePolicy?: string;
-  pathSpecs: PathSpec[];
-}
-
-/**
- * One column of the response.
- *
- * The metadata key is `$source`, not `sourceRef` — signalk-server #2817
- * renamed it on the RESPONSE side while `PathSpec.sourceRef` (the request
- * side) kept its name. The two are deliberately different words for the same
- * thing, and nothing validates the response, so emitting the old key simply
- * left every consumer unable to tell the columns apart.
- */
-interface ValueColumn {
-  path: string;
-  method: string;
-  $source?: string;
-}
-
-interface ValuesResponse {
-  context: string;
-  range: { from: string; to: string };
-  values: ValueColumn[];
-  data: [string, ...unknown[]][];
-}
-
-type PathsRequest = {
-  from?: { toString(): string; add(d: unknown): unknown };
-  to?: { toString(): string };
-  duration?: unknown;
 };
 
-type ContextsRequest = PathsRequest;
+type ValuesRequest = HistoryApi.ValuesRequest;
+type ValuesResponse = HistoryApi.ValuesResponse;
+type PathsRequest = HistoryApi.PathsRequest;
+type ContextsRequest = HistoryApi.ContextsRequest;
+type AggregateMethod = HistoryApi.AggregateMethod;
 
-function aggregateToSql(method: string): string {
+/**
+ * One column of the response. Its metadata key is `$source`, not
+ * `sourceRef` — signalk-server #2817 renamed it on the RESPONSE side while
+ * `PathSpec.sourceRef` (the request side) kept its name; the two are
+ * deliberately different words for the same thing. Nothing validates the
+ * response at runtime, so the published type is what holds the key in place.
+ */
+type ValueColumn = HistoryApi.ValueList[number];
+
+function aggregateToSql(method: AggregateMethod): string {
   switch (method) {
     case "average":
       return "avg(value)";
@@ -119,7 +92,7 @@ function middleRowSql(
   return `SELECT ts, ${columns} FROM (SELECT ts, ${columns}, row_number() OVER (ORDER BY ts) AS rn, count(*) OVER () AS n FROM (SELECT ts, ${columns} FROM ${table} WHERE ${where} ORDER BY ts LIMIT 50000)) WHERE rn = n / 2 + 1`;
 }
 
-function isMovingAverage(method: string): boolean {
+function isMovingAverage(method: AggregateMethod): boolean {
   return method === "sma" || method === "ema";
 }
 
@@ -289,7 +262,7 @@ export function createHistoryProviderV2(
   // Degrading must be visible. Defaults to a no-op so existing callers and
   // tests need no change.
   debug: (msg: string) => void = () => {},
-) {
+): HistoryApi.HistoryProvider {
   /**
    * Distinct sources that recorded `path` inside the range.
    *
@@ -461,7 +434,7 @@ export function createHistoryProviderV2(
   }
 
   async function getValues(query: ValuesRequest): Promise<ValuesResponse> {
-    const range = resolveTimeRange(query as any);
+    const range = resolveTimeRange(query);
 
     // Two gates, both required. The caller asks with sourcePolicy=all; the
     // operator has to have allowed it. An unknown policy string is treated as
@@ -537,7 +510,7 @@ export function createHistoryProviderV2(
           );
           continue;
         }
-        columns.push({ ...spec, sourceRef: source });
+        columns.push({ ...spec, sourceRef: source as SourceRef });
       }
       // Every source was unusable: keep the path as one merged column rather
       // than dropping it from the response entirely.
@@ -753,8 +726,8 @@ export function createHistoryProviderV2(
       indexMaps.set(specIndex, m);
     }
 
-    const data: [string, ...unknown[]][] = sortedTimestamps.map((ts) => {
-      const row: [string, ...unknown[]] = [ts];
+    const data: HistoryApi.DataRow[] = sortedTimestamps.map((ts) => {
+      const row: HistoryApi.DataRow = [ts as Timestamp];
       for (let i = 0; i < columns.length; i++) {
         const m = indexMaps.get(i);
         row.push(m?.get(ts) ?? null);
@@ -763,15 +736,17 @@ export function createHistoryProviderV2(
     });
 
     return {
-      context: requestedContext,
-      range: { from: range.from, to: range.to },
+      context: requestedContext as Context,
+      range: { from: range.from as Timestamp, to: range.to as Timestamp },
       values: valuesList,
       data,
     };
   }
 
-  async function getPaths(query: PathsRequest): Promise<string[]> {
-    const range = resolveTimeRange(query as any);
+  async function getPaths(
+    query: PathsRequest,
+  ): Promise<HistoryApi.PathsResponse> {
+    const range = resolveTimeRange(query);
     const where = buildRangeWhere(range);
 
     // signalk_position has no `path` column — the whole table IS
@@ -788,11 +763,13 @@ export function createHistoryProviderV2(
        ORDER BY path`,
     );
 
-    return result.dataset.map((row) => row[0] as string);
+    return result.dataset.map((row) => row[0] as Path);
   }
 
-  async function getContexts(query: ContextsRequest): Promise<string[]> {
-    const range = resolveTimeRange(query as any);
+  async function getContexts(
+    query: ContextsRequest,
+  ): Promise<HistoryApi.ContextsResponse> {
+    const range = resolveTimeRange(query);
     const where = buildRangeWhere(range);
 
     // Include the track table: a vessel can be position-only (an AIS target
@@ -809,8 +786,8 @@ export function createHistoryProviderV2(
 
     // Translate stored "self" back to the spec-canonical "vessels.self"
     return result.dataset.map((row) => {
-      const ctx = row[0] as string;
-      return ctx === "self" ? "vessels.self" : ctx;
+      const ctx = row[0] as Context;
+      return ctx === "self" ? ("vessels.self" as Context) : ctx;
     });
   }
 
