@@ -3,8 +3,23 @@ name: release-please
 on:
   push:
     branches: [master]
+  # The gate below runs release-please only for a push that carries a commit
+  # users get, so a release pull request it has already opened is not
+  # refreshed by a docs or ci merge — and a config change is exactly such a
+  # merge. This trigger re-runs it on demand, which is what rewrites an
+  # outstanding release pull request against the current configuration.
+  workflow_dispatch:
 
 permissions: {}
+
+# One release-please run at a time: a push and a manual run, or two pushes
+# landing close together, would each read the release pull request's state
+# and each write it, and the later write could undo the earlier one. Queued
+# rather than cancelled — a run already creating a tag or dispatching the
+# publish must be allowed to finish.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # GitHub's release notes are never empty, so release-please would propose
@@ -22,11 +37,20 @@ jobs:
     outputs:
       releasable: ${{ steps.check.outputs.releasable }}
     steps:
+      # A manual run carries no commits to judge, and asking for one is the
+      # statement that it should happen — so it bypasses the check below
+      # rather than being skipped by it for having an empty payload.
       - id: check
         env:
+          DISPATCHED: ${{ github.event_name == 'workflow_dispatch' }}
           MESSAGES: ${{ toJSON(github.event.commits.*.message) }}
           RELEASABLE: '^((feat|fix|perf|revert)(\([^)]*\))?!?: |[a-z]+(\([^)]*\))?!: |build\(deps\): |Revert |chore(\([^)]*\))?: release v?[0-9])'
         run: |
+          if [ "$DISPATCHED" = true ]; then
+            echo "releasable=true" >> "$GITHUB_OUTPUT"
+            echo "Run requested manually; release-please not gated."
+            exit 0
+          fi
           if jq -e --arg re "$RELEASABLE" '(length >= 2048) or ([.[] | (split("\n")[0] | test($re)) or test("\nBREAKING[- ]CHANGE: ")] | any)' <<< "$MESSAGES" > /dev/null; then
             echo "releasable=true" >> "$GITHUB_OUTPUT"
           else
