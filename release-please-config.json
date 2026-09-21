@@ -2,7 +2,6 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "release-type": "node",
   "include-component-in-tag": false,
-  "versioning": "always-bump-patch",
   "changelog-type": "github",
   "skip-changelog": true,
   "pull-request-title-pattern": "chore: release ${version}",
