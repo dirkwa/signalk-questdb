@@ -14,9 +14,13 @@ permissions: {}
 
 # One release-please run at a time: a push and a manual run, or two pushes
 # landing close together, would each read the release pull request's state
-# and each write it, and the later write could undo the earlier one. Queued
-# rather than cancelled — a run already creating a tag or dispatching the
-# publish must be allowed to finish.
+# and each write it, and the later write could undo the earlier one.
+# cancel-in-progress is false so a run already creating a tag or dispatching
+# the publish is never killed part-way. A run waiting behind it can still be
+# replaced by a newer one — the default queue holds a single pending run —
+# which costs nothing here: release-please derives the release pull request
+# from the commit range, so the newest run produces the same result the
+# superseded one would have.
 concurrency:
   group: release-please-${{ github.ref }}
   cancel-in-progress: false
