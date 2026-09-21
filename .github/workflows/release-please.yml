@@ -21,8 +21,14 @@ permissions: {}
 # which costs nothing here: release-please derives the release pull request
 # from the commit range, so the newest run produces the same result the
 # superseded one would have.
+#
+# The group is a constant rather than keyed on github.ref: the action is
+# given no target-branch, so every run — including a dispatch launched from
+# some other branch — acts on the default branch's release pull request. A
+# ref-keyed group would put such a run in a group of its own and let it edit
+# that pull request alongside a master run.
 concurrency:
-  group: release-please-${{ github.ref }}
+  group: release-please
   cancel-in-progress: false
 
 jobs:
