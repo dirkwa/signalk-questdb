@@ -85,6 +85,14 @@ export const ConfigSchema = Type.Object({
       'Override default rate for specific paths. e.g. { "environment.wind.*": 200, "tanks.*": 10000 }',
   }),
 
+  unchangedHeartbeatSeconds: Type.Number({
+    default: 300,
+    minimum: 0,
+    title: "Unchanged-value heartbeat (s)",
+    description:
+      "A value equal to the last one recorded for its path is written again only once per this many seconds instead of at every sampling interval; a change is written as it arrives, subject to the sampling rate like any value. History queries carry the last value across the buckets in between, for up to twice this long, so a path that stops updating shows as a gap after that. 0 = record every sample.",
+  }),
+
   recordSelf: Type.Boolean({
     default: true,
     title: "Record own vessel",
@@ -177,6 +185,13 @@ export function normalizeConfig(config: Config): Config {
       paths: config.pathFilter?.paths ?? [],
     },
     samplingRates: config.samplingRates ?? {},
+    // A config saved before the option existed gets the schema default, so
+    // an update turns change-only recording on. An explicit 0 turns it off.
+    unchangedHeartbeatSeconds:
+      typeof config.unchangedHeartbeatSeconds === "number" &&
+      config.unchangedHeartbeatSeconds >= 0
+        ? config.unchangedHeartbeatSeconds
+        : 300,
     // Missing recording toggles get the schema defaults (both ON). The
     // runtime guards read these directly, so without this a hand-edited or
     // pre-panel config silently disabled the recording the schema promises.

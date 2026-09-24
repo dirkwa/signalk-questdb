@@ -97,6 +97,7 @@ import type {
 } from "./api-contract.js";
 import { buildContainerEnv } from "./container-env.js";
 import { PathMatcher, RateMatcher, Throttle } from "./path-matcher.js";
+import { ChangeGate } from "./change-gate.js";
 
 interface App {
   debug: (...args: unknown[]) => void;
@@ -631,6 +632,12 @@ export default (app: App) => {
   // 100% CPU with an 89-pattern filter list.
   let pathFilterMatcher: PathMatcher | null = null;
   let rateMatcher: RateMatcher | null = null;
+  // Built per config like the matchers, since the heartbeat is config. Its
+  // record of what was written is only true while the writer has dropped
+  // nothing — same invalidation as the vessel-name dedupe below, through
+  // `changeGateDropMark`.
+  let changeGate: ChangeGate | null = null;
+  let changeGateDropMark = 0;
 
   // Paths carrying a value with no representation in any table: arrays, and
   // objects nested below the one level `flattenObjectValue` descends. These
@@ -862,6 +869,8 @@ export default (app: App) => {
     // restarts the plugin).
     pathFilterMatcher = new PathMatcher(config.pathFilter?.paths ?? []);
     rateMatcher = new RateMatcher(config.samplingRates ?? {});
+    changeGate = new ChangeGate(config.unchangedHeartbeatSeconds * 1000);
+    changeGateDropMark = 0;
     // A start may connect to a different QuestDB than the previous run —
     // notably external mode repointed at a new host/build — so drop any cached
     // wal_tables() capability flag and let /api/status re-probe. The
@@ -1089,6 +1098,9 @@ export default (app: App) => {
       config.historySourcePolicyAll ?? false,
       (msg) => app.debug(msg),
       unitsResolver(app),
+      // Twice the heartbeat: a path that updates at least once per heartbeat
+      // gets a row within heartbeat + its own interval of the previous one.
+      config.unchangedHeartbeatSeconds * 2000,
     );
     app.registerHistoryApiProvider(v2Provider);
 
@@ -1177,7 +1189,24 @@ export default (app: App) => {
         return;
       }
 
+      // A path going stale arrives as null. Nothing is written for it, but
+      // the change gate must forget the path, so the first reading after the
+      // gap is recorded even when it equals the last one before it.
+      if (path && value === null) {
+        changeGate?.forget(
+          path,
+          context === app.selfContext ? "self" : context,
+        );
+      }
+
       if (!path || value === undefined || value === null) return;
+
+      // Lines the writer dropped were never stored, so the gate's record of
+      // what was written is wrong from that point on: start it over.
+      if (writer.droppedLineCount !== changeGateDropMark) {
+        changeGateDropMark = writer.droppedLineCount;
+        changeGate?.clear();
+      }
 
       const isSelf = context === app.selfContext;
       if (isSelf && !config.recordSelf) return;
@@ -1202,8 +1231,19 @@ export default (app: App) => {
         return;
       }
 
+      // Positions are never gated: the track table is small, and a vessel
+      // lying still is exactly when a restored or replayed track needs its
+      // fixes. Everything else skips a value it already wrote, BEFORE the
+      // throttle — a repeat must not take the throttle slot of the change
+      // that follows it.
+      const gated = route !== "position" && route !== "flatten";
+      const ctx = isSelf ? "self" : context;
+      const now = Date.now();
+
       if (route !== "flatten") {
         if (!shouldRecord(path, config.pathFilter.mode)) return;
+        if (gated && changeGate?.isRepeat(path, ctx, source, value, now))
+          return;
         // Throttled per path AND context: the sampling rate bounds each
         // vessel's stream, not the fleet's (issue #93). The stored context
         // ("self" vs raw) is the key, matching what the rows carry. The key
@@ -1234,8 +1274,6 @@ export default (app: App) => {
       // key), so every commit is a pure append. A device with a broken clock
       // even gets *more* accurate history. Re-sent ILP batches keep their
       // original stamps (baked at write() time), so replay-idempotency holds.
-      const ctx = isSelf ? "self" : context;
-
       if (route === "number") {
         writer.write(path, ctx, value as number, undefined, source);
       } else if (route === "string") {
@@ -1259,7 +1297,10 @@ export default (app: App) => {
           "boolean",
           source,
         );
-      } else if (route === "position") {
+      }
+      if (gated) changeGate?.wrote(path, ctx, source, value, now);
+
+      if (route === "position") {
         writer.writePosition(
           ctx,
           value as { latitude: number; longitude: number },
@@ -1285,8 +1326,11 @@ export default (app: App) => {
           // per leaf also keeps one object's sampling budget from being
           // consumed by whichever key happened to be written first.
           if (!shouldRecord(leaf.path, config.pathFilter.mode)) continue;
+          if (changeGate?.isRepeat(leaf.path, ctx, source, leaf.value, now))
+            continue;
           if (isThrottled(leaf.path, ctx, config.defaultSamplingRate ?? 2000))
             continue;
+          changeGate?.wrote(leaf.path, ctx, source, leaf.value, now);
           if (typeof leaf.value === "number") {
             writer.write(leaf.path, ctx, leaf.value, undefined, source);
           } else if (typeof leaf.value === "boolean") {
@@ -1604,6 +1648,7 @@ export default (app: App) => {
       // with different patterns cannot match against the previous run's.
       pathFilterMatcher = null;
       rateMatcher = null;
+      changeGate = null;
       queryClient = null;
       questdbEndpoints = null;
 
