@@ -287,27 +287,36 @@ function computeAngularEMA(
  * heartbeat, so a longer silence is a real gap — a sensor gone stale, the
  * recorder stopped — and stays one.
  *
- * `seed` is the last row before the range, in the same shape as a bucket
- * row, so the first buckets of a range are held too. Measured from the start
- * of the bucket the sample fell in, which can only shorten the hold.
+ * Every row ends in the bucket's `last(ts)` — when its last sample was
+ * taken, null for an empty bucket — and the hold is measured from that, not
+ * from the bucket start: at a resolution near the hold, a sample late in its
+ * bucket would otherwise count as a whole bucket older than it is. `seed` is
+ * the last row before the range in the same shape, so the first buckets of a
+ * range are held too.
+ *
+ * Never into a bucket that starts after `now`: a held value says the value
+ * had not changed, which nothing can say about a time still to come.
  */
 function holdThroughEmptyBuckets(
   rows: unknown[][],
   seed: unknown[] | null,
   holdMs: number,
-  isEmpty: (row: unknown[]) => boolean,
   carry: (empty: unknown[], held: unknown[]) => unknown[],
+  now = Date.now(),
 ): unknown[][] {
   if (holdMs <= 0) return rows;
+  const sampledAt = (row: unknown[]) => row[row.length - 1];
   let held = seed;
   return rows.map((row) => {
-    if (!isEmpty(row)) {
+    if (sampledAt(row) !== null) {
       held = row;
       return row;
     }
+    const bucketStart = Date.parse(row[0] as string);
     if (
       held === null ||
-      Date.parse(row[0] as string) - Date.parse(held[0] as string) >= holdMs
+      bucketStart > now ||
+      bucketStart - Date.parse(sampledAt(held) as string) >= holdMs
     ) {
       return row;
     }
@@ -384,6 +393,10 @@ const MAX_EXPANDED_COLUMNS = 64;
 
 // Effective SAMPLE BY period: QuestDB rejects `SAMPLE BY 0s`, so fractional
 // resolutions (e.g. 0.5) must clamp up to 1s instead of flooring to zero.
+// Trailing columns of every numeric bucket read, for holdNumericBuckets: the
+// bucket's last sample and when it was taken.
+const HELD_SQL = "last(value) as held, last(ts) as held_ts";
+
 function effectiveResolution(resolution: number): number {
   return Math.max(1, Math.floor(resolution));
 }
@@ -435,36 +448,44 @@ export function createHistoryProviderV2(
     return `ts >= '${since}' AND ts < '${from}' AND context = '${safeContext}'`;
   }
 
-  /** The numeric table's last `[ts, value]` before the range, or null. */
+  /** The numeric table's last `[value, ts]` before the range, or null. */
   async function numericSeed(seedWhere: string): Promise<unknown[] | null> {
     const result = await queryClient.exec(
-      `SELECT ts, value FROM signalk WHERE ${seedWhere} LIMIT -1`,
+      `SELECT value, ts FROM signalk WHERE ${seedWhere} LIMIT -1`,
     );
     return result.dataset[0] ?? null;
   }
 
   /**
-   * Hold a numeric SAMPLE BY result whose last column is the bucket's
-   * `last(value)`. Every aggregate of a bucket that held one unchanged value
-   * is that value, so an empty bucket takes the held sample in every column.
-   * The seed is only fetched when the range opens on an empty bucket.
+   * Hold a numeric SAMPLE BY result whose last two columns are the bucket's
+   * `last(value)` and `last(ts)` (HELD_SQL). Every aggregate of a bucket
+   * that held one unchanged value is that value, so an empty bucket takes the
+   * held sample in every column. The seed is only fetched when the range
+   * opens on an empty bucket.
    */
   async function holdNumericBuckets(
     dataset: unknown[][],
     seedWhere: string,
   ): Promise<unknown[][]> {
     if (holdMs <= 0 || dataset.length === 0) return dataset;
-    const isEmpty = (row: unknown[]) => row[row.length - 1] === null;
-    const seed = isEmpty(dataset[0]) ? await numericSeed(seedWhere) : null;
-    return holdThroughEmptyBuckets(
-      dataset,
-      seed,
-      holdMs,
-      isEmpty,
-      (row, held) => [
-        row[0],
-        ...Array<unknown>(row.length - 1).fill(held[held.length - 1]),
-      ],
+    const width = dataset[0].length;
+    let seed: unknown[] | null = null;
+    if (dataset[0][width - 1] === null) {
+      const found = await numericSeed(seedWhere);
+      // Shaped like a bucket row: the value in every value column, the
+      // sample's time last.
+      if (found) {
+        seed = [
+          found[1],
+          ...Array<unknown>(width - 2).fill(found[0]),
+          found[1],
+        ];
+      }
+    }
+    return holdThroughEmptyBuckets(dataset, seed, holdMs, (row, held) =>
+      row.map((cell, i) =>
+        i === 0 ? cell : i === width - 1 ? null : held[width - 2],
+      ),
     );
   }
 
@@ -606,7 +627,7 @@ export function createHistoryProviderV2(
       const kind = withKind ? "value_kind" : "NULL";
       const clause = withSource ? where : withoutSource(where);
       return resolution && resolution > 0
-        ? `SELECT ts, last(value_str) as value_str, last(${kind}) as value_kind FROM signalk_str WHERE ${clause} ${sampleBy(range, resolution)} ORDER BY ts`
+        ? `SELECT ts, last(value_str) as value_str, last(${kind}) as value_kind, last(ts) as held_ts FROM signalk_str WHERE ${clause} ${sampleBy(range, resolution)} ORDER BY ts`
         : `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${clause} ORDER BY ts LIMIT 10000`;
     };
     // A read racing ensureTables()'s migration — or an external QuestDB the
@@ -643,23 +664,21 @@ export function createHistoryProviderV2(
     // A text bucket's value is already its last sample, so an empty bucket
     // takes the held row's text and kind as they are.
     if (resolution && resolution > 0 && seedWhere && holdMs > 0) {
-      const isEmpty = (row: unknown[]) => row[1] === null;
       let seed: unknown[] | null = null;
-      if (dataset.length > 0 && isEmpty(dataset[0])) {
+      if (dataset.length > 0 && dataset[0][3] === null) {
         const kind = ranWithKind ? "value_kind" : "NULL";
         const clause = sourceDropped ? withoutSource(seedWhere) : seedWhere;
         const seedResult = await queryClient.exec(
-          `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${clause} LIMIT -1`,
+          `SELECT ts, value_str, ${kind} as value_kind, ts as held_ts FROM signalk_str WHERE ${clause} LIMIT -1`,
         );
         seed = seedResult.dataset[0] ?? null;
       }
-      dataset = holdThroughEmptyBuckets(
-        dataset,
-        seed,
-        holdMs,
-        isEmpty,
-        (row, held) => [row[0], held[1], held[2]],
-      );
+      dataset = holdThroughEmptyBuckets(dataset, seed, holdMs, (row, held) => [
+        row[0],
+        held[1],
+        held[2],
+        null,
+      ]);
     }
     return {
       rows: dataset.map((row: unknown[]) => [
@@ -875,7 +894,7 @@ export function createHistoryProviderV2(
         const bucket = angular ? ANGULAR_BUCKET_SQL : "avg(value) as agg_value";
         const sampled = !!query.resolution && query.resolution > 0;
         const sql = sampled
-          ? `SELECT ts, ${bucket}, last(value) as held FROM ${table} WHERE ${where} ${sampleBy(range, query.resolution!)} ORDER BY ts`
+          ? `SELECT ts, ${bucket}, ${HELD_SQL} FROM ${table} WHERE ${where} ${sampleBy(range, query.resolution!)} ORDER BY ts`
           : `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
         const result = await queryClient.exec(sql);
         // Held before averaging: an unchanged value is still a sample of
@@ -936,7 +955,7 @@ export function createHistoryProviderV2(
         : `${aggregateToSql(spec.aggregate)} as agg_value`;
       const sampled = !!query.resolution && query.resolution > 0;
       const sql = sampled
-        ? `SELECT ts, ${aggExpr}, last(value) as held FROM ${table} WHERE ${where} ${sampleBy(range, query.resolution!)} ORDER BY ts`
+        ? `SELECT ts, ${aggExpr}, ${HELD_SQL} FROM ${table} WHERE ${where} ${sampleBy(range, query.resolution!)} ORDER BY ts`
         : `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
 
       const result = await queryClient.exec(sql);

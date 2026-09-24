@@ -246,7 +246,8 @@ Buckets start at the request's `from` and cover the whole range, empty ones
 included. A bucket with no row is not always missing data. Change-only recording (see
 Recording) writes an unchanged value only once per heartbeat, so an empty bucket
 takes the last sample before it — in every aggregate, since every aggregate of a
-steady value is that value — for up to twice the heartbeat. At the start of a
+steady value is that value — for up to twice the heartbeat after the sample was
+taken, and never into a bucket that has not started yet. At the start of a
 range the sample comes from just before it. Past that window, and with the
 heartbeat set to 0, an empty bucket is `null`. This happens before `sma` and
 `ema`, so a held value counts as a sample. `middle_index` and
