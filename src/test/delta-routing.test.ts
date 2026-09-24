@@ -3,6 +3,7 @@ import assert from "node:assert";
 import {
   extractVesselName,
   flattenObjectValue,
+  isNoDataSentinel,
   routeDeltaValue,
   UnstorableTracker,
 } from "../delta-routing.js";
@@ -99,6 +100,18 @@ describe("routeDeltaValue", () => {
     }
   });
 
+  it("refuses an NMEA 2000 AC power no-data marker", () => {
+    // 0xFFFFFFFF decoded as signed -1 plus the PGN's -2e9 offset; apparent
+    // power is then scaled by the power factor. Both values seen in the field.
+    for (const [path, value] of [
+      ["electrical.ac.131.phase.A.realPower", -2000000001],
+      ["electrical.ac.131.phase.B.apparentPower", -3725220001.8626103],
+      ["electrical.generators.132.total.reactivePower", -2000000001],
+    ] as const) {
+      assert.strictEqual(routeDeltaValue(path, value), null, path);
+    }
+  });
+
   it("refuses non-finite top-level numbers", () => {
     // QuestDB does NOT reject these — verified live, `value=NaN` is accepted
     // and stored — so recording one poisons the column and every aggregate
@@ -166,6 +179,18 @@ describe("flattenObjectValue (issue #128)", () => {
 
     assert.deepStrictEqual(leaves, [{ path: "sensor.x.good", value: 1.5 }]);
     assert.deepStrictEqual(skipped, ["sensor.x.bad", "sensor.x.worse"]);
+  });
+
+  it("reports an NMEA 2000 no-data marker as skipped", () => {
+    const { leaves, skipped } = flattenObjectValue("electrical.ac.131.total", {
+      realPower: -2000000001,
+      apparentPower: 1200,
+    });
+
+    assert.deepStrictEqual(leaves, [
+      { path: "electrical.ac.131.total.apparentPower", value: 1200 },
+    ]);
+    assert.deepStrictEqual(skipped, ["electrical.ac.131.total.realPower"]);
   });
 
   it("does not descend into nested objects, and says so", () => {
@@ -342,5 +367,66 @@ describe("extractVesselName", () => {
     assert.strictEqual(extractVesselName("", { name: 42 }), null);
     assert.strictEqual(extractVesselName("", null), null);
     assert.strictEqual(extractVesselName("", "just a string"), null);
+  });
+});
+
+describe("isNoDataSentinel", () => {
+  it("keeps every power the PGN can encode, negative included", () => {
+    // -2e9 is raw 0, the lowest encodable value; exported power is negative.
+    for (const path of [
+      "electrical.generators.132.total.realPower",
+      "electrical.ac.131.phase.A.reactivePower",
+    ]) {
+      for (const value of [-2000000000, -3500, 0, 11782]) {
+        assert.strictEqual(
+          isNoDataSentinel(path, value),
+          false,
+          `${path} ${value}`,
+        );
+      }
+    }
+  });
+
+  it("refuses the reserved values just below the floor", () => {
+    // 0xFFFFFFFE (error) and 0xFFFFFFFD decode one and two below no-data.
+    for (const value of [-2000000001, -2000000002, -2000000003]) {
+      assert.strictEqual(
+        isNoDataSentinel("electrical.ac.131.phase.A.realPower", value),
+        true,
+        String(value),
+      );
+    }
+  });
+
+  it("refuses any negative apparent power, however it was scaled", () => {
+    // n2k-signalk multiplies apparent power by the power factor, so the marker
+    // lands above the floor for a factor below 1. Apparent power is a
+    // magnitude, so a negative one is never a reading.
+    for (const value of [-2000000001 * 0.5, -3725220001.8626103, -1]) {
+      assert.strictEqual(
+        isNoDataSentinel("electrical.ac.131.phase.B.apparentPower", value),
+        true,
+        String(value),
+      );
+    }
+    for (const value of [0, 1200, 3976]) {
+      assert.strictEqual(
+        isNoDataSentinel("electrical.ac.131.phase.B.apparentPower", value),
+        false,
+        String(value),
+      );
+    }
+  });
+
+  it("only applies to AC power leaves", () => {
+    // An energy counter or any other path is not an offset power field, and
+    // a large negative value there is not this decoder artefact.
+    for (const path of [
+      "electrical.ac.130.total.energyExport",
+      "electrical.batteries.0.power",
+      "electrical.ac.131.phase.A.realPowerLimit",
+    ]) {
+      assert.strictEqual(isNoDataSentinel(path, -2000000001), false, path);
+    }
   });
 });

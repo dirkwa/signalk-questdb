@@ -82,6 +82,39 @@ export function extractVesselName(path: string, value: unknown): string | null {
   return typeof name === "string" && name.trim() !== "" ? name : null;
 }
 
+// The AC power fields of NMEA 2000 PGNs 65007–65029 (utility and generator
+// real, apparent and reactive power, total and per phase) carry an offset of
+// -2 000 000 000 W, so the lowest value they can encode is exactly that. The
+// canboat definition also marks them signed, and canboatjs reads them that
+// way: a device reporting "no data" (0xFFFFFFFF) decodes as -1, misses the
+// signed no-data check (0x7FFFFFFF), and has the offset added — arriving as
+// -2000000001 W ("error" and the other reserved values land just below). The
+// canboat WASM decoder gets this right; canboatjs connections do not. A
+// handful of these on device start-up dominate every min and average over the
+// path they land in.
+//
+// Real and reactive power: anything below the floor cannot have been
+// encoded, so it is an artefact by construction, and a real negative
+// (exported, capacitive) power passes untouched.
+//
+// Apparent power needs a different test, because n2k-signalk multiplies it by
+// the power factor before it reaches the stream: the marker times a factor
+// below 1 lands ABOVE the floor (-3725220001.86 was observed in the field with
+// a factor above 1). But apparent power is a magnitude, V·I, and never
+// negative — so any negative value is the marker, whatever it was scaled by.
+const N2K_AC_POWER_FLOOR = -2_000_000_000;
+const SIGNED_AC_POWER_LEAF = /\.(realPower|reactivePower)$/;
+const APPARENT_POWER_LEAF = /\.apparentPower$/;
+
+/**
+ * True for a numeric value that is an NMEA 2000 "no data" marker leaked
+ * through the decoder rather than a reading. See N2K_AC_POWER_FLOOR.
+ */
+export function isNoDataSentinel(path: string, value: number): boolean {
+  if (APPARENT_POWER_LEAF.test(path)) return value < 0;
+  return value < N2K_AC_POWER_FLOOR && SIGNED_AC_POWER_LEAF.test(path);
+}
+
 export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
   // NaN and ±Infinity have no ILP representation. QuestDB does NOT reject
   // them — verified against a live instance, `value=NaN` is accepted and
@@ -89,9 +122,12 @@ export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
   // column, and every aggregate over that path afterwards. A source
   // reporting a non-finite number is reporting "no reading", which is what
   // recording nothing means. flattenObjectValue already applied this to
-  // leaves; the top-level path has to agree.
+  // leaves; the top-level path has to agree. A decoder's "no data" marker
+  // is the same "no reading", in disguise.
   if (typeof value === "number")
-    return Number.isFinite(value) ? "number" : null;
+    return Number.isFinite(value) && !isNoDataSentinel(path, value)
+      ? "number"
+      : null;
   if (typeof value === "string") return "string";
   // Booleans are everywhere in Signal K — switch and relay states, pump and
   // valve states, autopilot flags — and used to fall through to null, so a
@@ -156,8 +192,10 @@ export function flattenObjectValue(
     const leafPath = `${path}.${key}`;
     if (typeof leaf === "number") {
       // NaN and ±Infinity have no ILP representation and would poison the
-      // column; a sensor reporting them is reporting "no reading".
-      if (Number.isFinite(leaf)) leaves.push({ path: leafPath, value: leaf });
+      // column; a sensor reporting them is reporting "no reading", and so is
+      // a leaked "no data" marker.
+      if (Number.isFinite(leaf) && !isNoDataSentinel(leafPath, leaf))
+        leaves.push({ path: leafPath, value: leaf });
       else skipped.push(leafPath);
     } else if (typeof leaf === "string" || typeof leaf === "boolean") {
       leaves.push({ path: leafPath, value: leaf });
