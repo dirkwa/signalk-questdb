@@ -181,4 +181,13 @@ describe("normalizeConfig resource limits", () => {
     assert.equal(normalized.questdbMemoryLimit, "2g");
     assert.equal(normalized.questdbCpuLimit, 3);
   });
+  it("turns change-only recording on for a config that predates it", () => {
+    const legacy = { managedContainer: true } as unknown as Config;
+    assert.equal(normalizeConfig(legacy).unchangedHeartbeatSeconds, 300);
+    // An explicit 0 is the opt-out, not a missing key.
+    const off = { unchangedHeartbeatSeconds: 0 } as unknown as Config;
+    assert.equal(normalizeConfig(off).unchangedHeartbeatSeconds, 0);
+    const bad = { unchangedHeartbeatSeconds: -5 } as unknown as Config;
+    assert.equal(normalizeConfig(bad).unchangedHeartbeatSeconds, 300);
+  });
 });

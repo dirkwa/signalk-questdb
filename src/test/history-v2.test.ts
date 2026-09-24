@@ -1816,7 +1816,9 @@ describe("history-v2 middle_index", () => {
     assert.ok(
       sql.includes("row_number() OVER (PARTITION BY b ORDER BY ts)") &&
         sql.includes("count(*) OVER (PARTITION BY b)") &&
-        sql.includes("timestamp_floor('180s', ts)") &&
+        sql.includes(
+          "timestamp_floor('180s', ts, '2024-01-01T00:00:00.000Z')",
+        ) &&
         sql.includes("rn = n / 2 + 1") &&
         sql.includes("FROM signalk ") &&
         !sql.includes("LIMIT"),
@@ -2170,6 +2172,363 @@ describe("history-v2 angular paths", () => {
     close(
       response.data.map((r) => r[1]),
       [Math.PI],
+    );
+  });
+});
+
+describe("history-v2 holding unchanged values across empty buckets", () => {
+  // The recorder writes an unchanged value only once per heartbeat, so an
+  // empty bucket means "unchanged" for up to holdMs after the last sample,
+  // and a real gap after that.
+  const FROM = "2024-01-01T00:00:00Z";
+  const TO = "2024-01-01T00:30:00Z";
+  const HOLD = 10 * 60_000;
+  type QueryClientArg = Parameters<typeof createHistoryProviderV2>[0];
+  type ValuesArg = Parameters<
+    ReturnType<typeof createHistoryProviderV2>["getValues"]
+  >[0];
+  const minute = (m: number) =>
+    `2024-01-01T00:${String(m).padStart(2, "0")}:00.000000Z`;
+  // A numeric bucket row: its aggregate(s), then last(value) and last(ts) —
+  // taken at the bucket start here unless a test says otherwise.
+  const bucket = (m: number, ...values: (number | null)[]) => [
+    minute(m),
+    ...values,
+    values[values.length - 1] === null ? null : minute(m),
+  ];
+
+  function holdingClient(
+    numeric: unknown[][],
+    opts: { seed?: unknown[]; strings?: unknown[][]; stringSeed?: unknown[] },
+    captured: string[] = [],
+  ): QueryClientArg {
+    return {
+      exec: async (sql: string) => {
+        captured.push(sql);
+        let dataset: unknown[][] = [];
+        if (sql.includes("LIMIT -1")) {
+          const seed = sql.includes("signalk_str")
+            ? opts.stringSeed
+            : opts.seed;
+          dataset = seed ? [seed] : [];
+        } else if (sql.includes("FROM signalk_str")) {
+          dataset = opts.strings ?? [];
+        } else if (sql.includes("FROM signalk ")) {
+          dataset = numeric;
+        }
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+    } as unknown as QueryClientArg;
+  }
+
+  const request = (
+    aggregate: string,
+    path = "electrical.switches.a.state",
+  ): ValuesArg =>
+    ({
+      from: Temporal.Instant.from(FROM),
+      to: Temporal.Instant.from(TO),
+      resolution: 60,
+      pathSpecs: [{ path, aggregate, parameter: [] }],
+    }) as unknown as ValuesArg;
+
+  it("carries the last sample into empty buckets, then stops at holdMs", async () => {
+    const numeric = [
+      bucket(0, 2.5, 3),
+      ...[1, 5, 9, 10, 11].map((m) => bucket(m, null, null)),
+    ];
+    const provider = createHistoryProviderV2(
+      holdingClient(numeric, {}),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+
+    const result = await provider.getValues(request("average"));
+
+    // The bucket's own average stays; empty buckets take its LAST sample,
+    // which is what an unchanged value was. At 10 minutes the hold ends.
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      [2.5, 3, 3, 3, null, null],
+    );
+  });
+
+  it("measures the hold from the sample, not from its bucket's start", async () => {
+    // 10-minute buckets and a 10-minute hold: a sample one second before its
+    // bucket ends is one second old at the next bucket, not ten minutes.
+    const numeric = [
+      [minute(0), 5, 5, "2024-01-01T00:09:59.000000Z"],
+      bucket(10, null, null),
+      bucket(20, null, null),
+    ];
+    const provider = createHistoryProviderV2(
+      holdingClient(numeric, {}),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+
+    const result = await provider.getValues({
+      ...request("average"),
+      resolution: 600,
+    });
+
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      [5, 5, null],
+    );
+  });
+
+  it("does not hold into buckets that have not started yet", async () => {
+    const start = Math.floor(Date.now() / 60_000) * 60_000 - 2 * 60_000;
+    const at = (m: number) => new Date(start + m * 60_000).toISOString();
+    const numeric = [
+      [at(0), 3, 3, at(0)],
+      [at(1), null, null, null],
+      [at(4), null, null, null],
+    ];
+    const provider = createHistoryProviderV2(
+      holdingClient(numeric, {}),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+
+    const result = await provider.getValues(request("average"));
+
+    // One minute ago is held; two minutes from now is not.
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      [3, 3, null],
+    );
+  });
+
+  it("holds the first buckets from the last sample before the range", async () => {
+    const captured: string[] = [];
+    const numeric = [
+      bucket(0, null, null),
+      bucket(1, null, null),
+      bucket(2, 7, 7),
+    ];
+    const provider = createHistoryProviderV2(
+      holdingClient(
+        numeric,
+        { seed: [6, "2023-12-31T23:55:00.000000Z"] },
+        captured,
+      ),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+
+    const result = await provider.getValues(request("max"));
+
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      [6, 6, 7],
+    );
+    const seedSql = captured.find((sql) => sql.includes("LIMIT -1"));
+    assert.ok(seedSql, "expected a seed query");
+    assert.ok(
+      seedSql.includes("ts >= '2023-12-31T23:50:00.000Z'") &&
+        seedSql.includes("ts < '2024-01-01T00:00:00.000Z'") &&
+        seedSql.includes("path = 'electrical.switches.a.state'"),
+      `seed window should be the holdMs before the range: ${seedSql}`,
+    );
+  });
+
+  it("does not look before the range when the first bucket has data", async () => {
+    const captured: string[] = [];
+    const provider = createHistoryProviderV2(
+      holdingClient([bucket(0, 1, 1)], {}, captured),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+    await provider.getValues(request("average"));
+    assert.equal(captured.filter((sql) => sql.includes("LIMIT -1")).length, 0);
+  });
+
+  it("leaves empty buckets null when holding is off", async () => {
+    const captured: string[] = [];
+    const numeric = [bucket(0, 1, 1), bucket(1, null, null)];
+    const provider = createHistoryProviderV2(
+      holdingClient(numeric, { seed: [1, minute(0)] }, captured),
+      SELF_CONTEXT,
+    );
+    const result = await provider.getValues(request("average"));
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      [1, null],
+    );
+    assert.equal(captured.filter((sql) => sql.includes("LIMIT -1")).length, 0);
+  });
+
+  it("holds a boolean state from the string table, kind included", async () => {
+    const strings = [
+      [minute(0), null, null, null],
+      [minute(1), "true", "boolean", minute(1)],
+      [minute(2), null, null, null],
+    ];
+    const provider = createHistoryProviderV2(
+      holdingClient([], {
+        strings,
+        stringSeed: [
+          "2023-12-31T23:58:00.000000Z",
+          "false",
+          "boolean",
+          "2023-12-31T23:58:00.000000Z",
+        ],
+      }),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+
+    const result = await provider.getValues(request("last"));
+
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      [false, true, true],
+    );
+  });
+
+  it("feeds held buckets to a moving average as samples", async () => {
+    const numeric = [bucket(0, 4, 4), bucket(1, null, null), bucket(2, 1, 1)];
+    const provider = createHistoryProviderV2(
+      holdingClient(numeric, {}),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+
+    const result = await provider.getValues({
+      ...request("sma", "tanks.fuel.0.currentLevel"),
+      pathSpecs: [
+        {
+          path: "tanks.fuel.0.currentLevel" as Path,
+          aggregate: "sma",
+          parameter: ["2"],
+        },
+      ],
+    });
+
+    // sma:2 over 4, 4 (held), 1.
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      [4, 4, 2.5],
+    );
+  });
+
+  it("holds an angular average in its own convention", async () => {
+    const heading = 6.2;
+    const numeric = [
+      // agg_value, agg_floor, held, held_ts
+      bucket(0, heading, heading, heading),
+      bucket(1, null, null, null),
+    ];
+    const provider = createHistoryProviderV2(
+      holdingClient(numeric, {}),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      () => "rad",
+      HOLD,
+    );
+
+    const result = await provider.getValues(
+      request("average", "navigation.headingTrue"),
+    );
+
+    // Normalised into [0, 2π) like any angular bucket, to rounding.
+    for (const row of result.data) {
+      assert.ok(Math.abs((row[1] as number) - heading) < 1e-9, String(row));
+    }
+  });
+});
+
+describe("history-v2 bucket grid", () => {
+  type ValuesArg = Parameters<
+    ReturnType<typeof createHistoryProviderV2>["getValues"]
+  >[0];
+  // Without FROM … TO, QuestDB's FILL(NULL) only fills between the first and
+  // last bucket holding a row, so leading and trailing empty buckets vanish.
+  it("samples over the whole range, aligned to its start", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+    await provider.getValues({
+      from: Temporal.Instant.from("2024-01-01T00:00:17Z"),
+      to: Temporal.Instant.from("2024-01-01T01:00:00Z"),
+      resolution: 60,
+      pathSpecs: [
+        {
+          path: "environment.depth.belowKeel",
+          aggregate: "average",
+          parameter: [],
+        },
+        { path: "navigation.position", aggregate: "first", parameter: [] },
+        {
+          path: "environment.depth.belowKeel",
+          aggregate: "sma",
+          parameter: [],
+        },
+      ],
+    } as unknown as ValuesArg);
+
+    const sampled = captured.filter((q) => q.sql.includes("SAMPLE BY"));
+    // average, its string-table fallback, position, sma.
+    assert.equal(sampled.length, 4);
+    for (const { sql } of sampled) {
+      assert.ok(
+        sql.includes(
+          "SAMPLE BY 60s FROM '2024-01-01T00:00:17.000Z' TO '2024-01-01T01:00:00.000Z' FILL(NULL)",
+        ),
+        sql,
+      );
+    }
+  });
+
+  it("floors middle_index buckets from the range start too", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+    await provider.getValues({
+      from: Temporal.Instant.from("2024-01-01T00:00:17Z"),
+      to: Temporal.Instant.from("2024-01-01T01:00:00Z"),
+      resolution: 60,
+      pathSpecs: [
+        {
+          path: "environment.depth.belowKeel",
+          aggregate: "middle_index",
+          parameter: [],
+        },
+      ],
+    } as unknown as ValuesArg);
+    assert.ok(
+      captured[0].sql.includes(
+        "timestamp_floor('60s', ts, '2024-01-01T00:00:17.000Z')",
+      ),
+      captured[0].sql,
     );
   });
 });

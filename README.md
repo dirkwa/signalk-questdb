@@ -38,6 +38,9 @@ InfluxDB history can be imported.
 ### Requirements
 
 - Node.js 22 or newer
+- QuestDB 8.1 or newer (resolution queries use `SAMPLE BY … FROM … TO`). This
+  applies to an external QuestDB and to a pinned **QuestDB image version** in
+  managed mode; `latest` always qualifies
 - Signal K server — 2.31 or newer to choose the default history provider in the
   admin UI
 - For managed mode: the
@@ -92,32 +95,33 @@ Export** and **Danger zone** sections. The Danger zone removes the container and
 all of its data — including what Signal K's plugin uninstall cannot reach on
 rootless Podman.
 
-| Setting                      | Default      | Description                                                                                                                                                                     |
-| ---------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| QuestDB image version        | `latest`     | Image tag; the dropdown lists the latest release, pre-releases, and the last three stable releases                                                                              |
-| Manage QuestDB container     | `true`       | Let signalk-container run QuestDB; off = connect to an external QuestDB                                                                                                         |
-| QuestDB host                 | `127.0.0.1`  | External mode only; in managed mode the address is resolved automatically                                                                                                       |
-| HTTP port                    | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on; otherwise signalk-container allocates it                                                                       |
-| ILP port                     | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on; otherwise signalk-container allocates it                                                                       |
-| PostgreSQL port              | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                                                                                                                      |
-| QuestDB memory limit         | `768m`       | Hard cgroup cap on the container (empty = unlimited); the JVM sizes its heap to a fraction of it, so heap plus off-heap stays inside                                            |
-| QuestDB CPU limit (cores)    | `1.5`        | Fractional cores (0 = unlimited)                                                                                                                                                |
-| Default sampling rate (ms)   | `2000`       | Minimum ms between writes for any one path (0 = every update)                                                                                                                   |
-| Per-path sampling rates (ms) | _(empty)_    | Glob → ms overrides, e.g. `{ "environment.wind.*": 200, "tanks.*": 10000 }`                                                                                                     |
-| Write batch interval (ms)    | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance)                                                                           |
-| Record own vessel            | `true`       | Record the `self` context                                                                                                                                                       |
-| Record AIS targets           | `true`       | Record other vessels                                                                                                                                                            |
-| Restore vessels on startup   | `false`      | Replay each vessel's last recorded position after a restart (see Startup restore)                                                                                               |
-| Restore max age (minutes)    | `9`          | Only replay values recorded within this window                                                                                                                                  |
-| Allow `sourcePolicy=all`     | `false`      | Let History API callers split a path into one column per recording source (see History API)                                                                                     |
-| QuestDB console webapp       | `true`       | Serve QuestDB's console inside the Signal K admin UI, admin only (see Console webapp)                                                                                           |
-| Retention (days)             | `0`          | Drop daily partitions older than this (0 = keep forever)                                                                                                                        |
-| Filter mode                  | `exclude`    | `exclude` the matching paths, or `include` only the matching paths                                                                                                              |
-| Path patterns                | _(empty)_    | Glob patterns, one per line, e.g. `environment.wind.*`; empty records everything                                                                                                |
-| Compression codec            | `lz4`        | On-disk WAL segments and Parquet exports: `none`, `lz4` (fast) or `zstd` (smaller)                                                                                              |
-| Compression level            | `3`          | ZSTD level 1–22, used only with `zstd`                                                                                                                                          |
-| Container network            | `sk-network` | Shared Podman/Docker network QuestDB joins in managed mode, so the companion signalk-grafana reaches it by container DNS; host-port publication is separate ("Bind to 0.0.0.0") |
-| Bind to 0.0.0.0              | `false`      | Publish QuestDB's ports on all interfaces (see Connectivity)                                                                                                                    |
+| Setting                       | Default      | Description                                                                                                                                                                     |
+| ----------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| QuestDB image version         | `latest`     | Image tag; the dropdown lists the latest release, pre-releases, and the last three stable releases                                                                              |
+| Manage QuestDB container      | `true`       | Let signalk-container run QuestDB; off = connect to an external QuestDB                                                                                                         |
+| QuestDB host                  | `127.0.0.1`  | External mode only; in managed mode the address is resolved automatically                                                                                                       |
+| HTTP port                     | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on; otherwise signalk-container allocates it                                                                       |
+| ILP port                      | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on; otherwise signalk-container allocates it                                                                       |
+| PostgreSQL port               | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                                                                                                                      |
+| QuestDB memory limit          | `768m`       | Hard cgroup cap on the container (empty = unlimited); the JVM sizes its heap to a fraction of it, so heap plus off-heap stays inside                                            |
+| QuestDB CPU limit (cores)     | `1.5`        | Fractional cores (0 = unlimited)                                                                                                                                                |
+| Default sampling rate (ms)    | `2000`       | Minimum ms between writes for any one path (0 = every update)                                                                                                                   |
+| Per-path sampling rates (ms)  | _(empty)_    | Glob → ms overrides, e.g. `{ "environment.wind.*": 200, "tanks.*": 10000 }`                                                                                                     |
+| Unchanged-value heartbeat (s) | `300`        | A value equal to the last one recorded is written again only this often; changes are written at the sampling rate (0 = every sample, see Change-only recording)                 |
+| Write batch interval (ms)     | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance)                                                                           |
+| Record own vessel             | `true`       | Record the `self` context                                                                                                                                                       |
+| Record AIS targets            | `true`       | Record other vessels                                                                                                                                                            |
+| Restore vessels on startup    | `false`      | Replay each vessel's last recorded position after a restart (see Startup restore)                                                                                               |
+| Restore max age (minutes)     | `9`          | Only replay values recorded within this window                                                                                                                                  |
+| Allow `sourcePolicy=all`      | `false`      | Let History API callers split a path into one column per recording source (see History API)                                                                                     |
+| QuestDB console webapp        | `true`       | Serve QuestDB's console inside the Signal K admin UI, admin only (see Console webapp)                                                                                           |
+| Retention (days)              | `0`          | Drop daily partitions older than this (0 = keep forever)                                                                                                                        |
+| Filter mode                   | `exclude`    | `exclude` the matching paths, or `include` only the matching paths                                                                                                              |
+| Path patterns                 | _(empty)_    | Glob patterns, one per line, e.g. `environment.wind.*`; empty records everything                                                                                                |
+| Compression codec             | `lz4`        | On-disk WAL segments and Parquet exports: `none`, `lz4` (fast) or `zstd` (smaller)                                                                                              |
+| Compression level             | `3`          | ZSTD level 1–22, used only with `zstd`                                                                                                                                          |
+| Container network             | `sk-network` | Shared Podman/Docker network QuestDB joins in managed mode, so the companion signalk-grafana reaches it by container DNS; host-port publication is separate ("Bind to 0.0.0.0") |
+| Bind to 0.0.0.0               | `false`      | Publish QuestDB's ports on all interfaces (see Connectivity)                                                                                                                    |
 
 ## Recording
 
@@ -178,6 +182,39 @@ resolution and the many that need less. **Record own vessel** and **Record AIS
 targets** switch the two kinds of context independently, and **Path patterns**
 exclude (or include only) paths by glob.
 
+**Change-only recording.** Most paths on a boat do not change from one sample
+to the next: a switch that flips twice a day, an energy counter at rest, a tank
+nobody is drawing from, a notification's state. Sampling alone would write each
+of them at the sampling rate forever, and those repeats make up most of the
+rows. So a value equal to the last one written for its path, vessel and source
+is skipped until the **Unchanged-value heartbeat** is due, and then
+written once more. Every change is written as it arrives, subject to the
+sampling rate.
+
+The heartbeat is what keeps the gaps readable. A path that is still being
+updated has a row at least once per heartbeat, so a longer silence means the
+data really stopped:
+
+- **History API (v2).** A resolution bucket with no row takes the last sample
+  before it, for up to twice the heartbeat (see History API). A switch that has
+  been on for an hour reads as on for the whole hour, not as one point and
+  then nothing.
+- **Stale data.** When Signal K marks a path stale it sends `null` for it.
+  Nothing is written for the `null`, so the history shows the last value for at
+  most twice the heartbeat and then a gap. The next reading after that is
+  always written, even if it equals the one before the gap.
+- **Direct SQL and Grafana** see the rows as stored. Add `FILL(PREV)` to a
+  `SAMPLE BY` query to carry values across buckets.
+- **Averages** weight rows, not time. A bucket in which a value changes often
+  and then holds steady averages mostly over the changes; `min`, `max`, `first`
+  and `last` are exact.
+- **Startup restore** replays motion values recorded within **Restore max
+  age**. Keep the heartbeat below that, or a vessel lying still may come back
+  with its position but without its speed, course and heading.
+
+`navigation.position` is never skipped. Set the heartbeat to 0 to record every
+sample.
+
 **Batching.** Samples are buffered and committed every **Write batch interval**
 (5 s), one WAL transaction per table per commit. The buffer holds 100 000 lines;
 if QuestDB is unreachable for longer than that covers, the oldest lines are
@@ -214,6 +251,17 @@ same grid as every other column in the response. An empty bucket keeps its place
 in the window: the average there is of what the window still holds, and a value
 leaves it N buckets after it arrived. `ema` carries its last value across an
 empty bucket instead.
+
+Buckets start at the request's `from` and cover the whole range, empty ones
+included. A bucket with no row is not always missing data. Change-only recording (see
+Recording) writes an unchanged value only once per heartbeat, so an empty bucket
+takes the last sample before it — in every aggregate, since every aggregate of a
+steady value is that value — for up to twice the heartbeat after the sample was
+taken, and never into a bucket that has not started yet. At the start of a
+range the sample comes from just before it. Past that window, and with the
+heartbeat set to 0, an empty bucket is `null`. This happens before `sma` and
+`ema`, so a held value counts as a sample. `middle_index` and
+`navigation.position` return recorded rows only.
 
 A path recorded in radians — a heading, a course, a wind angle; `units: rad` in
 the server's metadata for the path — is averaged as a vector: `average`, `sma`
@@ -667,6 +715,10 @@ shown on the status card as **WAL suspended**. Two causes need two remedies:
   seconds, keeping write volume modest on busy NMEA 2000 buses; per-path
   overrides allow faster rates for critical paths
   (`{ "environment.wind.*": 200 }`) while slow-changing ones stay throttled.
+- **Change-only recording** skips a value that has not changed since it was last
+  written until the heartbeat is due. Paths that hold steady — which is
+  most of them — cost one row per heartbeat instead of one per sampling
+  interval, which cuts both disk use and WAL apply work (see Recording).
 - **Resource caps** of 768 MB RAM and 1.5 CPU cores (cgroup limits via
   signalk-container) keep QuestDB from squeezing co-resident containers like
   Grafana, mayara, or signalk-backup. The JVM sizes its heap to a fraction of

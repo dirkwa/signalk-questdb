@@ -133,6 +133,11 @@ export default function PluginConfigurationPanel({
   const [ilpFlushIntervalMs, setIlpFlushIntervalMs] = useState(
     String(cfg.ilpFlushIntervalMs ?? 5000),
   );
+  // Raw input string, for the same reason. A missing key is the schema
+  // default (on); an explicit 0 is off and must show as 0.
+  const [unchangedHeartbeatSeconds, setUnchangedHeartbeatSeconds] = useState(
+    String(cfg.unchangedHeartbeatSeconds ?? 300),
+  );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
   // Hydrate defensively: a hand-edited or corrupted config could carry a bad
   // mode or a non-array `paths`, and an unguarded `.join()` would crash the
@@ -952,6 +957,18 @@ export default function PluginConfigurationPanel({
       setStatusError(true);
       return;
     }
+    const heartbeatSeconds = Number(unchangedHeartbeatSeconds);
+    if (
+      unchangedHeartbeatSeconds === "" ||
+      !Number.isFinite(heartbeatSeconds) ||
+      heartbeatSeconds < 0
+    ) {
+      setActionStatus(
+        "Unchanged-value heartbeat must be 0 or more seconds (0 = off).",
+      );
+      setStatusError(true);
+      return;
+    }
     // `satisfies` rather than a bare argument: it rejects a key that is not
     // in the schema, so a rename or typo here becomes a compile error
     // instead of a value silently written under a key nothing reads.
@@ -969,6 +986,7 @@ export default function PluginConfigurationPanel({
       managedContainer,
       defaultSamplingRate,
       ilpFlushIntervalMs: batchIntervalMs,
+      unchangedHeartbeatSeconds: heartbeatSeconds,
       recordSelf,
       recordOthers,
       restoreOnStart,
@@ -1582,6 +1600,23 @@ export default function PluginConfigurationPanel({
         />
         <span style={S.hint}>
           1000 = max 1 write/sec per path (0 = every update)
+        </span>
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Unchanged-value heartbeat (s)</span>
+        <input
+          style={S.inputSmall}
+          type="number"
+          min={0}
+          aria-label="Unchanged-value heartbeat in seconds"
+          value={unchangedHeartbeatSeconds}
+          onChange={(e) => setUnchangedHeartbeatSeconds(e.target.value)}
+        />
+        <span style={S.hint}>
+          a value that has not changed is written once per this many seconds;
+          changes are written at the sampling rate (default 300, 0 = every
+          sample)
         </span>
       </div>
 
