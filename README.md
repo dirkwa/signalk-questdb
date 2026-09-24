@@ -162,6 +162,16 @@ objects — notifications, resource documents — are not descended into; a valu
 table can hold is skipped and reported in the status endpoint and the panel
 rather than dropped silently.
 
+A number that means "no reading" is skipped and reported the same way: `NaN`
+and `±Infinity`, and the NMEA 2000 "no data" marker on AC real, apparent and
+reactive power (PGNs 65007–65029). Those fields cannot encode anything below
+−2 000 000 000 W, but canboatjs decodes "no data" as −2 000 000 001 W, so real
+and reactive power below that floor are dropped; real negative power, such as
+export, is unaffected. Apparent power reaches the stream multiplied by the power
+factor, which can move the marker anywhere below zero — and apparent power is
+never negative, so any negative apparent power is dropped. Connections using the
+canboat WASM decoder do not produce the marker at all.
+
 **Sampling.** Each path is written at most once per **Default sampling rate**
 (2000 ms), with per-path overrides by glob for the few paths that need finer
 resolution and the many that need less. **Record own vessel** and **Record AIS
