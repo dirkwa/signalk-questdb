@@ -40,7 +40,7 @@ export const ConfigSchema = Type.Object({
     default: "768m",
     title: "QuestDB memory limit",
     description:
-      "Hard cgroup memory cap (e.g. 512m, 1g, 2g). Empty = unlimited. The JVM auto-sizes its heap to a fraction of this, so capping here bounds total footprint including off-heap.",
+      "Hard cgroup memory cap (e.g. 512m, 1g, 2g). Empty = unlimited. The JVM heap gets half of this, so capping here bounds total footprint including off-heap.",
   }),
 
   questdbCpuLimit: Type.Number({

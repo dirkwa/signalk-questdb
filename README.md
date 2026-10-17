@@ -103,7 +103,7 @@ rootless Podman.
 | HTTP port                     | `9000`       | External mode, or the host binding when "Bind to 0.0.0.0" is on; otherwise signalk-container allocates it                                                                       |
 | ILP port                      | `9009`       | External mode, or the host binding when "Bind to 0.0.0.0" is on; otherwise signalk-container allocates it                                                                       |
 | PostgreSQL port               | `8812`       | Host binding for Grafana/psql when "Bind to 0.0.0.0" is on                                                                                                                      |
-| QuestDB memory limit          | `768m`       | Hard cgroup cap on the container (empty = unlimited); the JVM sizes its heap to a fraction of it, so heap plus off-heap stays inside                                            |
+| QuestDB memory limit          | `768m`       | Hard cgroup cap on the container (empty = unlimited); the JVM heap gets half of it, so heap plus off-heap stays inside                                                          |
 | QuestDB CPU limit (cores)     | `1.5`        | Fractional cores (0 = unlimited)                                                                                                                                                |
 | Default sampling rate (ms)    | `2000`       | Minimum ms between writes for any one path (0 = every update)                                                                                                                   |
 | Per-path sampling rates (ms)  | _(empty)_    | Glob → ms overrides, e.g. `{ "environment.wind.*": 200, "tanks.*": 10000 }`                                                                                                     |
@@ -721,8 +721,9 @@ shown on the status card as **WAL suspended**. Two causes need two remedies:
   interval, which cuts both disk use and WAL apply work (see Recording).
 - **Resource caps** of 768 MB RAM and 1.5 CPU cores (cgroup limits via
   signalk-container) keep QuestDB from squeezing co-resident containers like
-  Grafana, mayara, or signalk-backup. The JVM sizes its heap to a fraction of
-  the memory cap, so total footprint (heap plus off-heap) is bounded. Set the
+  Grafana, mayara, or signalk-backup. The JVM heap gets half of the memory
+  cap, so total footprint (heap plus off-heap) is bounded, and a JVM that runs
+  out of heap exits so the container restarts instead of hanging. Set the
   memory limit to empty or the CPU limit to `0` to lift the cap on roomier
   hosts.
 - **Worker tuning** cuts idle CPU. QuestDB sizes its worker pools from the host
