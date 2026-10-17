@@ -31,7 +31,6 @@ const UNHEALTHY_AFTER_FLAPS = 5;
 // lines — for a live history feed the most recent samples are the ones worth
 // keeping. At ~80 bytes/line this caps the buffer near ~8 MB.
 const MAX_BUFFER_LINES = 100_000;
-// Dropped lines collected before the buffer is compacted; see enforceBufferCap.
 const COMPACT_AFTER_DROPS = 1024;
 
 function escapeTag(s: string): string {
@@ -588,33 +587,44 @@ export class ILPWriter {
     return this.totalSettledLines;
   }
 
-  // While the socket is backpressured, lines stay in `buffer`, where
-  // MAX_BUFFER_LINES bounds them; the drain listener flushes again. Writing on
-  // regardless queued every batch inside the socket, which has no bound: a
+  // Batches go out until the socket pushes back; the rest stays in `buffer`,
+  // where MAX_BUFFER_LINES bounds it, and the drain listener resumes. So at
+  // most one batch waits inside the socket, which has no bound of its own: a
   // QuestDB that accepts the connection but stops reading (a JVM stuck in GC)
-  // grew it for as long as the stall lasted, and nothing was ever dropped or
-  // reported. `force` is for hold() and disconnect(), which promise to send
-  // what is buffered.
+  // otherwise grew it for as long as the stall lasted. `force` sends
+  // everything in one write, for hold() and disconnect(), which promise to.
   private flush(force = false): void {
     if (this.held) return;
-    if (this.awaitingDrain && !force) return;
-    if (!this.connected || !this.socket || this.bufferedLines === 0) return;
+    const socket = this.socket;
+    if (!this.connected || !socket) return;
+    let sent = false;
+    while (this.bufferedLines > 0 && (force || !this.awaitingDrain)) {
+      const end = force
+        ? this.buffer.length
+        : Math.min(this.buffer.length, this.bufferHead + FLUSH_BATCH_SIZE);
+      const batch = this.buffer.slice(this.bufferHead, end);
+      this.bufferHead = end;
+      this.writeBatch(socket, batch);
+      sent = true;
+    }
+    // Sent lines leave the array once per flush that sent any, not once per
+    // batch — and not on the calls a backpressured socket turns away, which
+    // arrive once per enqueue while the buffer sits at the cap.
+    if (sent) {
+      this.buffer = this.buffer.slice(this.bufferHead);
+      this.bufferHead = 0;
+    }
+  }
 
-    const data = (
-      this.bufferHead ? this.buffer.slice(this.bufferHead) : this.buffer
-    ).join("");
-    this.buffer = [];
-    this.bufferHead = 0;
-
+  private writeBatch(socket: net.Socket, lines: string[]): void {
     // The write callback reports failure (e.g. ERR_STREAM_DESTROYED when
     // QuestDB drops the connection mid-flush). Re-queue the batch's lines so the
     // next flush retries them on the reconnected socket instead of silently
     // losing them. QuestDB sorts/dedups by the designated `ts`, so the resulting
-    // out-of-order ingestion is harmless. Splitting back into lines (keeping the
-    // trailing newline on each) means the re-queued data counts toward
-    // MAX_BUFFER_LINES per line, preserving the bound across flap cycles.
-    const lines = data.length > 0 ? data.split(/(?<=\n)/) : [];
-    const canWrite = this.socket.write(data, (err) => {
+    // out-of-order ingestion is harmless. Re-queuing per line keeps the
+    // re-queued data counted toward MAX_BUFFER_LINES, preserving the bound
+    // across flap cycles.
+    const canWrite = socket.write(lines.join(""), (err) => {
       if (err) {
         this.requeueFront(lines);
         this.debug(`ILP write failed, re-queued batch: ${err.message}`);
@@ -631,7 +641,6 @@ export class ILPWriter {
       // during a 65M-row import. Harmless in effect (they only log) but it is
       // a real leak, and it masks the warning's value for genuine ones.
       this.awaitingDrain = true;
-      const socket = this.socket;
       socket.once("drain", () => {
         // A drain from a socket already replaced by a reconnect says nothing
         // about the current one.

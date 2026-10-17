@@ -307,6 +307,68 @@ describe("ILPWriter", () => {
     }
   });
 
+  it("keeps at most one batch in the socket when a stall follows a drain", async () => {
+    // The peer reads for a while after the first stall, then stops again. A
+    // drain that handed the whole buffer to the socket would leave most of it
+    // queued there, outside the cap, while the buffer refills.
+    let accepted: net.Socket | null = null;
+    let readBytes = 0;
+    const READ_BEFORE_STALL = 15_000_000;
+    const server = net.createServer((socket) => {
+      accepted = socket;
+      socket.pause();
+      socket.on("data", (chunk: Buffer) => {
+        readBytes += chunk.length;
+        if (readBytes >= READ_BEFORE_STALL) socket.pause();
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    const CAP = 300_000;
+    let writer: ILPWriter | null = null;
+    let socket: net.Socket | null = null;
+    try {
+      writer = new ILPWriter("127.0.0.1", port, undefined, {
+        flushIntervalMs: 60_000,
+        maxBufferLines: CAP,
+      });
+      await writer.connect();
+
+      const ts = new Date("2024-06-15T12:00:00.000Z");
+      for (let i = 0; i < 500_000; i++) {
+        writer.write("navigation.speedOverGround", "self", i, ts);
+      }
+      (accepted as net.Socket | null)?.resume();
+      const deadline = Date.now() + 10_000;
+      while (readBytes < READ_BEFORE_STALL && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      socket = (writer as unknown as { socket: net.Socket | null }).socket;
+      const queuedBytes = socket?.writableLength ?? 0;
+      // Guard the guard: the drain must have sent part of the buffer.
+      assert.ok(readBytes >= READ_BEFORE_STALL, "peer never read enough");
+      assert.ok(bufferedLines(writer) < CAP, "no drain flush happened");
+      assert.ok(
+        queuedBytes < 1_000_000,
+        `socket queued ${queuedBytes} bytes after the second stall`,
+      );
+    } finally {
+      if (writer) {
+        (writer as unknown as { stopped: boolean }).stopped = true;
+      }
+      socket?.destroy();
+      (accepted as net.Socket | null)?.destroy();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
   it("tags booleans with value_kind and leaves text untagged", async () => {
     // value_kind is what keeps a recorded boolean distinguishable from a
     // path whose text value is literally "true". Text must stay untagged so
