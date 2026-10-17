@@ -673,6 +673,31 @@ describe("history-v2 path and context discovery", () => {
       `getContexts must consult the track table, got: ${captured[0].sql}`,
     );
   });
+
+  it("answers getContexts with LATEST ON, not a DISTINCT scan", async () => {
+    // Callers probe from the epoch; DISTINCT read every row in range and took
+    // >30s per probe on a 2-billion-row install, where LATEST ON stops once
+    // each known context has been seen.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      captureClient(captured),
+      SELF_CONTEXT,
+    );
+
+    await provider.getContexts(range);
+
+    const sql = captured[0].sql;
+    assert.ok(!sql.includes("DISTINCT"), `expected no DISTINCT, got: ${sql}`);
+    for (const table of ["signalk", "signalk_str", "signalk_position"]) {
+      assert.match(
+        sql,
+        new RegExp(
+          `FROM ${table} WHERE ts >= '[^']+' AND ts <= '[^']+' LATEST ON ts PARTITION BY context\\)`,
+        ),
+        `expected a range-filtered LATEST ON over ${table}`,
+      );
+    }
+  });
 });
 
 describe("history-v2 sourceRef filtering", () => {

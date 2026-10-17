@@ -110,6 +110,48 @@ describe("buildContainerEnv low-power tuning", () => {
   });
 });
 
+describe("buildContainerEnv JVM flags", () => {
+  // A heap OOM in a worker loop killed a QuestDB worker thread while the JVM
+  // stayed up in back-to-back full GCs — recording nothing, never restarted.
+  it("exits on OutOfMemoryError so the restart policy can recover", () => {
+    for (const config of [
+      {},
+      baseConfig,
+      { questdbMemoryLimit: "" } as Partial<Config>,
+      { questdbMemoryLimit: "768m" } as Partial<Config>,
+    ]) {
+      assert.ok(
+        buildContainerEnv(config).JVM_PREPEND.includes(
+          "-XX:+ExitOnOutOfMemoryError",
+        ),
+      );
+    }
+  });
+
+  // The entrypoint splices JVM_PREPEND into the java command unquoted, so each
+  // flag must arrive as its own whitespace-separated token.
+  it("gives the heap half of a memory cap", () => {
+    // The JVM default is 25% of the cap: 192 MiB under the 768m default.
+    const env = buildContainerEnv({
+      questdbMemoryLimit: "768m",
+    } as Partial<Config>);
+    assert.deepEqual(env.JVM_PREPEND.split(" "), [
+      "-XX:+ExitOnOutOfMemoryError",
+      "-XX:MaxRAMPercentage=50",
+    ]);
+  });
+
+  it("leaves heap sizing alone without a cap", () => {
+    // Uncapped, the percentage applies to the whole host.
+    for (const questdbMemoryLimit of [undefined, "", "  "]) {
+      const env = buildContainerEnv({ questdbMemoryLimit } as Partial<Config>);
+      assert.deepEqual(env.JVM_PREPEND.split(" "), [
+        "-XX:+ExitOnOutOfMemoryError",
+      ]);
+    }
+  });
+});
+
 describe("buildContainerEnv compression", () => {
   it("omits compression vars when disabled", () => {
     const env = buildContainerEnv(baseConfig);

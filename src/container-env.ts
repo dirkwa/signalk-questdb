@@ -31,6 +31,32 @@ export const QUESTDB_COMMIT_MODE = "sync";
 // wake-up per batch.
 const WORKER_SLEEP_THRESHOLD = "100";
 
+// Extra JVM flags; the image's entrypoint splices JVM_PREPEND into the java
+// command line.
+//
+// ExitOnOutOfMemoryError: QuestDB survives a heap OOM inside one query, but
+// not one inside a worker loop — the worker thread dies and the JVM stays up
+// without it. Observed on a Pi: a "GC overhead limit exceeded" killed the
+// shared-write worker, and the JVM then ran back-to-back full GCs at ~1.4
+// cores for nine hours, recording nothing and failing its healthcheck. The
+// container's restart policy only acts on an exit, so turn the first OOM into
+// one: a restart costs seconds, which the ILP writer's buffer absorbs.
+//
+// MaxRAMPercentage: under a cgroup cap the JVM sizes its heap to the default
+// 25% of it — 192 MiB under the 768m default, which that same install
+// exhausted. QuestDB keeps column data off-heap (mmap and native buffers, the
+// page cache for which the kernel reclaims under the cap), so half the cap
+// for the heap still leaves the native side room while the total stays
+// bounded by the cap. Only set under a cap: without one the percentage
+// applies to the whole host, where the default 25% is already generous.
+export function buildJvmPrepend(config: Partial<Config>): string {
+  const flags = ["-XX:+ExitOnOutOfMemoryError"];
+  if (config.questdbMemoryLimit?.trim()) {
+    flags.push("-XX:MaxRAMPercentage=50");
+  }
+  return flags.join(" ");
+}
+
 export function buildContainerEnv(
   config: Partial<Config>,
 ): Record<string, string> {
@@ -39,6 +65,7 @@ export function buildContainerEnv(
     QDB_HTTP_ENABLED: "true",
     QDB_LINE_TCP_ENABLED: "true",
     QDB_CAIRO_COMMIT_MODE: QUESTDB_COMMIT_MODE,
+    JVM_PREPEND: buildJvmPrepend(config),
 
     // ── Low-power tuning (Pi, Cerbo) ──────────────────────────────────────
     //
