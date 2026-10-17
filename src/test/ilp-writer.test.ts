@@ -3,6 +3,12 @@ import assert from "node:assert/strict";
 import * as net from "net";
 import { ILPWriter, DEFAULT_FLUSH_INTERVAL_MS } from "../ilp-writer.js";
 
+// Lines waiting in the writer's own buffer (not yet handed to the socket).
+function bufferedLines(writer: ILPWriter): number {
+  const w = writer as unknown as { buffer: string[]; bufferHead: number };
+  return w.buffer.length - w.bufferHead;
+}
+
 describe("ILPWriter", () => {
   it("sends correctly formatted ILP lines over TCP", async () => {
     const received: string[] = [];
@@ -183,6 +189,117 @@ describe("ILPWriter", () => {
         (writer as unknown as { stopped: boolean }).stopped = true;
       }
       socket?.destroy();
+      (accepted as net.Socket | null)?.destroy();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
+  it("keeps lines in the capped buffer while backpressured", async () => {
+    // A peer that accepts the connection but never reads, like a QuestDB JVM
+    // stuck in GC. Every later batch used to be queued inside the socket,
+    // which has no bound: nothing was dropped and memory grew for as long as
+    // the stall lasted.
+    let accepted: net.Socket | null = null;
+    const server = net.createServer((socket) => {
+      accepted = socket;
+      socket.pause();
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    let writer: ILPWriter | null = null;
+    let socket: net.Socket | null = null;
+    try {
+      writer = new ILPWriter("127.0.0.1", port, undefined, {
+        flushIntervalMs: 10,
+        maxBufferLines: 10_000,
+      });
+      await writer.connect();
+
+      const ts = new Date("2024-06-15T12:00:00.000Z");
+      for (let i = 0; i < 400_000; i++) {
+        writer.write("navigation.speedOverGround", "self", i, ts);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      socket = (writer as unknown as { socket: net.Socket | null }).socket;
+      const queuedBytes = socket?.writableLength ?? 0;
+      const buffered = bufferedLines(writer);
+
+      assert.ok(queuedBytes > 0, "expected the socket to be backpressured");
+      // The socket keeps only the batch that hit backpressure (~1000 lines);
+      // before the fix it held the other ~390,000 lines, ~30 MB.
+      assert.ok(
+        queuedBytes < 1_000_000,
+        `socket queued ${queuedBytes} bytes past the buffer cap`,
+      );
+      assert.ok(buffered <= 10_000, `buffer holds ${buffered} lines`);
+      assert.ok(
+        writer.droppedLineCount > 0,
+        "expected the cap to drop the oldest lines",
+      );
+    } finally {
+      if (writer) {
+        (writer as unknown as { stopped: boolean }).stopped = true;
+      }
+      socket?.destroy();
+      (accepted as net.Socket | null)?.destroy();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
+  it("sends the held-back lines once the socket drains", async () => {
+    // The flush timer is set far out, so only the drain listener can send
+    // what backpressure held back.
+    let accepted: net.Socket | null = null;
+    let received = 0;
+    const server = net.createServer((socket) => {
+      accepted = socket;
+      socket.pause();
+      socket.on("data", (chunk: Buffer) => {
+        for (const byte of chunk) if (byte === 0x0a) received++;
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+
+    let writer: ILPWriter | null = null;
+    try {
+      writer = new ILPWriter("127.0.0.1", port, undefined, {
+        flushIntervalMs: 60_000,
+        maxBufferLines: 500_000,
+      });
+      await writer.connect();
+
+      const TOTAL = 400_000;
+      const ts = new Date("2024-06-15T12:00:00.000Z");
+      for (let i = 0; i < TOTAL; i++) {
+        writer.write("navigation.speedOverGround", "self", i, ts);
+      }
+      const held = bufferedLines(writer);
+      assert.ok(held > 0, "expected backpressure to hold lines back");
+
+      (accepted as net.Socket | null)?.resume();
+      const deadline = Date.now() + 10_000;
+      while (received < TOTAL && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      assert.strictEqual(received, TOTAL);
+      assert.strictEqual(writer.droppedLineCount, 0);
+    } finally {
+      // Read before disconnecting: disconnect() ends the socket gracefully,
+      // which waits on a peer that would otherwise still be paused.
+      (accepted as net.Socket | null)?.resume();
+      if (writer) await writer.disconnect();
       (accepted as net.Socket | null)?.destroy();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
