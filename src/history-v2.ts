@@ -1072,12 +1072,22 @@ export function createHistoryProviderV2(
     // Include the track table: a vessel can be position-only (an AIS target
     // whose other paths are filtered out, or a receiver sending nothing but
     // fixes), and omitting it hides that context entirely.
+    //
+    // LATEST ON, not DISTINCT: DISTINCT reads the context column of every row
+    // in range, while LATEST ON walks back from the newest row and stops once
+    // each context in the symbol table has been seen. Callers probe with
+    // epoch-wide ranges (the tracks plugin asks "is this vessel known at
+    // all?" from 1970), and on a 2-billion-row install DISTINCT took >30s per
+    // probe — abandoned probes piled up until the JVM ran out of heap — where
+    // LATEST ON answers in tens of milliseconds. Applied per table and
+    // unioned, as in history-v1's snapshot, so each table can stop early.
+    const latest = ` LATEST ON ts PARTITION BY context`;
     const result = await queryClient.exec(
-      `SELECT DISTINCT context FROM signalk WHERE ${where}
+      `(SELECT context FROM signalk WHERE ${where}${latest})
        UNION
-       SELECT DISTINCT context FROM signalk_str WHERE ${where}
+       (SELECT context FROM signalk_str WHERE ${where}${latest})
        UNION
-       SELECT DISTINCT context FROM signalk_position WHERE ${where}
+       (SELECT context FROM signalk_position WHERE ${where}${latest})
        ORDER BY context`,
     );
 
