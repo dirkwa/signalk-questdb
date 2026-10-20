@@ -9,6 +9,13 @@ function bufferedLines(writer: ILPWriter): number {
   return w.buffer.length - w.bufferHead;
 }
 
+// Resolves once the server has run its handler for the next connection. The
+// client's connect() resolving does not mean that: on macOS the accept can
+// come later, and a resume() on a socket not yet accepted is lost.
+function nextConnection(server: net.Server): Promise<net.Socket> {
+  return new Promise((resolve) => server.once("connection", resolve));
+}
+
 describe("ILPWriter", () => {
   it("sends correctly formatted ILP lines over TCP", async () => {
     const received: string[] = [];
@@ -271,6 +278,7 @@ describe("ILPWriter", () => {
     );
     const port = (server.address() as net.AddressInfo).port;
 
+    const peer = nextConnection(server);
     let writer: ILPWriter | null = null;
     try {
       writer = new ILPWriter("127.0.0.1", port, undefined, {
@@ -278,6 +286,7 @@ describe("ILPWriter", () => {
         maxBufferLines: 500_000,
       });
       await writer.connect();
+      await peer;
 
       const TOTAL = 400_000;
       const ts = new Date("2024-06-15T12:00:00.000Z");
@@ -328,6 +337,7 @@ describe("ILPWriter", () => {
     const port = (server.address() as net.AddressInfo).port;
 
     const CAP = 300_000;
+    const peer = nextConnection(server);
     let writer: ILPWriter | null = null;
     let socket: net.Socket | null = null;
     try {
@@ -336,6 +346,7 @@ describe("ILPWriter", () => {
         maxBufferLines: CAP,
       });
       await writer.connect();
+      await peer;
 
       const ts = new Date("2024-06-15T12:00:00.000Z");
       for (let i = 0; i < 500_000; i++) {
