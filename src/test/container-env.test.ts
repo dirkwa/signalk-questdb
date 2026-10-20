@@ -152,6 +152,20 @@ describe("buildContainerEnv JVM flags", () => {
   });
 });
 
+describe("buildContainerEnv native memory", () => {
+  // glibc keeps freed memory in per-thread arenas; under the cgroup cap the
+  // kept arenas filled most of a Pi's swap allowance within hours.
+  it("caps glibc malloc arenas on every config", () => {
+    for (const config of [
+      {},
+      baseConfig,
+      { questdbMemoryLimit: "768m" } as Partial<Config>,
+    ]) {
+      assert.equal(buildContainerEnv(config).MALLOC_ARENA_MAX, "2");
+    }
+  });
+});
+
 describe("buildContainerEnv compression", () => {
   it("omits compression vars when disabled", () => {
     const env = buildContainerEnv(baseConfig);

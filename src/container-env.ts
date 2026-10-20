@@ -66,6 +66,17 @@ export function buildContainerEnv(
     QDB_LINE_TCP_ENABLED: "true",
     QDB_CAIRO_COMMIT_MODE: QUESTDB_COMMIT_MODE,
     JVM_PREPEND: buildJvmPrepend(config),
+    // glibc's malloc gives every thread that contends for it an arena of its
+    // own, up to eight per core, and keeps what an arena held after it is
+    // freed. Everything the JVM allocates natively goes through it, so under
+    // the memory cap the kept arenas end up in swap: on a Pi 5 with the 768m
+    // cap, seven 64/128 MiB arenas held 46 MiB resident and 406 MiB swapped
+    // after 4.5 hours, with the container at 676 of its 768 MiB swap
+    // allowance, the margin left before the kernel kills it. Two arenas is
+    // the usual cap for a JVM in a container. QuestDB's entrypoint switches
+    // to its bundled jemalloc only on x86_64; there LD_PRELOAD replaces
+    // glibc's malloc and this variable goes unread.
+    MALLOC_ARENA_MAX: "2",
 
     // ── Low-power tuning (Pi, Cerbo) ──────────────────────────────────────
     //
