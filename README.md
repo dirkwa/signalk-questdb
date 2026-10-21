@@ -116,6 +116,9 @@ rootless Podman.
 | Allow `sourcePolicy=all`      | `false`      | Let History API callers split a path into one column per recording source (see History API)                                                                                     |
 | QuestDB console webapp        | `true`       | Serve QuestDB's console inside the Signal K admin UI, admin only (see Console webapp)                                                                                           |
 | Retention (days)              | `0`          | Drop daily partitions older than this (0 = keep forever)                                                                                                                        |
+| Keep own track                | `true`       | Archive the own vessel's positions before retention drops them (see Retention and the archive)                                                                                  |
+| Archived own-vessel paths     | _(empty)_    | Glob patterns of own-vessel numeric paths to archive the same way, e.g. `environment.depth.*`                                                                                   |
+| Archive resolution (s)        | `10`         | Archived rows are thinned to the first sample per interval (0 = every row)                                                                                                      |
 | Filter mode                   | `exclude`    | `exclude` the matching paths, or `include` only the matching paths                                                                                                              |
 | Path patterns                 | _(empty)_    | Glob patterns, one per line, e.g. `environment.wind.*`; empty records everything                                                                                                |
 | Compression codec             | `lz4`        | On-disk WAL segments and Parquet exports: `none`, `lz4` (fast) or `zstd` (smaller)                                                                                              |
@@ -221,9 +224,33 @@ if QuestDB is unreachable for longer than that covers, the oldest lines are
 dropped and counted. A clean Signal K shutdown flushes first; a hard crash loses
 at most one interval.
 
-**Retention** drops whole daily partitions once they are older than the
-configured days; 0 keeps everything. **Compression** applies LZ4 or ZSTD to the
-WAL segments on disk (and to Parquet exports).
+**Compression** applies LZ4 or ZSTD to the WAL segments on disk (and to
+Parquet exports).
+
+### Retention and the archive
+
+Retention drops whole daily partitions once they lie entirely before the
+configured number of days; 0 keeps everything. QuestDB cannot delete single
+rows, so keeping part of a day means copying it out first. Before a day of
+`signalk_position` or `signalk` is dropped, the own vessel's rows that the
+settings ask to keep are copied into an archive table, thinned to one row per
+**Archive resolution** interval, and the day is dropped only once QuestDB has
+applied the copy. A copy that fails leaves the day in place for the next run.
+
+| Table                      | Holds                                                           |
+| -------------------------- | --------------------------------------------------------------- |
+| `signalk_position_archive` | Own-vessel positions (**Keep own track**, on by default)        |
+| `signalk_archive`          | Own-vessel numeric paths matching **Archived own-vessel paths** |
+
+Both have the columns and dedup keys of their base table and are partitioned by
+month. Retention never drops from them, other vessels are never archived, and
+strings are not archived. The History API reads the archive together with the
+base tables for any range it covers, so a track or a depth series continues
+past the retention boundary without a seam. An archived row is the first sample
+of its interval and is stamped on the interval's start.
+
+Size, measured: a position row takes 32 bytes, so a vessel recorded around the
+clock fills about 100 MB a year at the default 10 s, 34 MB at 30 s.
 
 ## History API
 

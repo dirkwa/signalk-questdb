@@ -1,3 +1,5 @@
+import { ARCHIVE_TABLES } from "./archive.js";
+
 const SAFE_IDENTIFIER = /^[a-zA-Z0-9_.:-]+$/;
 const READ_ONLY_SQL = /^\s*(SELECT|SHOW|WITH)\b/i;
 const DANGEROUS_SQL =
@@ -177,6 +179,34 @@ export class QueryClient {
         lon       DOUBLE
       ) TIMESTAMP(ts)
         PARTITION BY DAY
+        WAL
+        DEDUP UPSERT KEYS(ts, context, source)
+    `);
+
+    // What retention keeps of the own vessel (see archive.ts). Same columns
+    // and keys as the base tables, partitioned by month.
+    await this.exec(`
+      CREATE TABLE IF NOT EXISTS ${ARCHIVE_TABLES.signalk} (
+        ts        TIMESTAMP,
+        path      SYMBOL CAPACITY 512 CACHE,
+        context   SYMBOL CAPACITY 128 CACHE,
+        source    SYMBOL CAPACITY 256 CACHE,
+        value     DOUBLE
+      ) TIMESTAMP(ts)
+        PARTITION BY MONTH
+        WAL
+        DEDUP UPSERT KEYS(ts, path, context, source)
+    `);
+
+    await this.exec(`
+      CREATE TABLE IF NOT EXISTS ${ARCHIVE_TABLES.signalk_position} (
+        ts        TIMESTAMP,
+        context   SYMBOL CAPACITY 128 CACHE,
+        source    SYMBOL CAPACITY 256 CACHE,
+        lat       DOUBLE,
+        lon       DOUBLE
+      ) TIMESTAMP(ts)
+        PARTITION BY MONTH
         WAL
         DEDUP UPSERT KEYS(ts, context, source)
     `);

@@ -139,6 +139,17 @@ export default function PluginConfigurationPanel({
     String(cfg.unchangedHeartbeatSeconds ?? 300),
   );
   const [retentionDays, setRetentionDays] = useState(cfg.retentionDays || 0);
+  // A missing key is the schema default (on), as normalizeConfig reads it.
+  const [archiveOwnTrack, setArchiveOwnTrack] = useState(
+    cfg.archiveOwnTrack !== false,
+  );
+  const [archivePaths, setArchivePaths] = useState(
+    (Array.isArray(cfg.archivePaths) ? cfg.archivePaths : []).join("\n"),
+  );
+  // Raw input string, like the other numeric fields doSave validates.
+  const [archiveResolutionSeconds, setArchiveResolutionSeconds] = useState(
+    String(cfg.archiveResolutionSeconds ?? 10),
+  );
   // Hydrate defensively: a hand-edited or corrupted config could carry a bad
   // mode or a non-array `paths`, and an unguarded `.join()` would crash the
   // whole panel render.
@@ -969,6 +980,18 @@ export default function PluginConfigurationPanel({
       setStatusError(true);
       return;
     }
+    const archiveSeconds = Number(archiveResolutionSeconds);
+    if (
+      archiveResolutionSeconds === "" ||
+      !Number.isInteger(archiveSeconds) ||
+      archiveSeconds < 0
+    ) {
+      setActionStatus(
+        "Archive resolution must be a whole number of seconds, 0 or more.",
+      );
+      setStatusError(true);
+      return;
+    }
     // `satisfies` rather than a bare argument: it rejects a key that is not
     // in the schema, so a rename or typo here becomes a compile error
     // instead of a value silently written under a key nothing reads.
@@ -994,6 +1017,12 @@ export default function PluginConfigurationPanel({
       enableConsole,
       restoreMaxAgeMinutes,
       retentionDays,
+      archiveOwnTrack,
+      archivePaths: archivePaths
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      archiveResolutionSeconds: archiveSeconds,
       compression,
       compressionLevel,
       networkName,
@@ -1741,6 +1770,58 @@ export default function PluginConfigurationPanel({
         />
         <span style={S.hint}>0 = keep forever</span>
       </div>
+
+      {retentionDays > 0 && (
+        <>
+          <div style={S.fieldRow}>
+            <span style={S.label}>Keep own track</span>
+            <input
+              type="checkbox"
+              style={S.checkbox}
+              aria-label="Keep own track beyond retention"
+              checked={archiveOwnTrack}
+              onChange={(e) => setArchiveOwnTrack(e.target.checked)}
+            />
+            <span style={S.hint}>
+              copy the own vessel&apos;s positions into an archive retention
+              never drops, so the own track stays available however old
+            </span>
+          </div>
+
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ ...S.label, width: "auto", marginBottom: 6 }}>
+              Archived own-vessel paths (one per line, glob supported)
+            </div>
+            <textarea
+              style={S.textarea}
+              aria-label="Own-vessel paths to keep beyond retention"
+              value={archivePaths}
+              onChange={(e) => setArchivePaths(e.target.value)}
+            />
+            <div style={S.fieldHelp}>
+              Numeric paths only, e.g. environment.depth.* for the depth along
+              the track. Other vessels are never archived.
+            </div>
+          </div>
+
+          <div style={S.fieldRow}>
+            <span style={S.label}>Archive resolution (s)</span>
+            <input
+              style={S.inputSmall}
+              type="number"
+              min={0}
+              step={1}
+              aria-label="Archive resolution (seconds)"
+              value={archiveResolutionSeconds}
+              onChange={(e) => setArchiveResolutionSeconds(e.target.value)}
+            />
+            <span style={S.hint}>
+              one row per path per interval (default 10); 0 keeps every recorded
+              row
+            </span>
+          </div>
+        </>
+      )}
 
       {/* Open on mount when patterns are already configured, so a user who has
           set filtering sees it rather than a collapsed header. Keyed on the

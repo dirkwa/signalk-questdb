@@ -191,3 +191,32 @@ describe("normalizeConfig resource limits", () => {
     assert.equal(normalizeConfig(bad).unchangedHeartbeatSeconds, 300);
   });
 });
+
+describe("normalizeConfig archive options", () => {
+  it("keeps the own track and archives at 10 s when the keys are missing", () => {
+    const normalized = normalizeConfig({
+      retentionDays: 30,
+    } as unknown as Config);
+    assert.equal(normalized.archiveOwnTrack, true);
+    assert.deepEqual(normalized.archivePaths, []);
+    assert.equal(normalized.archiveResolutionSeconds, 10);
+  });
+
+  it("respects an explicit opt-out and an explicit 0 resolution", () => {
+    const normalized = normalizeConfig({
+      archiveOwnTrack: false,
+      archiveResolutionSeconds: 0,
+    } as unknown as Config);
+    assert.equal(normalized.archiveOwnTrack, false);
+    assert.equal(normalized.archiveResolutionSeconds, 0);
+  });
+
+  it("drops blank and non-string patterns and repairs a bad resolution", () => {
+    const normalized = normalizeConfig({
+      archivePaths: ["environment.depth.*", " ", 5],
+      archiveResolutionSeconds: -3,
+    } as unknown as Config);
+    assert.deepEqual(normalized.archivePaths, ["environment.depth.*"]);
+    assert.equal(normalized.archiveResolutionSeconds, 10);
+  });
+});

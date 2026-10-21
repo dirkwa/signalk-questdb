@@ -2557,3 +2557,100 @@ describe("history-v2 bucket grid", () => {
     );
   });
 });
+
+describe("history-v2 archive", () => {
+  // An archive that covers everything up to the end of 2024.
+  const archive = {
+    covers: (_table: string, from: string) =>
+      Date.parse(from) <= Date.parse("2024-12-31T23:59:59Z"),
+  };
+  const provider = (captured: CapturedQuery[]) =>
+    createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+      false,
+      () => {},
+      () => undefined,
+      0,
+      archive,
+    );
+  const request = (from: string, to: string, path: string) =>
+    ({
+      from: { toString: () => from },
+      to: { toString: () => to },
+      context: "vessels.self",
+      resolution: 60,
+      pathSpecs: [{ path, aggregate: "first", parameter: [] }],
+    }) as any;
+
+  it("reads a covered position range from the base table merged with the archive", async () => {
+    const captured: CapturedQuery[] = [];
+    await provider(captured).getValues(
+      request(
+        "2024-06-01T00:00:00Z",
+        "2024-06-02T00:00:00Z",
+        "navigation.position",
+      ),
+    );
+    assert.match(
+      captured[0].sql,
+      /FROM \(\(SELECT ts, context, source, lat, lon FROM signalk_position UNION ALL SELECT ts, context, source, lat, lon FROM signalk_position_archive\) ORDER BY ts\) TIMESTAMP\(ts\) WHERE ts >= /,
+    );
+    assert.match(captured[0].sql, /SAMPLE BY 60s/);
+  });
+
+  it("reads a numeric path through the archive too", async () => {
+    const captured: CapturedQuery[] = [];
+    await provider(captured).getValues(
+      request(
+        "2024-06-01T00:00:00Z",
+        "2024-06-02T00:00:00Z",
+        "environment.depth.belowTransducer",
+      ),
+    );
+    assert.match(
+      captured[0].sql,
+      /FROM signalk_archive\) ORDER BY ts\) TIMESTAMP\(ts\) WHERE /,
+    );
+  });
+
+  it("keeps a range the archive does not cover on the base table alone", async () => {
+    const captured: CapturedQuery[] = [];
+    await provider(captured).getValues(
+      request(
+        "2025-06-01T00:00:00Z",
+        "2025-06-02T00:00:00Z",
+        "navigation.position",
+      ),
+    );
+    assert.match(captured[0].sql, /FROM signalk_position WHERE ts >= /);
+    assert.doesNotMatch(captured[0].sql, /_archive/);
+  });
+
+  it("lists archived paths and contexts for a covered range", async () => {
+    const captured: CapturedQuery[] = [];
+    const p = provider(captured);
+    const range = {
+      from: { toString: () => "2024-01-01T00:00:00Z" },
+      to: { toString: () => "2025-01-01T00:00:00Z" },
+    } as any;
+    await p.getPaths(range);
+    await p.getContexts(range);
+    assert.match(
+      captured[0].sql,
+      /SELECT DISTINCT path FROM signalk_archive WHERE/,
+    );
+    assert.match(
+      captured[0].sql,
+      /SELECT DISTINCT 'navigation\.position' path FROM signalk_position_archive WHERE/,
+    );
+    assert.match(
+      captured[1].sql,
+      /\(SELECT context FROM signalk_archive WHERE [^)]* LATEST ON ts PARTITION BY context\)/,
+    );
+    assert.match(
+      captured[1].sql,
+      /\(SELECT context FROM signalk_position_archive WHERE/,
+    );
+  });
+});

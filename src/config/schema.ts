@@ -135,6 +135,28 @@ export const ConfigSchema = Type.Object({
     title: "Retention (days, 0 = keep forever)",
   }),
 
+  archiveOwnTrack: Type.Boolean({
+    default: true,
+    title: "Keep own track beyond retention",
+    description:
+      "Before retention drops a day, copy the own vessel's positions into an archive that retention never touches, thinned to the archive resolution. History reads include the archive, so the own track stays available however old it is.",
+  }),
+
+  archivePaths: Type.Array(Type.String(), {
+    default: [],
+    title: "Archived own-vessel paths",
+    description:
+      "Numeric paths of the own vessel to archive the same way, as glob patterns, e.g. environment.depth.*. Other vessels are never archived.",
+  }),
+
+  archiveResolutionSeconds: Type.Number({
+    default: 10,
+    minimum: 0,
+    title: "Archive resolution (seconds)",
+    description:
+      "Archived rows are thinned to the first sample in each interval of this length. 0 archives every recorded row.",
+  }),
+
   networkName: Type.String({
     default: "sk-network",
     title: "Container network",
@@ -210,6 +232,20 @@ export function normalizeConfig(config: Config): Config {
     // than restoreOnStart: the console only ever does what an authenticated
     // admin types, so a missing key should not hide the tool.
     enableConsole: config.enableConsole !== false,
+    // On unless explicitly disabled: turning retention on must not silently
+    // drop the own track along with everything else.
+    archiveOwnTrack: config.archiveOwnTrack !== false,
+    archivePaths: Array.isArray(config.archivePaths)
+      ? config.archivePaths.filter(
+          (p): p is string => typeof p === "string" && p.trim() !== "",
+        )
+      : [],
+    archiveResolutionSeconds:
+      typeof config.archiveResolutionSeconds === "number" &&
+      Number.isFinite(config.archiveResolutionSeconds) &&
+      config.archiveResolutionSeconds >= 0
+        ? Math.floor(config.archiveResolutionSeconds)
+        : 10,
     // Missing resource limits get the schema defaults. Config-panel saves
     // used to drop these keys entirely (issue #98), which ran QuestDB with
     // NO memory cap instead of the promised 768m — this backfill repairs
