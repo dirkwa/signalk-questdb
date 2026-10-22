@@ -53,8 +53,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  *
  * Before a partition of `signalk_position` or `signalk` is dropped, the own
  * vessel's rows that the options ask to keep are copied, thinned, into the
- * archive, and the drop waits until QuestDB has applied that copy. A copy
- * that fails leaves the partition in place for the next run; a run stopped
+ * archive, and the drop waits until QuestDB has applied that copy and reads
+ * know the archive covers it. A copy or a refresh that fails leaves the
+ * partition in place for the next run; a run stopped
  * between the copy and the drop repeats the copy, which the archive's dedup
  * keys absorb.
  */
@@ -62,7 +63,9 @@ export function startRetention(
   queryClient: Pick<QueryClient, "exec">,
   options: RetentionOptions,
   debug: (msg: string) => void,
-  onArchived: () => void = () => {},
+  // Awaited after each copy, before its drop: reads pick the archive by its
+  // cached span, so the span must reach a day before the base rows go.
+  onArchived: () => Promise<void> = async () => {},
 ): Retention | null {
   if (options.retentionDays <= 0) return null;
 
@@ -210,7 +213,6 @@ export function startRetention(
   async function run() {
     if (running || stopped) return;
     running = true;
-    let archived = false;
     try {
       const cutoff = new Date(
         Date.now() - Math.floor(options.retentionDays) * DAY_MS,
@@ -222,7 +224,7 @@ export function startRetention(
         try {
           for (const partition of await expiredPartitions(table, cutoff)) {
             if (stopped) return;
-            if (await archive(table, partition)) archived = true;
+            if (await archive(table, partition)) await onArchived();
             if (stopped) return;
             await queryClient.exec(
               `ALTER TABLE ${table} DROP PARTITION LIST '${partition.name}'`,
@@ -237,7 +239,6 @@ export function startRetention(
       debug(`Retention check complete (keeping ${options.retentionDays} days)`);
     } finally {
       running = false;
-      if (archived) onArchived();
     }
   }
 

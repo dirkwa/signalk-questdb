@@ -1385,13 +1385,7 @@ export default (app: App) => {
           archiveResolutionSeconds: config.archiveResolutionSeconds,
         },
         (msg) => app.debug(msg),
-        () => {
-          archive.refresh().catch((err: unknown) => {
-            app.debug(
-              `Archive span refresh failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-        },
+        () => archive.refresh(),
       );
     }
 

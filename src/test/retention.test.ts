@@ -74,7 +74,9 @@ async function runOnce(
       logs.push(msg);
       if (msg.startsWith("Retention check complete")) done();
     },
-    () => archived++,
+    async () => {
+      archived++;
+    },
   );
   assert.ok(retention);
   await finished;
@@ -224,6 +226,59 @@ describe("retention", () => {
     assert.ok(
       logs.some((l) => /Retention for signalk_position failed/.test(l)),
     );
+  });
+
+  it("refreshes what reads know of the archive before each drop", async () => {
+    const order: string[] = [];
+    const { client, statements } = scripted({
+      partitions: { signalk_position: [DAY_ONE, DAY_TWO] },
+    });
+    let done!: () => void;
+    const finished = new Promise<void>((resolve) => (done = resolve));
+    const retention = startRetention(
+      client,
+      OPTIONS,
+      (msg) => {
+        if (msg.startsWith("Retention check complete")) done();
+      },
+      async () => {
+        order.push(`refresh after ${statements.length} statements`);
+      },
+    );
+    await finished;
+    retention?.stop();
+    const drops = statements
+      .map((s, i) => [s, i] as const)
+      .filter(([s]) => s.includes("DROP PARTITION"))
+      .map(([, i]) => i);
+    assert.equal(order.length, 2);
+    // Each refresh came after its copy and before its drop.
+    assert.ok(Number(order[0]!.split(" ")[2]) <= drops[0]!);
+    assert.ok(Number(order[1]!.split(" ")[2]) <= drops[1]!);
+  });
+
+  it("keeps the partition when the refresh fails", async () => {
+    const { client, statements } = scripted({
+      partitions: { signalk_position: [DAY_ONE] },
+    });
+    let done!: () => void;
+    const finished = new Promise<void>((resolve) => (done = resolve));
+    const logs: string[] = [];
+    const retention = startRetention(
+      client,
+      OPTIONS,
+      (msg) => {
+        logs.push(msg);
+        if (msg.startsWith("Retention check complete")) done();
+      },
+      async () => {
+        throw new Error("QuestDB query failed (503)");
+      },
+    );
+    await finished;
+    retention?.stop();
+    assert.equal(index(statements, /DROP PARTITION/), -1);
+    assert.ok(logs.some((l) => /signalk_position failed: .*503/.test(l)));
   });
 
   it("keeps the partition when the archive is suspended", async () => {

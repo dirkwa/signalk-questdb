@@ -250,7 +250,7 @@ past the retention boundary without a seam. An archived row is the first sample
 of its interval and is stamped on the interval's start.
 
 Size, measured: a position row takes 32 bytes, so a vessel recorded around the
-clock fills about 100 MB a year at the default 10 s, 34 MB at 30 s.
+clock fills about 100 MB a year at a 10 s resolution, 34 MB at 30 s.
 
 ## History API
 
