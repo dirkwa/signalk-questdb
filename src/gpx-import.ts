@@ -126,15 +126,26 @@ interface Point {
   segment: number;
 }
 
+// Names counted so far per tally, so a point past the cap costs no scan of
+// the keys: in an export full of AIS targets that is most points.
+const NAMED = new WeakMap<Record<string, number>, number>();
+
 /** Count one point against a track name, bounded at MAX_NAMED names. */
 function tally(counts: Record<string, number>, name: string): void {
   // Own properties only: a track named "constructor" is a name like any
   // other, not the object's inherited function.
-  const key =
-    Object.hasOwn(counts, name) || Object.keys(counts).length < MAX_NAMED
-      ? name
-      : OTHER_NAMES;
-  counts[key] = (Object.hasOwn(counts, key) ? counts[key]! : 0) + 1;
+  if (Object.hasOwn(counts, name)) {
+    counts[name]! += 1;
+    return;
+  }
+  const named = NAMED.get(counts) ?? 0;
+  if (named < MAX_NAMED) {
+    counts[name] = 1;
+    NAMED.set(counts, named + 1);
+    return;
+  }
+  counts[OTHER_NAMES] =
+    (Object.hasOwn(counts, OTHER_NAMES) ? counts[OTHER_NAMES]! : 0) + 1;
 }
 
 /** The document is not well-formed XML; rows before the error are kept. */
