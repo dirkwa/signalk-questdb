@@ -113,6 +113,15 @@ describe("GpxImports", () => {
     assert.equal(imports.latest()?.id, second.id);
   });
 
+  it("says whether an import holds the writer", () => {
+    const imports = new GpxImports();
+    assert.equal(imports.active, false);
+    const first = imports.start(() => session().s);
+    assert.equal(imports.active, true);
+    first.abort();
+    assert.equal(imports.active, false);
+  });
+
   it("abandons an import nobody has sent a slice to", () => {
     let now = 0;
     const imports = new GpxImports();

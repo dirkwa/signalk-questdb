@@ -200,6 +200,12 @@ export class GpxImports {
     return this.current?.status ?? null;
   }
 
+  /** An import holds the writer: receiving, or finishing what it received. */
+  get active(): boolean {
+    this.reapIdle();
+    return this.current?.active ?? false;
+  }
+
   /** The plugin is stopping: the writer the import uses is going away. */
   abortAll(): void {
     this.current?.abort("The plugin stopped");

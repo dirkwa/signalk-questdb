@@ -30,6 +30,7 @@ import {
   IMPORT_SOURCE,
   WriterGate,
   recordedIntervals,
+  waitForImportedRow,
 } from "./gpx-import.js";
 import {
   GpxImportConflict,
@@ -3057,12 +3058,6 @@ export default (app: App) => {
           importReply(res, 503, { error: "QuestDB writer not connected" });
           return;
         }
-        if (activeMigration && activeMigration.state === "running") {
-          importReply(res, 409, {
-            error: "An InfluxDB migration is running; import after it ends",
-          });
-          return;
-        }
         // ILP would auto-create a missing archive with the wrong designated
         // timestamp, and every read of it would come back empty.
         if (
@@ -3072,6 +3067,14 @@ export default (app: App) => {
         ) {
           importReply(res, 503, {
             error: `${ARCHIVE_TABLES.signalk_position} is missing; restart the plugin to create it`,
+          });
+          return;
+        }
+        // From here to gpxImports.start() nothing awaits, so a migration
+        // cannot start between this check and the import taking the writer.
+        if (activeMigration && activeMigration.state === "running") {
+          importReply(res, 409, {
+            error: "An InfluxDB migration is running; import after it ends",
           });
           return;
         }
@@ -3101,6 +3104,12 @@ export default (app: App) => {
                 ARCHIVE_TABLES.signalk_position,
                 120_000,
               );
+              // QuestDB commits ILP on its own schedule, so a batch the
+              // socket took may not be in the WAL yet; the last row written
+              // reading back is what says the import is stored.
+              const last = importer.lastWritten;
+              if (last !== null)
+                await waitForImportedRow(client, last, 120_000);
               await spans.refresh();
             });
           });
@@ -3162,6 +3171,12 @@ export default (app: App) => {
           res.status(409).json({
             error: "A migration is already running",
             run: migrationRunView(activeMigration),
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        if (gpxImports.active) {
+          res.status(409).json({
+            error: "A GPX import is running; migrate after it ends",
           } satisfies MigrationStatusResponse);
           return;
         }
@@ -3422,6 +3437,12 @@ export default (app: App) => {
         if (legacyCleanupRunning) {
           res.status(409).json({
             error: "The string table is being rebuilt; try again in a moment",
+          } satisfies MigrationStatusResponse);
+          return;
+        }
+        if (gpxImports.active) {
+          res.status(409).json({
+            error: "A GPX import is running; migrate after it ends",
           } satisfies MigrationStatusResponse);
           return;
         }

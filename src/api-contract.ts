@@ -12,7 +12,6 @@
 import type { UlimitClamp } from "signalk-container-helper";
 import type { MaxMapCountStatus } from "./host-limits.js";
 import type { SkipPlan, SuspendedTable } from "./wal-monitor.js";
-import type { GpxImportSummary } from "./gpx-import.js";
 
 /**
  * Every handler answers failures with `{ error }`, and the action endpoints
@@ -308,7 +307,29 @@ export interface MigrationStatusResponse extends ApiError {
   interrupted?: MigrationInterrupted;
 }
 
-export type { GpxImportSummary };
+/** What a GPX import has read and written so far. */
+export interface GpxImportSummary {
+  /** Bytes of the document parsed. */
+  bytes: number;
+  tracks: number;
+  /** Points per track name, of the tracks selected for import. */
+  importedTracks: Record<string, number>;
+  /** Points per track name, of the tracks left out. */
+  skippedTracks: Record<string, number>;
+  /** Track points read, in every track. */
+  points: number;
+  /** Rows written to the archive. */
+  imported: number;
+  /** Points that fell in an interval already written from the same segment. */
+  thinned: number;
+  /** Points where the vessel already had recorded positions. */
+  alreadyRecorded: number;
+  /** Points with a position or time GPX cannot express, or none at all. */
+  invalid: number;
+  /** First and last imported instant, ISO. */
+  from: string | null;
+  to: string | null;
+}
 
 /**
  * receiving: slices are accepted. finishing: the last slice is in and the

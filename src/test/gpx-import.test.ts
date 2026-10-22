@@ -9,6 +9,7 @@ import {
   gpxDateTime,
   gpxDecimal,
   recordedIntervals,
+  waitForImportedRow,
   type GpxImportOptions,
 } from "../gpx-import.js";
 
@@ -315,6 +316,30 @@ describe("GpxImport", () => {
     );
   });
 
+  it("knows the row it wrote last, even out of time order", async () => {
+    const importer = new GpxImport({
+      tracks: OWN,
+      resolutionSeconds: 10,
+      write: () => {},
+      backpressure: async () => {},
+    });
+    assert.equal(importer.lastWritten, null);
+    await importer.write(
+      encoder.encode(
+        gpx(
+          trk("Own Ship", [pt(1, 1, "2024-06-02T00:00:00Z")]),
+          trk("Own Ship", [pt(1, 1, "2024-06-01T00:00:00Z")]),
+        ),
+      ),
+    );
+    await importer.finish();
+    assert.equal(importer.summary.to, "2024-06-02T00:00:00.000Z");
+    assert.equal(
+      new Date(importer.lastWritten!).toISOString(),
+      "2024-06-01T00:00:00.000Z",
+    );
+  });
+
   it("stops writing once cancelled", async () => {
     const importer = new GpxImport({
       tracks: OWN,
@@ -408,5 +433,48 @@ describe("recordedIntervals", () => {
       /context = 'self' AND \(source IS NULL OR source != 'import\.gpx'\)/,
     );
     assert.match(sql, /SAMPLE BY 5m ALIGN TO CALENDAR$/);
+  });
+});
+
+describe("waitForImportedRow", () => {
+  it("polls until the row reads back", async () => {
+    const statements: string[] = [];
+    let found = 0;
+    await waitForImportedRow(
+      {
+        exec: async (sql: string) => {
+          statements.push(sql);
+          const n = found++ < 2 ? 0 : 1;
+          return { columns: [], dataset: [[n]], count: 1, timestamp: 0 };
+        },
+      },
+      Date.parse("2024-06-01T00:00:10Z"),
+      1000,
+      1,
+    );
+    assert.equal(statements.length, 3);
+    assert.match(
+      statements[0]!,
+      /FROM signalk_position_archive WHERE ts = '2024-06-01T00:00:10\.000Z' AND context = 'self' AND source = 'import\.gpx'/,
+    );
+  });
+
+  it("gives up at the deadline", async () => {
+    await assert.rejects(
+      waitForImportedRow(
+        {
+          exec: async () => ({
+            columns: [],
+            dataset: [[0]],
+            count: 1,
+            timestamp: 0,
+          }),
+        },
+        0,
+        20,
+        1,
+      ),
+      /not stored the last imported row/,
+    );
   });
 });

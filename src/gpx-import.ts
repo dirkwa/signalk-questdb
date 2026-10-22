@@ -18,7 +18,8 @@
 import { SaxesParser, type SaxesTagNS } from "saxes";
 import type { QueryClient } from "./query-client.js";
 import type { ILPWriter } from "./ilp-writer.js";
-import { readFrom, type ArchiveReader } from "./archive.js";
+import type { GpxImportSummary } from "./api-contract.js";
+import { ARCHIVE_TABLES, readFrom, type ArchiveReader } from "./archive.js";
 
 /** The sourceRef imported positions are stored under. */
 export const IMPORT_SOURCE = "import.gpx";
@@ -92,29 +93,6 @@ export function antimeridian(longitude: number): number {
   if (longitude < -180) return longitude + 360;
   if (longitude > 180) return longitude - 360;
   return longitude;
-}
-
-export interface GpxImportSummary {
-  /** Bytes of the document parsed. */
-  bytes: number;
-  tracks: number;
-  /** Points per track name, of the tracks selected for import. */
-  importedTracks: Record<string, number>;
-  /** Points per track name, of the tracks left out. */
-  skippedTracks: Record<string, number>;
-  /** Track points read, in every track. */
-  points: number;
-  /** Rows written to the archive. */
-  imported: number;
-  /** Points that fell in an interval already written from the same segment. */
-  thinned: number;
-  /** Points where the vessel already had recorded positions. */
-  alreadyRecorded: number;
-  /** Points with a position or time GPX cannot express, or none at all. */
-  invalid: number;
-  /** First and last imported instant, ISO. */
-  from: string | null;
-  to: string | null;
 }
 
 export interface GpxImportOptions {
@@ -202,6 +180,7 @@ export class GpxImport {
   private pending: Point[] = [];
 
   private lastSegment = -1;
+  private last: number | null = null;
   private lastBucket = Number.NaN;
   private readonly coverage = new Map<number, Promise<ReadonlySet<number>>>();
   private coveredDay = Number.NaN;
@@ -216,6 +195,14 @@ export class GpxImport {
     this.parser.on("error", (err) => {
       this.parseError ??= err;
     });
+  }
+
+  /**
+   * The instant of the row written last, or null before the first. Not
+   * `summary.to`: an export out of time order writes its latest row early.
+   */
+  get lastWritten(): number | null {
+    return this.last;
   }
 
   /** Stop writing: the slice in progress ends at its next point. */
@@ -389,6 +376,7 @@ export class GpxImport {
       this.lastBucket = bucket;
       const ms = resolution > 0 ? bucket * resolution : point.ms;
       this.options.write(ms, point.latitude, point.longitude);
+      this.last = ms;
       this.summary.imported++;
       const iso = new Date(ms).toISOString();
       if (this.summary.from === null || iso < this.summary.from) {
@@ -504,4 +492,34 @@ export function recordedIntervals(
       ),
     );
   };
+}
+
+/**
+ * Wait until the imported row stamped `ms` reads back from the archive.
+ * Readable means QuestDB committed and applied it, and with it every row the
+ * writer sent before.
+ */
+export async function waitForImportedRow(
+  queryClient: Pick<QueryClient, "exec">,
+  ms: number,
+  timeoutMs: number,
+  pollMs = 1000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = await queryClient.exec(
+      `SELECT count() FROM ${ARCHIVE_TABLES.signalk_position} ` +
+        `WHERE ts = '${new Date(ms).toISOString()}' AND context = 'self' ` +
+        `AND source = '${IMPORT_SOURCE}'`,
+    );
+    if (Number(result.dataset[0]?.[0] ?? 0) > 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(
+        "QuestDB has not stored the last imported row. Run the import " +
+          "again once QuestDB is healthy: rows already imported are not " +
+          "duplicated.",
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
 }
