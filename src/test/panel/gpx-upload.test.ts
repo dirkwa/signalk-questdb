@@ -10,6 +10,8 @@ function server(
   behaviour: {
     failPutOnce?: "network" | "stale";
     refuse?: number;
+    /** Answer this many PUTs "still writing the previous slice". */
+    busy?: number;
   } = {},
 ) {
   const calls: string[] = [];
@@ -57,6 +59,10 @@ function server(
       const offset = Number(
         new URL(url, "http://x").searchParams.get("offset"),
       );
+      if ((behaviour.busy ?? 0) > 0) {
+        behaviour.busy!--;
+        return reply(409, { error: "busy", import: status() });
+      }
       const bytes = (init!.body as ArrayBuffer).byteLength;
       if (!failed && behaviour.failPutOnce === "network") {
         failed = true;
@@ -133,6 +139,20 @@ describe("uploadGpx", () => {
         "PUT /plugins/signalk-questdb/api/gpx-import/imp-1?offset=3",
       ),
     );
+  });
+
+  it("waits while the server is still writing the previous slice", async () => {
+    const { fetchFake } = server({ busy: 2 });
+    assert.equal((await run(fetchFake).done).state, "finished");
+  });
+
+  it("gives up on a server that never takes the slice", async () => {
+    const { fetchFake } = server({ busy: 100 });
+    await assert.rejects(run(fetchFake).done, (err) => {
+      assert.ok(err instanceof GpxUploadError);
+      assert.equal(err.message, "busy");
+      return true;
+    });
   });
 
   it("reports why the server would not start", async () => {

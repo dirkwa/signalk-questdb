@@ -49,6 +49,31 @@ interface Group {
   samples: number[];
 }
 
+const ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+};
+
+/**
+ * XML's predefined and numeric character references, decoded. The server's
+ * parser decodes them, and a name selected here must match its spelling
+ * there or the track is skipped.
+ */
+function decodeEntities(value: string): string {
+  return value.replace(
+    /&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g,
+    (match, decimal?: string, hex?: string, named?: string) => {
+      if (named !== undefined) return ENTITIES[named]!;
+      const code =
+        decimal !== undefined ? Number(decimal) : Number.parseInt(hex!, 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+    },
+  );
+}
+
 /** Named like an AIS target in a TimeZero export: "AIS <name>", or the MMSI. */
 export function isOtherVesselName(name: string): boolean {
   return /^AIS\b/.test(name) || /^\d{9}$/.test(name);
@@ -129,6 +154,19 @@ export async function scanGpx(
   // Text matters only inside a track's <name> and a point's <time>; the
   // whitespace between the other tags is most of the file.
   let collecting = false;
+  // A track name's text in pieces: CDATA is literal and the rest is decoded,
+  // and a reference can be cut in two by a chunk boundary, so the pieces are
+  // joined by kind before decoding.
+  let nameParts: { value: string; cdata: boolean }[] = [];
+  const append = (value: string, cdata: boolean) => {
+    if (where !== Where.Name) {
+      text += value;
+      return;
+    }
+    const last = nameParts[nameParts.length - 1];
+    if (last && last.cdata === cdata) last.value += value;
+    else nameParts.push({ value, cdata });
+  };
   let current: Group | null = null;
   let trackName: string | null = null;
   // The open point's tag, kept as a place in the text: its coordinates are
@@ -207,11 +245,11 @@ export async function scanGpx(
     for (;;) {
       const lt = buffer.indexOf("<", i);
       if (lt < 0) {
-        if (collecting) text += buffer.slice(i);
+        if (collecting) append(buffer.slice(i), false);
         carry = "";
         return;
       }
-      if (collecting) text += buffer.slice(i, lt);
+      if (collecting) append(buffer.slice(i, lt), false);
       // Comments, CDATA and declarations end on their own markers.
       let close: string | null = null;
       const next = buffer.charCodeAt(lt + 1);
@@ -226,13 +264,20 @@ export async function scanGpx(
         return;
       }
       const stop = end + (close ? close.length : 1);
-      if (close === "]]>" && collecting) text += buffer.slice(lt + 9, end);
+      if (close === "]]>" && collecting) {
+        append(buffer.slice(lt + 9, end), true);
+      }
       i = stop;
       if (close) continue;
 
       if (next === 0x2f /* / */) {
         if (where === Where.Name && trackName === null) {
-          startTrack(text.trim());
+          startTrack(
+            nameParts
+              .map((p) => (p.cdata ? p.value : decodeEntities(p.value)))
+              .join("")
+              .trim(),
+          );
         } else if (where === Where.Time) {
           time = text;
         } else if (where === Where.Point) {
@@ -262,6 +307,7 @@ export async function scanGpx(
       }
       where = locate();
       text = "";
+      nameParts = [];
       collecting = where === Where.Name || where === Where.Time;
     }
   };

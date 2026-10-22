@@ -149,6 +149,23 @@ describe("scanGpx", () => {
     assert.equal(backup.selected, true);
   });
 
+  it("decodes references in names the way the server's parser does", async () => {
+    const doc = gpx(
+      trk("Tom &amp; Jerry &#8211; &#x2192;", [
+        pt(1, 2, "2024-01-01T00:00:00Z"),
+      ]),
+      trk("<![CDATA[a &amp; b]]>", [pt(1, 2, "2024-01-02T00:00:00Z")]),
+    );
+    for (const size of [5, 11, 1024]) {
+      const names = (await scan(doc, size)).map((g) => g.name).sort();
+      assert.deepEqual(
+        names,
+        ["Tom & Jerry – →", "a &amp; b"],
+        `chunks of ${size}`,
+      );
+    }
+  });
+
   it("counts points without a time but gives them no period", async () => {
     const [group] = await scan(gpx(trk("Own Ship", [pt(1, 2), pt(1, 2)])));
     assert.equal(group!.points, 2);

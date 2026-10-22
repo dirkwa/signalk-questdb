@@ -104,7 +104,18 @@ export async function uploadGpx(upload: GpxUpload): Promise<GpxImportStatus> {
     }
     const body = await read(res);
     if (res.status === 409 && body.import?.state === "receiving") {
-      // Out of step with the server: carry on from where it is.
+      // Out of step with the server: carry on from where it is. An offset
+      // that did not move means it is still writing the previous slice, so
+      // wait, and give up if it never moves.
+      if (body.import.received === offset) {
+        if (++failures > RETRIES) {
+          throw new GpxUploadError(
+            body.error ?? `The slice at byte ${offset} was refused`,
+            body.import,
+          );
+        }
+        await sleep(RETRY_DELAY_MS);
+      }
       status = body.import;
       continue;
     }

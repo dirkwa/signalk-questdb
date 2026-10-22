@@ -91,7 +91,10 @@ export function GpxImportSection({
   // AIS targets are most of the names in an export and never the vessel's;
   // they stay one line until asked for.
   const [showOthers, setShowOthers] = useState(false);
+  // The upload's, kept apart from the scan's: closing the section unmounts
+  // this component, which may stop a scan but must not abort an import.
   const abort = useRef<AbortController | null>(null);
+  const scanAbort = useRef<AbortController | null>(null);
 
   // The last import, so a panel opened afterwards still shows its result.
   useEffect(() => {
@@ -104,14 +107,32 @@ export function GpxImportSection({
       .catch(() => undefined);
     return () => {
       cancelled = true;
-      abort.current?.abort();
+      scanAbort.current?.abort();
     };
   }, []);
 
+  // An import this panel is not driving (started before the section was
+  // last closed, or in another tab) is followed from the server.
+  const following =
+    busy !== "importing" &&
+    (status?.state === "receiving" || status?.state === "finishing");
+  useEffect(() => {
+    if (!following) return;
+    const timer = setInterval(() => {
+      fetch(GPX_IMPORT_API)
+        .then((res) => res.json() as Promise<GpxImportResponse>)
+        .then((body) => {
+          if (body.import) setStatus(body.import);
+        })
+        .catch(() => undefined);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [following]);
+
   const scan = async (picked: File) => {
-    abort.current?.abort();
+    scanAbort.current?.abort();
     const controller = new AbortController();
-    abort.current = controller;
+    scanAbort.current = controller;
     setFile(picked);
     setGroups(null);
     setError(null);
@@ -126,7 +147,7 @@ export function GpxImportSection({
         setError(err instanceof Error ? err.message : String(err));
       }
     } finally {
-      if (abort.current === controller) abort.current = null;
+      if (scanAbort.current === controller) scanAbort.current = null;
       setBusy(null);
     }
   };
