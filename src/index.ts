@@ -1,5 +1,5 @@
 import type { history as HistoryApi } from "@signalk/server-api";
-import { IRouter } from "express";
+import { IRouter, type Response as ExpressResponse } from "express";
 import { waitForContainerManager } from "signalk-container-helper";
 import type {
   ContainerConfig,
@@ -22,7 +22,22 @@ import { unitsResolver } from "./history-units.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
 import { startRetention, type Retention } from "./retention.js";
-import { ARCHIVE_TABLES, ArchiveSpans } from "./archive.js";
+import { ARCHIVE_TABLES, ArchiveSpans, waitForApply } from "./archive.js";
+import {
+  GpxImport,
+  GpxImportCancelled,
+  GpxParseError,
+  IMPORT_SOURCE,
+  WriterGate,
+  recordedIntervals,
+} from "./gpx-import.js";
+import {
+  GpxImportConflict,
+  GpxImportSession,
+  GpxImports,
+  SliceTooLarge,
+  readSlice,
+} from "./gpx-import-session.js";
 import { RESTORE_SOURCE, restoreFromHistory } from "./restore.js";
 import { createConsoleProxy } from "./console-proxy.js";
 import { buildFullExportWhere } from "./full-export-range.js";
@@ -80,6 +95,7 @@ import {
 import { nofileClampSatisfied, readMaxMapCount } from "./host-limits.js";
 import type {
   DbStatus,
+  GpxImportResponse,
   LegacyImportRowsResponse,
   MigrationDetectResponse,
   MigrationBucketsResponse,
@@ -240,6 +256,10 @@ export default (app: App) => {
   let migrationCounter = 0;
   let queryClient: QueryClient | null = null;
   let retention: Retention | null = null;
+  // What the archive covers, for the history providers and the GPX import;
+  // null while the plugin is stopped.
+  let archiveSpans: ArchiveSpans | null = null;
+  const gpxImports = new GpxImports();
   let schemaHealTimer: NodeJS.Timeout | null = null;
   let currentConfig: Config | null = null;
   // True when the `signalk` table exists with the wrong (ILP-auto-created)
@@ -1072,6 +1092,7 @@ export default (app: App) => {
     // now, reads leave the archive out until the heal heartbeat below reads
     // it.
     const archive = new ArchiveSpans(queryClient);
+    archiveSpans = archive;
     try {
       await archive.refresh();
     } catch (err) {
@@ -1639,6 +1660,8 @@ export default (app: App) => {
         retention.stop();
         retention = null;
       }
+      gpxImports.abortAll();
+      archiveSpans = null;
 
       if (schemaHealTimer) {
         clearInterval(schemaHealTimer);
@@ -2622,6 +2645,8 @@ export default (app: App) => {
               retention.stop();
               retention = null;
             }
+            gpxImports.abortAll();
+            archiveSpans = null;
             if (writer) {
               try {
                 await writer.disconnect();
@@ -2953,6 +2978,180 @@ export default (app: App) => {
             contexts: [],
           } satisfies MigrationContextsResponse);
         }
+      });
+
+      // GPX import into the position archive (see gpx-import.ts). The file
+      // arrives as slices over several requests: POST announces it, each PUT
+      // carries the slice starting at `offset`, and POST …/finish ends it once
+      // every byte is in. Admin-only, like every route not registered through
+      // router.access(): an import writes history.
+      const importReply = (
+        res: ExpressResponse,
+        code: number,
+        body: GpxImportResponse,
+      ) => {
+        res.status(code).json(body);
+      };
+      const importFailure = (res: ExpressResponse, err: unknown) => {
+        if (err instanceof GpxImportConflict) {
+          importReply(res, 409, { error: err.message, import: err.status });
+        } else if (err instanceof SliceTooLarge) {
+          importReply(res, 413, { error: err.message });
+        } else if (err instanceof GpxParseError) {
+          importReply(res, 422, {
+            error: err.message,
+            import: gpxImports.latest(),
+          });
+        } else if (err instanceof GpxImportCancelled) {
+          importReply(res, 409, {
+            error: err.message,
+            import: gpxImports.latest(),
+          });
+        } else {
+          importReply(res, 500, {
+            error: err instanceof Error ? err.message : String(err),
+            import: gpxImports.latest(),
+          });
+        }
+      };
+
+      router.get("/api/gpx-import", (_req, res) => {
+        importReply(res, 200, { import: gpxImports.latest() });
+      });
+
+      router.post("/api/gpx-import", async (req, res) => {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const filename =
+          typeof body.filename === "string" ? body.filename.slice(0, 255) : "";
+        const size = body.size;
+        if (
+          typeof size !== "number" ||
+          !Number.isSafeInteger(size) ||
+          size <= 0
+        ) {
+          importReply(res, 400, {
+            error: "size must be the file's length in bytes",
+          });
+          return;
+        }
+        // Which tracks are the vessel's is the caller's call (see
+        // GpxImportOptions.tracks), so there is no default.
+        const tracks = body.tracks;
+        if (
+          !Array.isArray(tracks) ||
+          tracks.length === 0 ||
+          tracks.length > 1000 ||
+          !tracks.every((t) => typeof t === "string" && t.length <= 1024)
+        ) {
+          importReply(res, 400, {
+            error:
+              'tracks must list the names of the tracks to import ("" for one without a name)',
+          });
+          return;
+        }
+        const w = writer;
+        const client = queryClient;
+        const spans = archiveSpans;
+        const config = currentConfig;
+        if (!w || !client || !spans || !config) {
+          importReply(res, 503, { error: "QuestDB writer not connected" });
+          return;
+        }
+        if (activeMigration && activeMigration.state === "running") {
+          importReply(res, 409, {
+            error: "An InfluxDB migration is running; import after it ends",
+          });
+          return;
+        }
+        // ILP would auto-create a missing archive with the wrong designated
+        // timestamp, and every read of it would come back empty.
+        if (
+          (await client.designatedTimestamp(
+            ARCHIVE_TABLES.signalk_position,
+          )) !== "ts"
+        ) {
+          importReply(res, 503, {
+            error: `${ARCHIVE_TABLES.signalk_position} is missing; restart the plugin to create it`,
+          });
+          return;
+        }
+        try {
+          const session = gpxImports.start(() => {
+            const gate = new WriterGate(w);
+            const importer = new GpxImport({
+              tracks: new Set(tracks.map((t: string) => t.trim())),
+              resolutionSeconds: config.archiveResolutionSeconds,
+              write: (ms, latitude, longitude) =>
+                w.writePositionAtNanos(
+                  "self",
+                  { latitude, longitude },
+                  BigInt(ms) * 1_000_000n,
+                  IMPORT_SOURCE,
+                  ARCHIVE_TABLES.signalk_position,
+                ),
+              backpressure: () => gate.room(),
+              ...(body.fillGapsOnly === false
+                ? {}
+                : { recorded: recordedIntervals(client, spans) }),
+            });
+            return new GpxImportSession(filename, size, importer, async () => {
+              await gate.settled();
+              await waitForApply(
+                client,
+                ARCHIVE_TABLES.signalk_position,
+                120_000,
+              );
+              await spans.refresh();
+            });
+          });
+          importReply(res, 201, { import: session.status });
+        } catch (err) {
+          importFailure(res, err);
+        }
+      });
+
+      router.put("/api/gpx-import/:id", async (req, res) => {
+        const session = gpxImports.get(String(req.params.id));
+        if (!session) {
+          importReply(res, 404, { error: "No such import" });
+          return;
+        }
+        const offset = Number(req.query.offset);
+        if (!Number.isSafeInteger(offset) || offset < 0) {
+          importReply(res, 400, { error: "offset must be a byte offset" });
+          return;
+        }
+        try {
+          const slice = await readSlice(req);
+          importReply(res, 200, {
+            import: await session.append(offset, slice),
+          });
+        } catch (err) {
+          importFailure(res, err);
+        }
+      });
+
+      router.post("/api/gpx-import/:id/finish", async (req, res) => {
+        const session = gpxImports.get(String(req.params.id));
+        if (!session) {
+          importReply(res, 404, { error: "No such import" });
+          return;
+        }
+        try {
+          importReply(res, 200, { import: await session.finish() });
+        } catch (err) {
+          importFailure(res, err);
+        }
+      });
+
+      router.delete("/api/gpx-import/:id", (req, res) => {
+        const session = gpxImports.get(String(req.params.id));
+        if (!session) {
+          importReply(res, 404, { error: "No such import" });
+          return;
+        }
+        session.abort();
+        importReply(res, 200, { import: session.status });
       });
 
       router.post("/api/migration/start", async (req, res) => {

@@ -3,7 +3,7 @@ import {
   isSafeIdentifier,
   validateTimestamp,
 } from "./query-client.js";
-import { ARCHIVE_TABLES, type ArchivedTable } from "./archive.js";
+import { ARCHIVE_TABLES, waitForApply, type ArchivedTable } from "./archive.js";
 import type { PathMatcher } from "./path-matcher.js";
 
 const TABLES = ["signalk", "signalk_str", "signalk_position"] as const;
@@ -19,7 +19,6 @@ const PARTITION_NAME = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
 // busy install is millions of rows and runs on QuestDB's single worker.
 const COPY_TIMEOUT_MS = 120_000;
 const APPLY_TIMEOUT_MS = 120_000;
-const APPLY_POLL_MS = 1000;
 
 export interface RetentionOptions {
   retentionDays: number;
@@ -42,8 +41,6 @@ interface Partition {
   day: string;
   to: string;
 }
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Drop every daily partition that lies wholly before the retention cutoff,
@@ -103,36 +100,6 @@ export function startRetention(
     );
     const n = result.dataset[0]?.[0];
     return typeof n === "number" ? n : 0;
-  }
-
-  /** Wait until QuestDB has applied `table`'s WAL up to `txn`. */
-  async function applied(table: string, txn: number): Promise<void> {
-    const deadline = Date.now() + APPLY_TIMEOUT_MS;
-    for (;;) {
-      const result = await queryClient.exec(
-        `SELECT suspended, writerTxn FROM wal_tables() WHERE name = '${table}'`,
-      );
-      const [suspended, writerTxn] = result.dataset[0] ?? [];
-      if (suspended === true) {
-        throw new Error(`${table} is suspended, so the copy cannot be applied`);
-      }
-      if (typeof writerTxn === "number" && writerTxn >= txn) return;
-      if (Date.now() > deadline) {
-        throw new Error(`${table} did not apply the copy within the timeout`);
-      }
-      await sleep(APPLY_POLL_MS);
-    }
-  }
-
-  async function sequencerTxn(table: string): Promise<number> {
-    const result = await queryClient.exec(
-      `SELECT sequencerTxn FROM wal_tables() WHERE name = '${table}'`,
-    );
-    const txn = result.dataset[0]?.[0];
-    if (typeof txn !== "number") {
-      throw new Error(`${table} is not a WAL table`);
-    }
-    return txn;
   }
 
   /** The own-vessel rows of `partition` that the options keep, or null. */
@@ -203,7 +170,7 @@ export function startRetention(
       `INSERT INTO ${target} ${thinnedSelect(table, where)}`,
       COPY_TIMEOUT_MS,
     );
-    await applied(target, await sequencerTxn(target));
+    await waitForApply(queryClient, target, APPLY_TIMEOUT_MS);
     if ((await count(target, where)) === 0) {
       throw new Error(`the copy of ${table} ${partition.name} is missing`);
     }

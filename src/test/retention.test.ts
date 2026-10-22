@@ -40,9 +40,8 @@ function scripted(script: Script) {
       if (sql.startsWith("SELECT count()")) {
         return answer([[script.count ? script.count(sql) : 10]]);
       }
-      if (sql.startsWith("SELECT sequencerTxn")) return answer([[7]]);
       if (sql.startsWith("SELECT suspended")) {
-        return answer([[script.suspended === true, 7]]);
+        return answer([[script.suspended === true, 7, 7]]);
       }
       return answer([]);
     },
@@ -107,7 +106,7 @@ describe("retention", () => {
     const copy = index(statements, /^INSERT INTO signalk_position_archive /);
     const applied = index(
       statements,
-      /^SELECT suspended, writerTxn FROM wal_tables\(\) WHERE name = 'signalk_position_archive'/,
+      /^SELECT suspended, writerTxn, sequencerTxn FROM wal_tables\(\) WHERE name = 'signalk_position_archive'/,
     );
     const drop = index(
       statements,

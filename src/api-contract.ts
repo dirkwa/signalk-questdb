@@ -12,6 +12,7 @@
 import type { UlimitClamp } from "signalk-container-helper";
 import type { MaxMapCountStatus } from "./host-limits.js";
 import type { SkipPlan, SuspendedTable } from "./wal-monitor.js";
+import type { GpxImportSummary } from "./gpx-import.js";
 
 /**
  * Every handler answers failures with `{ error }`, and the action endpoints
@@ -305,4 +306,33 @@ export interface MigrationStatusResponse extends ApiError {
   };
   /** Present, when no run is active, if a stopped import can be continued. */
   interrupted?: MigrationInterrupted;
+}
+
+export type { GpxImportSummary };
+
+/**
+ * receiving: slices are accepted. finishing: the last slice is in and the
+ * import waits for QuestDB to apply it. The other three are final.
+ */
+export type GpxImportState =
+  "receiving" | "finishing" | "finished" | "failed" | "aborted";
+
+/** One GPX import, as /api/gpx-import reports it. */
+export interface GpxImportStatus {
+  id: string;
+  filename: string;
+  /** Size of the file the client announced, in bytes. */
+  size: number;
+  /** Bytes accepted so far: where the next slice must start. */
+  received: number;
+  state: GpxImportState;
+  summary: GpxImportSummary;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
+/** Every /api/gpx-import endpoint answers with the import it acted on. */
+export interface GpxImportResponse extends ApiError {
+  import?: GpxImportStatus | null;
 }

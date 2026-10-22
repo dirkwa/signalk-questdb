@@ -572,6 +572,36 @@ recorded during the rebuild are carried across. Should recording be fast enough
 to fill the writer's buffer during those seconds, the samples it could not keep
 are counted and the panel says how many. Run the import again afterwards.
 
+## Importing a GPX track
+
+A chartplotter's exported track goes into the position archive (see Retention
+and the archive), where retention never drops it, under the source
+`import.gpx`. An export can be gigabytes, a four-year TimeZero export is
+1.5 GB, so the file is sent in slices and parsed as it arrives. Memory stays at
+one slice, whatever the file's size.
+
+- **Which tracks.** An export mixes the own track with AIS targets and with
+  passages imported into the plotter from elsewhere, and GPX does not say whose
+  a track is. The import takes the names of the tracks to import (`tracks`);
+  every other track is skipped and listed in the summary. In a TimeZero export
+  the own track is named `Own Ship`, or the plotter's translation of it, such
+  as `Eigenes Schiff`.
+- **Thinning.** Points are thinned to the **Archive resolution**: each is
+  stamped on the start of its interval, and the archive keeps one row per
+  interval. 11.5 million points over four years become 3.2 million rows,
+  about 100 MB, at 10 s.
+- **Overlap.** With `fillGapsOnly` (the default), a point is left out where the
+  vessel already has recorded positions in the same five minutes. Two
+  receivers' fixes interleaved in one series draw a sawtooth.
+- **Doing it again.** Importing the same file again changes nothing, and a
+  stopped import can simply be restarted: the archive's dedup keys absorb the
+  rows already written.
+- **Strict reading.** Coordinates must be decimals within range and times
+  `xsd:dateTime`; anything else is counted as invalid. A longitude written just
+  past ±180, as TimeZero does at the antimeridian, is wrapped. A file that is
+  not well-formed XML stops the import at the error, keeping the rows before
+  it.
+
 ## Export and backup
 
 **Data Export** in the panel, and
@@ -625,6 +655,11 @@ default.
 | GET    | `/export?from=...&to=...&format=parquet` | Parquet or CSV export of the `signalk` numeric table (date range required)                |
 | GET    | `/full-export/tables`                    | List the tables the full-export route serves                                              |
 | GET    | `/full-export/:table?from=...&to=...`    | Stream a table as Parquet; optional half-open `[from, to)` window for slicing into shards |
+| GET    | `/gpx-import`                            | The current or last GPX import                                                            |
+| POST   | `/gpx-import`                            | Announce an import: `{filename, size, tracks, fillGapsOnly}`, see Importing a GPX track   |
+| PUT    | `/gpx-import/:id?offset=N`               | One slice of the file, as `application/octet-stream`, at most 8 MiB                       |
+| POST   | `/gpx-import/:id/finish`                 | End the import once every byte is in; answers when QuestDB has applied it                 |
+| DELETE | `/gpx-import/:id`                        | Abort the import; what it wrote stays                                                     |
 
 ## Deployment
 

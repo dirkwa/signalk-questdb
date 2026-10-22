@@ -362,15 +362,18 @@ export class ILPWriter {
     );
   }
 
+  // `table` is the position archive for a GPX import, which writes past
+  // retention rather than into the live table it would then drop.
   writePositionAtNanos(
     context: string,
     position: { latitude: number; longitude: number },
     tsNanos: bigint,
     source?: string,
+    table: "signalk_position" | "signalk_position_archive" = "signalk_position",
   ): void {
     const sourceTag = source ? `,source=${escapeTag(source)}` : "";
     this.enqueue(
-      `signalk_position,context=${escapeTag(context)}${sourceTag} lat=${position.latitude},lon=${position.longitude} ${tsNanos}\n`,
+      `${table},context=${escapeTag(context)}${sourceTag} lat=${position.latitude},lon=${position.longitude} ${tsNanos}\n`,
       tsNanos,
     );
   }
