@@ -29,6 +29,7 @@ import {
   VersionSelect,
 } from "signalk-container-helper/ui";
 import { S } from "./styles.js";
+import { GpxImportSection } from "./GpxImportSection.js";
 import {
   formatDateTime,
   toLegacyImportRows,
@@ -1911,6 +1912,12 @@ export default function PluginConfigurationPanel({
             <span style={S.hint}>1 (fast) to 22 (smallest)</span>
           </div>
         )}
+      </CollapsibleSection>
+
+      <CollapsibleSection title="GPX track import">
+        <GpxImportSection
+          archiveResolutionSeconds={cfg.archiveResolutionSeconds ?? 10}
+        />
       </CollapsibleSection>
 
       <CollapsibleSection title="InfluxDB Migration">
