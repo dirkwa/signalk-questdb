@@ -51,10 +51,12 @@ reviews:
 
         1. **Plugin runtime** (`src/`, TypeScript, compiled to `dist/`).
            Loaded by signalk-server as `main` (`dist/index.js`).
-        2. **React config panel** (`src/configpanel/`, plain JS — NOT
-           TypeScript). Bundled by webpack via Module Federation into
+        2. **React config panel** (`src/configpanel/`, TypeScript + JSX).
+           Bundled by Vite via Module Federation into
            `public/remoteEntry.js`. React 19 is a shared singleton with
-           the host Admin UI.
+           the host Admin UI. Imports leaving `src/configpanel/` must be
+           `import type`: a value import pulls server-side runtime code
+           (typebox, `fs/promises`, saxes) into the browser bundle.
 
         Both build outputs ship in the npm package; `prepublishOnly`
         rebuilds them.
@@ -95,17 +97,17 @@ reviews:
 
         ## Config schema is the source of truth
 
-        `src/config/schema.ts` uses TypeBox (`@sinclair/typebox`). The
+        `src/config/schema.ts` uses TypeBox (the unscoped `typebox` 1.x). The
         schema is BOTH the JSON Schema rendered by the Signal K Admin UI
         AND the source of the `Config` TypeScript type via `Static<...>`.
         Add new options there only.
 
-        - The plain-JS configpanel cannot `import` from `schema.ts`
-          (webpack only resolves `.js`/`.jsx`, no TS loader). The panel
-          owns its own UI state defaults that must be kept in sync with
-          the schema defaults. Flag any divergence between the schema's
-          `default:` value and the corresponding `useState(cfg.X ??
-          <literal>)` in `PluginConfigurationPanel.js`.
+        - The configpanel imports `Config` from `schema.ts` as a type
+          only, so it cannot read the schema's defaults. The panel owns
+          its own UI state defaults that must be kept in sync with the
+          schema defaults. Flag any divergence between the schema's
+          `default:` value and the fallback the corresponding `useState`
+          in `PluginConfigurationPanel.tsx` gives a missing `cfg.X`.
         - For runtime fallbacks (e.g. `config.foo ?? 1000` in
           `src/index.ts`), use the same literal as the schema default for
           the same reason: schema is canonical, fallback is a backstop
@@ -132,8 +134,8 @@ reviews:
         - `tsconfig.json` runs strict mode. Do not loosen `strict`,
           `noImplicitAny`, `noUnusedLocals`, `noUnusedParameters`. Code
           must narrow `unknown` and avoid `any`.
-        - The configpanel is plain JS (Babel + `@babel/preset-react`).
-          Don't suggest migrating it to TSX inside an unrelated PR.
+        - The configpanel is TypeScript too, with its own `tsconfig.json`
+          (browser libs, `noEmit`), checked by `npm run typecheck:panel`.
         - Node `>= 22` per `engines` (uses Node's built-in test runner).
 
         ## Tests
@@ -205,9 +207,11 @@ reviews:
           — loose coupling is required.
         - `signalk.requires: ['signalk-container']` without a matching
           npm dependency — see "Container integration" above.
-        - The configpanel being plain JS instead of TS — webpack/babel
-          setup is intentional, migration is out of scope for feature
-          PRs.
+        - Classic JSX in the configpanel (`jsxRuntime: "classic"` in
+          `vite.config.ts`, `"jsx": "react"` in its tsconfig). The
+          automatic runtime imports `react/jsx-runtime`, which is not in
+          the federation share scope, and a second React instance fails
+          to mount the panel.
         - The single-worker QuestDB env vars
           (`QDB_SHARED_WORKER_COUNT=1`, etc.) in `src/index.ts` — tuned
           for Pi/Cerbo, do not "fix" by raising.

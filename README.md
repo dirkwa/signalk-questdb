@@ -20,6 +20,12 @@ InfluxDB history can be imported.
 - **Recording controls** — per-path sampling rates, include/exclude filters with
   globs, own vessel and AIS targets separately, retention by days, LZ4/ZSTD
   on-disk compression
+- **Archive past retention** — retention drops old days, but the own track, and
+  any own-vessel paths you name such as depth, are kept, thinned, in an archive
+  the History API reads seamlessly
+- **GPX track import** — a chartplotter's track export of any size goes into
+  the archive; the file is read in the browser first, so you pick the own
+  vessel's tracks before anything is uploaded
 - **Startup restore** — AIS targets back on the chart right after a server
   restart, in their ship-type colour
 - **WAL watchdog** — a table QuestDB has silently stopped applying is detected,
@@ -137,6 +143,10 @@ Three tables, all with WAL mode, daily partitioning, and deduplication:
 | `signalk`          | Numeric values | `ts`, `path` (SYMBOL), `context` (SYMBOL), `source` (SYMBOL), `value` (DOUBLE)                             |
 | `signalk_str`      | String values  | `ts`, `path` (SYMBOL), `context` (SYMBOL), `source` (SYMBOL), `value_str` (VARCHAR), `value_kind` (SYMBOL) |
 | `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `source` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)                                |
+
+What retention keeps of the own vessel lives in two more tables,
+`signalk_archive` and `signalk_position_archive`, with the same columns and
+monthly partitions (see Retention and the archive).
 
 The own vessel is stored as context `self`, whatever its identity; other vessels
 keep their `vessels.urn:…` context. The history API translates `self` back to
@@ -604,6 +614,11 @@ the same time, since that was another vessel. Nothing is uploaded until
 - **Doing it again.** Importing the same file again changes nothing, and a
   stopped import can simply be restarted: the archive's dedup keys absorb the
   rows already written.
+- **Positions only.** The import takes a position and a time from each point;
+  depth, temperature or speed in a point's extensions are not imported. Depth
+  along the track beyond retention comes from live recording: list
+  `environment.depth.*` under **Archived own-vessel paths**, and retention keeps
+  it from then on.
 - **Strict reading.** Coordinates must be decimals within range and times
   `xsd:dateTime`; anything else is counted as invalid. A longitude written just
   past ±180, as TimeZero does at the antimeridian, is wrapped. A file that is
@@ -621,7 +636,10 @@ CSV.
 `GET /plugins/signalk-questdb/api/full-export/:table?from=…&to=…` streams one
 whole table as Parquet, for snapshot and backup tooling that wants the full
 content sliced into dedup-friendly shards (kopia, for instance). Tables:
-`signalk`, `signalk_str`, `signalk_position` (`/full-export/tables` lists them).
+`signalk`, `signalk_str`, `signalk_position`, `signalk_archive`, `signalk_position_archive`
+(`/full-export/tables` lists them). The archive tables hold the own vessel's
+history beyond retention and every imported track, so a backup that is meant to
+outlive retention needs them too.
 
 - `from` and `to` are optional but must be set together: omit both for the whole
   table, or pass both as ISO 8601 timestamps for a half-open `[from, to)` window
@@ -757,7 +775,8 @@ and no client-visible error is raised anywhere. Left alone, recording stalls
 silently for as long as nobody looks.
 
 The plugin watches for this. A suspended table of its own (in external mode,
-only the three tables above — never someone else's) is logged loudly, raised as
+only the three tables above and the two archive tables — never someone else's)
+is logged loudly, raised as
 the Signal K notification `notifications.signalk-questdb.walSuspended`, and
 shown on the status card as **WAL suspended**. Two causes need two remedies:
 
