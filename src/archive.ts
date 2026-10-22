@@ -99,3 +99,38 @@ export class ArchiveSpans implements ArchiveReader {
     return Date.parse(from) <= span[1] && Date.parse(to) >= span[0];
   }
 }
+
+/**
+ * Wait until QuestDB has applied everything committed to `table`'s WAL when
+ * this was called. A row is readable only once applied, and a suspended
+ * table never gets there, so that fails at once rather than at the deadline.
+ */
+export async function waitForApply(
+  queryClient: Pick<QueryClient, "exec">,
+  table: string,
+  timeoutMs: number,
+  pollMs = 1000,
+): Promise<void> {
+  const state = async () => {
+    const result = await queryClient.exec(
+      `SELECT suspended, writerTxn, sequencerTxn FROM wal_tables() WHERE name = '${table}'`,
+    );
+    const [suspended, writerTxn, sequencerTxn] = result.dataset[0] ?? [];
+    if (typeof writerTxn !== "number" || typeof sequencerTxn !== "number") {
+      throw new Error(`${table} is not a WAL table`);
+    }
+    if (suspended === true) {
+      throw new Error(`${table} is suspended, so the rows cannot be applied`);
+    }
+    return { writerTxn, sequencerTxn };
+  };
+  const target = (await state()).sequencerTxn;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if ((await state()).writerTxn >= target) return;
+    if (Date.now() > deadline) {
+      throw new Error(`${table} did not apply the rows within the timeout`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}

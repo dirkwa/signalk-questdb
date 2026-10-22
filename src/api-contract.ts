@@ -306,3 +306,54 @@ export interface MigrationStatusResponse extends ApiError {
   /** Present, when no run is active, if a stopped import can be continued. */
   interrupted?: MigrationInterrupted;
 }
+
+/** What a GPX import has read and written so far. */
+export interface GpxImportSummary {
+  /** Bytes of the document parsed. */
+  bytes: number;
+  tracks: number;
+  /** Points per track name, of the tracks selected for import. */
+  importedTracks: Record<string, number>;
+  /** Points per track name, of the tracks left out. */
+  skippedTracks: Record<string, number>;
+  /** Track points read, in every track. */
+  points: number;
+  /** Rows written to the archive. */
+  imported: number;
+  /** Points that fell in an interval already written from the same segment. */
+  thinned: number;
+  /** Points where the vessel already had recorded positions. */
+  alreadyRecorded: number;
+  /** Points with a position or time GPX cannot express, or none at all. */
+  invalid: number;
+  /** First and last imported instant, ISO. */
+  from: string | null;
+  to: string | null;
+}
+
+/**
+ * receiving: slices are accepted. finishing: the last slice is in and the
+ * import waits for QuestDB to apply it. The other three are final.
+ */
+export type GpxImportState =
+  "receiving" | "finishing" | "finished" | "failed" | "aborted";
+
+/** One GPX import, as /api/gpx-import reports it. */
+export interface GpxImportStatus {
+  id: string;
+  filename: string;
+  /** Size of the file the client announced, in bytes. */
+  size: number;
+  /** Bytes accepted so far: where the next slice must start. */
+  received: number;
+  state: GpxImportState;
+  summary: GpxImportSummary;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
+/** Every /api/gpx-import endpoint answers with the import it acted on. */
+export interface GpxImportResponse extends ApiError {
+  import?: GpxImportStatus | null;
+}
