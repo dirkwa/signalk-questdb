@@ -106,8 +106,8 @@ reviews:
           only, so it cannot read the schema's defaults. The panel owns
           its own UI state defaults that must be kept in sync with the
           schema defaults. Flag any divergence between the schema's
-          `default:` value and the corresponding `useState(cfg.X ??
-          <literal>)` in `PluginConfigurationPanel.tsx`.
+          `default:` value and the fallback the corresponding `useState`
+          in `PluginConfigurationPanel.tsx` gives a missing `cfg.X`.
         - For runtime fallbacks (e.g. `config.foo ?? 1000` in
           `src/index.ts`), use the same literal as the schema default for
           the same reason: schema is canonical, fallback is a backstop

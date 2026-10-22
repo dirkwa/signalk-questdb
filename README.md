@@ -614,10 +614,9 @@ the same time, since that was another vessel. Nothing is uploaded until
 - **Doing it again.** Importing the same file again changes nothing, and a
   stopped import can simply be restarted: the archive's dedup keys absorb the
   rows already written.
-- **Positions only.** The import reads a position and a time from each point,
-  and a TimeZero export carries nothing else per point anyway: no depth,
-  temperature or speed. Depth along
-  the track beyond retention comes from live recording: list
+- **Positions only.** The import takes a position and a time from each point;
+  depth, temperature or speed in a point's extensions are not imported. Depth
+  along the track beyond retention comes from live recording: list
   `environment.depth.*` under **Archived own-vessel paths**, and retention keeps
   it from then on.
 - **Strict reading.** Coordinates must be decimals within range and times
