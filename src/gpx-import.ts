@@ -165,8 +165,10 @@ export class GpxImport {
   readonly summary: GpxImportSummary = {
     bytes: 0,
     tracks: 0,
-    importedTracks: {},
-    skippedTracks: {},
+    // Without a prototype: a track name is the file's to choose, and one
+    // named "__proto__" must be a key like any other, not the setter.
+    importedTracks: Object.create(null) as Record<string, number>,
+    skippedTracks: Object.create(null) as Record<string, number>,
     points: 0,
     imported: 0,
     thinned: 0,

@@ -126,7 +126,7 @@ describe("GpxImport", () => {
     const sliced = await run(doc, {}, 7);
     assert.deepEqual(sliced.rows, whole.rows);
     assert.deepEqual(sliced.summary, whole.summary);
-    assert.deepEqual(sliced.summary.skippedTracks, { "AIS ÖRESUND": 1 });
+    assert.deepEqual({ ...sliced.summary.skippedTracks }, { "AIS ÖRESUND": 1 });
   });
 
   it("imports only the selected tracks and tallies every name", async () => {
@@ -146,11 +146,17 @@ describe("GpxImport", () => {
       [3, 4],
     );
     assert.equal(summary.tracks, 4);
-    assert.deepEqual(summary.skippedTracks, {
-      "AIS SALLY": 2,
-      "Savusavu _ Nabuwalou": 1,
-    });
-    assert.deepEqual(summary.importedTracks, { "Eigenes Schiff": 1, "": 1 });
+    assert.deepEqual(
+      { ...summary.skippedTracks },
+      {
+        "AIS SALLY": 2,
+        "Savusavu _ Nabuwalou": 1,
+      },
+    );
+    assert.deepEqual(
+      { ...summary.importedTracks },
+      { "Eigenes Schiff": 1, "": 1 },
+    );
   });
 
   it("counts tracks named like Object's own properties as names", async () => {
@@ -159,9 +165,14 @@ describe("GpxImport", () => {
         trk("constructor", [pt(1, 1, "2024-06-01T00:00:00Z")]),
         trk("toString", [pt(1, 1, "2024-06-01T00:00:00Z")]),
         trk("toString", [pt(1, 1, "2024-06-01T00:01:00Z")]),
+        trk("__proto__", [pt(1, 1, "2024-06-01T00:02:00Z")]),
       ),
     );
-    assert.deepEqual(summary.skippedTracks, { constructor: 1, toString: 2 });
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(summary.skippedTracks)),
+      JSON.parse('{"constructor":1,"toString":2,"__proto__":1}'),
+    );
+    assert.equal(Object.keys(summary.skippedTracks).length, 3);
   });
 
   it("names at most 100 tracks and counts the rest together", async () => {
