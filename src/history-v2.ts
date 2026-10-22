@@ -18,6 +18,12 @@ import {
   isMissingSourceColumn,
   isMissingTable,
 } from "./schema-errors.js";
+import {
+  ARCHIVE_TABLES,
+  NO_ARCHIVE,
+  readFrom,
+  type ArchiveReader,
+} from "./archive.js";
 
 /**
  * The server's PathSpec — `sourceRef` (signalk-server #2737) restricts the
@@ -437,6 +443,9 @@ export function createHistoryProviderV2(
   // holdThroughEmptyBuckets). 0 leaves empty buckets null, as FILL(NULL)
   // makes them.
   holdMs = 0,
+  // Where retention kept the own vessel's older rows. A read includes it only
+  // for a range it covers.
+  archive: ArchiveReader = NO_ARCHIVE,
 ): HistoryApi.HistoryProvider {
   /**
    * The range's context predicate over the `holdMs` just before it — where
@@ -448,10 +457,20 @@ export function createHistoryProviderV2(
     return `ts >= '${since}' AND ts < '${from}' AND context = '${safeContext}'`;
   }
 
+  /** What the numeric seed is read from: the window `seedRangeWhere` names. */
+  function seedSource(range: ResolvedRange): string {
+    const from = validateTimestamp(range.from);
+    const since = new Date(Date.parse(from) - holdMs).toISOString();
+    return readFrom("signalk", archive.covers("signalk", since, from));
+  }
+
   /** The numeric table's last `[value, ts]` before the range, or null. */
-  async function numericSeed(seedWhere: string): Promise<unknown[] | null> {
+  async function numericSeed(
+    seedWhere: string,
+    source: string,
+  ): Promise<unknown[] | null> {
     const result = await queryClient.exec(
-      `SELECT value, ts FROM signalk WHERE ${seedWhere} LIMIT -1`,
+      `SELECT value, ts FROM ${source} WHERE ${seedWhere} LIMIT -1`,
     );
     return result.dataset[0] ?? null;
   }
@@ -466,12 +485,13 @@ export function createHistoryProviderV2(
   async function holdNumericBuckets(
     dataset: unknown[][],
     seedWhere: string,
+    seedFrom: string,
   ): Promise<unknown[][]> {
     if (holdMs <= 0 || dataset.length === 0) return dataset;
     const width = dataset[0].length;
     let seed: unknown[] | null = null;
     if (dataset[0][width - 1] === null) {
-      const found = await numericSeed(seedWhere);
+      const found = await numericSeed(seedWhere, seedFrom);
       // Shaped like a bucket row: the value in every value column, the
       // sample's time last.
       if (found) {
@@ -515,13 +535,22 @@ export function createHistoryProviderV2(
   ): Promise<(string | null)[]> {
     const safePath = validateIdentifier(path);
     const rangeWhere = buildRangeWhere(range, safeContext);
-    const tables =
-      path === "navigation.position"
-        ? [`SELECT DISTINCT source FROM signalk_position WHERE ${rangeWhere}`]
-        : [
-            `SELECT DISTINCT source FROM signalk WHERE ${rangeWhere} AND path = '${safePath}'`,
-            `SELECT DISTINCT source FROM signalk_str WHERE ${rangeWhere} AND path = '${safePath}'`,
-          ];
+    const position = path === "navigation.position";
+    const table = position ? "signalk_position" : "signalk";
+    const pathWhere = position ? "" : ` AND path = '${safePath}'`;
+    const tables = [
+      `SELECT DISTINCT source FROM ${table} WHERE ${rangeWhere}${pathWhere}`,
+    ];
+    if (archive.covers(table, range.from, range.to)) {
+      tables.push(
+        `SELECT DISTINCT source FROM ${ARCHIVE_TABLES[table]} WHERE ${rangeWhere}${pathWhere}`,
+      );
+    }
+    if (!position) {
+      tables.push(
+        `SELECT DISTINCT source FROM signalk_str WHERE ${rangeWhere}${pathWhere}`,
+      );
+    }
 
     const found = new Set<string | null>();
     for (const sql of tables) {
@@ -843,7 +872,8 @@ export function createHistoryProviderV2(
 
       const sourceWhere = buildSourceWhere(spec);
       const isPosition = spec.path === "navigation.position";
-      const table = isPosition ? "signalk_position" : "signalk";
+      const base = isPosition ? "signalk_position" : "signalk";
+      const table = readFrom(base, archive.covers(base, range.from, range.to));
 
       if (isPosition) {
         const where = buildRangeWhere(range, safeContext) + sourceWhere;
@@ -879,6 +909,7 @@ export function createHistoryProviderV2(
 
       const where = `${buildRangeWhere(range, safeContext)} AND path = '${safePath}'${sourceWhere}`;
       const seedWhere = `${seedRangeWhere(range, safeContext)} AND path = '${safePath}'${sourceWhere}`;
+      const seedFrom = seedSource(range);
 
       if (isMovingAverage(spec.aggregate)) {
         // The window runs over the series at the requested resolution — one
@@ -900,7 +931,7 @@ export function createHistoryProviderV2(
         // Held before averaging: an unchanged value is still a sample of
         // the window, not a hole in it.
         const dataset = sampled
-          ? await holdNumericBuckets(result.dataset, seedWhere)
+          ? await holdNumericBuckets(result.dataset, seedWhere, seedFrom)
           : result.dataset;
         // An angular series keeps one convention throughout: [0, 2π) unless
         // a sample (or a bucket's lowest sample) was negative.
@@ -960,7 +991,7 @@ export function createHistoryProviderV2(
 
       const result = await queryClient.exec(sql);
       const dataset = sampled
-        ? await holdNumericBuckets(result.dataset, seedWhere)
+        ? await holdNumericBuckets(result.dataset, seedWhere, seedFrom)
         : result.dataset;
       const rows: [string, unknown][] = dataset.map((row) => [
         row[0] as string,
@@ -1051,13 +1082,23 @@ export function createHistoryProviderV2(
     // this branch getValues happily serves the track while getPaths never
     // advertised it, so a client enumerating paths could not discover the one
     // series it most likely wants.
+    const branches = [
+      `SELECT DISTINCT path FROM signalk WHERE ${where}`,
+      `SELECT DISTINCT path FROM signalk_str WHERE ${where}`,
+      `SELECT DISTINCT 'navigation.position' path FROM signalk_position WHERE ${where}`,
+    ];
+    if (archive.covers("signalk", range.from, range.to)) {
+      branches.push(
+        `SELECT DISTINCT path FROM ${ARCHIVE_TABLES.signalk} WHERE ${where}`,
+      );
+    }
+    if (archive.covers("signalk_position", range.from, range.to)) {
+      branches.push(
+        `SELECT DISTINCT 'navigation.position' path FROM ${ARCHIVE_TABLES.signalk_position} WHERE ${where}`,
+      );
+    }
     const result = await queryClient.exec(
-      `SELECT DISTINCT path FROM signalk WHERE ${where}
-       UNION
-       SELECT DISTINCT path FROM signalk_str WHERE ${where}
-       UNION
-       SELECT DISTINCT 'navigation.position' path FROM signalk_position WHERE ${where}
-       ORDER BY path`,
+      `${branches.join("\n       UNION\n       ")}\n       ORDER BY path`,
     );
 
     return result.dataset.map((row) => row[0] as Path);
@@ -1082,13 +1123,19 @@ export function createHistoryProviderV2(
     // LATEST ON answers in tens of milliseconds. Applied per table and
     // unioned, as in history-v1's snapshot, so each table can stop early.
     const latest = ` LATEST ON ts PARTITION BY context`;
+    const tables: string[] = ["signalk", "signalk_str", "signalk_position"];
+    if (archive.covers("signalk", range.from, range.to)) {
+      tables.push(ARCHIVE_TABLES.signalk);
+    }
+    if (archive.covers("signalk_position", range.from, range.to)) {
+      tables.push(ARCHIVE_TABLES.signalk_position);
+    }
     const result = await queryClient.exec(
-      `(SELECT context FROM signalk WHERE ${where}${latest})
-       UNION
-       (SELECT context FROM signalk_str WHERE ${where}${latest})
-       UNION
-       (SELECT context FROM signalk_position WHERE ${where}${latest})
-       ORDER BY context`,
+      `${tables
+        .map(
+          (table) => `(SELECT context FROM ${table} WHERE ${where}${latest})`,
+        )
+        .join("\n       UNION\n       ")}\n       ORDER BY context`,
     );
 
     // Translate stored "self" back to the spec-canonical "vessels.self"

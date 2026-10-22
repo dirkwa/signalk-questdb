@@ -1,5 +1,6 @@
 import { QueryClient, validateTimestamp } from "./query-client.js";
 import { isMissingKindColumn, isMissingSourceColumn } from "./schema-errors.js";
+import { ARCHIVE_TABLES, NO_ARCHIVE, type ArchiveReader } from "./archive.js";
 
 interface HistoryOptions {
   startTime: Date;
@@ -35,11 +36,16 @@ function sourceCol(withSource: boolean): string {
   return withSource ? `CAST(source AS STRING)` : `CAST(NULL AS STRING)`;
 }
 
-function numBranch(where: string, withSource: boolean, tail = ""): string {
+function numBranch(
+  where: string,
+  withSource: boolean,
+  tail = "",
+  table = "signalk",
+): string {
   return (
     `SELECT ts, path, context, ${sourceCol(withSource)} source, ` +
     `CAST(value AS STRING) valuetext, ` +
-    `'number' kind FROM signalk WHERE ${where}${tail}`
+    `'number' kind FROM ${table} WHERE ${where}${tail}`
   );
 }
 
@@ -64,26 +70,66 @@ function strBranch(
 }
 
 // The track table has no path column, so the path is supplied as a literal.
-function posBranch(where: string, withSource: boolean, tail = ""): string {
+function posBranch(
+  where: string,
+  withSource: boolean,
+  tail = "",
+  table = "signalk_position",
+): string {
   return (
     `SELECT ts, 'navigation.position' path, context, ` +
     `${sourceCol(withSource)} source, ` +
     `concat(CAST(lat AS STRING), ',', CAST(lon AS STRING)) valuetext, ` +
-    `'position' kind FROM signalk_position WHERE ${where}${tail}`
+    `'position' kind FROM ${table} WHERE ${where}${tail}`
   );
 }
+
+/** Which archive tables a read adds to its base tables. */
+interface ArchivedBranches {
+  numeric: boolean;
+  position: boolean;
+}
+
+const NOT_ARCHIVED: ArchivedBranches = { numeric: false, position: false };
 
 function unionValueRowsSQL(
   where: string,
   orderAndLimit: string,
   withKind = true,
   withSource = true,
+  archived = NOT_ARCHIVED,
 ): string {
-  return (
-    `${numBranch(where, withSource)} UNION ALL ` +
-    `${strBranch(where, withKind, withSource)} UNION ALL ` +
-    `${posBranch(where, withSource)} ${orderAndLimit}`
-  );
+  const branches = [
+    numBranch(where, withSource),
+    strBranch(where, withKind, withSource),
+    posBranch(where, withSource),
+  ];
+  if (archived.numeric) {
+    branches.push(numBranch(where, withSource, "", ARCHIVE_TABLES.signalk));
+  }
+  if (archived.position) {
+    branches.push(
+      posBranch(where, withSource, "", ARCHIVE_TABLES.signalk_position),
+    );
+  }
+  return `${branches.join(" UNION ALL ")} ${orderAndLimit}`;
+}
+
+/**
+ * Keep the newest row per path and context. A snapshot reading the archive
+ * as well as the base tables gets a LATEST ON row from each for a path both
+ * hold, and the older one must not end up applied after the newer.
+ */
+function newestPerPath(
+  rows: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const newest = new Map<string, Record<string, unknown>>();
+  for (const row of rows) {
+    const key = `${String(row.path)}\u0000${String(row.context)}`;
+    const held = newest.get(key);
+    if (!held || String(row.ts) > String(held.ts)) newest.set(key, row);
+  }
+  return [...newest.values()];
 }
 
 // Turn a unified row back into the value a Signal K delta carries. Numbers
@@ -224,7 +270,17 @@ export function createHistoryProviderV1(
   queryClient: QueryClient,
   selfContext: string,
   debug: (msg: string) => void,
+  // Where retention kept the own vessel's older rows. A read includes it only
+  // for a range it covers.
+  archive: ArchiveReader = NO_ARCHIVE,
 ) {
+  function archivedIn(from: string, to: string): ArchivedBranches {
+    return {
+      numeric: archive.covers("signalk", from, to),
+      position: archive.covers("signalk_position", from, to),
+    };
+  }
+
   // Run a unified read, retrying without whichever optional column QuestDB
   // reports missing. value_kind and source are separate migrations, so
   // either — or both, on an external database ensureTables() has not
@@ -281,14 +337,22 @@ export function createHistoryProviderV1(
     // "Any data" must consider every value table: a vessel recording only
     // string/boolean channels (or only a position track) has history to play
     // back, and answering false here disables playback entirely.
+    const tables = ["signalk", "signalk_str", "signalk_position"];
+    const archived = archivedIn(startTime, new Date().toISOString());
+    if (archived.numeric) tables.push(ARCHIVE_TABLES.signalk);
+    if (archived.position) tables.push(ARCHIVE_TABLES.signalk_position);
     queryClient
       .exec(
         // Summed via a UNION ALL subquery: QuestDB rejects adding scalar
         // subqueries with `+` ("no matching operator").
         `SELECT sum(c) as cnt FROM (` +
-          `SELECT count() c FROM signalk WHERE ts >= '${startTime}'` +
-          ` UNION ALL SELECT count() c FROM signalk_str WHERE ts >= '${startTime}'` +
-          ` UNION ALL SELECT count() c FROM signalk_position WHERE ts >= '${startTime}')`,
+          tables
+            .map(
+              (table) =>
+                `SELECT count() c FROM ${table} WHERE ts >= '${startTime}'`,
+            )
+            .join(" UNION ALL ") +
+          `)`,
       )
       .then((result) => {
         const count =
@@ -357,9 +421,10 @@ export function createHistoryProviderV1(
       try {
         const window = `ts >= '${from}' AND ts < '${to}'`;
         const order = `ORDER BY ts LIMIT ${CHUNK_ROW_LIMIT}`;
+        const archived = archivedIn(from, to);
         const result = await execUnified(
           (withKind, withSource) =>
-            unionValueRowsSQL(window, order, withKind, withSource),
+            unionValueRowsSQL(window, order, withKind, withSource, archived),
           columnState,
         );
 
@@ -497,16 +562,35 @@ export function createHistoryProviderV1(
     const at = `ts <= '${ts}'`;
     const byPath = ` LATEST ON ts PARTITION BY path, context`;
     const byContext = ` LATEST ON ts PARTITION BY context`;
-    const snapshotSQL = (withKind: boolean, withSource: boolean) =>
-      `(${numBranch(at, withSource, byPath)})` +
-      ` UNION ALL ` +
-      `(${strBranch(at, withKind, withSource, byPath)})` +
-      ` UNION ALL ` +
-      `(${posBranch(at, withSource, byContext)})`;
+    // The archive answers for paths whose base rows retention has dropped,
+    // as one more per-table LATEST ON branch, never by wrapping the union.
+    const archived = archivedIn(new Date(0).toISOString(), ts);
+    const snapshotSQL = (withKind: boolean, withSource: boolean) => {
+      const branches = [
+        numBranch(at, withSource, byPath),
+        strBranch(at, withKind, withSource, byPath),
+        posBranch(at, withSource, byContext),
+      ];
+      if (archived.numeric) {
+        branches.push(
+          numBranch(at, withSource, byPath, ARCHIVE_TABLES.signalk),
+        );
+      }
+      if (archived.position) {
+        branches.push(
+          posBranch(at, withSource, byContext, ARCHIVE_TABLES.signalk_position),
+        );
+      }
+      return branches.map((branch) => `(${branch})`).join(" UNION ALL ");
+    };
 
     execUnified(snapshotSQL)
       .then((result) => {
-        const rows = queryClient.toObjects(result);
+        const objects = queryClient.toObjects(result);
+        const rows =
+          archived.numeric || archived.position
+            ? newestPerPath(objects)
+            : objects;
         const deltas = groupRowsIntoDeltas(rows);
         callback(deltas);
       })

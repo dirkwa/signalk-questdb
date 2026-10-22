@@ -21,7 +21,8 @@ import {
 import { unitsResolver } from "./history-units.js";
 import { createHistoryProviderV2 } from "./history-v2.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
-import { startRetention } from "./retention.js";
+import { startRetention, type Retention } from "./retention.js";
+import { ARCHIVE_TABLES, ArchiveSpans } from "./archive.js";
 import { RESTORE_SOURCE, restoreFromHistory } from "./restore.js";
 import { createConsoleProxy } from "./console-proxy.js";
 import { buildFullExportWhere } from "./full-export-range.js";
@@ -140,6 +141,8 @@ const FULL_EXPORT_TABLES = [
   "signalk",
   "signalk_str",
   "signalk_position",
+  ARCHIVE_TABLES.signalk,
+  ARCHIVE_TABLES.signalk_position,
 ] as const;
 const FULL_EXPORT_TABLE_SET: ReadonlySet<string> = new Set(FULL_EXPORT_TABLES);
 
@@ -236,7 +239,7 @@ export default (app: App) => {
   };
   let migrationCounter = 0;
   let queryClient: QueryClient | null = null;
-  let retentionTimer: NodeJS.Timeout | null = null;
+  let retention: Retention | null = null;
   let schemaHealTimer: NodeJS.Timeout | null = null;
   let currentConfig: Config | null = null;
   // True when the `signalk` table exists with the wrong (ILP-auto-created)
@@ -1064,6 +1067,19 @@ export default (app: App) => {
     // ingest into the broken shape.
     await healSchemaTables();
 
+    // Reads add the archive only where it covers the asked range, so its span
+    // must be known before a provider answers anything. If it cannot be read
+    // now, reads leave the archive out until the heal heartbeat below reads
+    // it.
+    const archive = new ArchiveSpans(queryClient);
+    try {
+      await archive.refresh();
+    } catch (err) {
+      app.debug(
+        `Archive span unknown: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     writer = new ILPWriter(ilpHost, ilpPort, (msg) => app.debug(msg), {
       // Surface a flapping ILP connection instead of leaving the status line
       // stuck on a cheerful "Recording" while every sample is dropped.
@@ -1101,6 +1117,7 @@ export default (app: App) => {
       // Twice the heartbeat: a path that updates at least once per heartbeat
       // gets a row within heartbeat + its own interval of the previous one.
       config.unchangedHeartbeatSeconds * 2000,
+      archive,
     );
     app.registerHistoryApiProvider(v2Provider);
 
@@ -1108,6 +1125,7 @@ export default (app: App) => {
       queryClient,
       app.selfContext,
       (msg) => app.debug(msg),
+      archive,
     );
     app.registerHistoryProvider(v1Provider);
 
@@ -1358,10 +1376,16 @@ export default (app: App) => {
     unsubscribes.push(unsub);
 
     if (config.retentionDays && config.retentionDays > 0) {
-      retentionTimer = startRetention(
+      retention = startRetention(
         queryClient,
-        config.retentionDays,
+        {
+          retentionDays: config.retentionDays,
+          archiveOwnTrack: config.archiveOwnTrack,
+          archivePaths: new PathMatcher(config.archivePaths),
+          archiveResolutionSeconds: config.archiveResolutionSeconds,
+        },
         (msg) => app.debug(msg),
+        () => archive.refresh(),
       );
     }
 
@@ -1370,6 +1394,13 @@ export default (app: App) => {
     // recording silently breaking heals itself instead of needing a restart.
     schemaHealTimer = setInterval(() => {
       void healSchemaTables();
+      if (!archive.known) {
+        archive.refresh().catch((err: unknown) => {
+          app.debug(
+            `Archive span still unknown: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
     }, SCHEMA_HEAL_INTERVAL_MS);
 
     // Watch for WAL suspensions. Detection alone is not enough — a suspended
@@ -1604,9 +1635,9 @@ export default (app: App) => {
       }
       unsubscribes.length = 0;
 
-      if (retentionTimer) {
-        clearInterval(retentionTimer);
-        retentionTimer = null;
+      if (retention) {
+        retention.stop();
+        retention = null;
       }
 
       if (schemaHealTimer) {
@@ -2587,9 +2618,9 @@ export default (app: App) => {
               walMonitor = null;
             }
             clearWalAlertOnTeardown();
-            if (retentionTimer) {
-              clearInterval(retentionTimer);
-              retentionTimer = null;
+            if (retention) {
+              retention.stop();
+              retention = null;
             }
             if (writer) {
               try {

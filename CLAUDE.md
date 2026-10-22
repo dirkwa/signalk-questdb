@@ -35,7 +35,7 @@ Both build outputs are shipped in the npm package; `prepublishOnly` rebuilds the
 - Reads come from two registered providers:
   - **v2** (`src/history-v2.ts`) — `app.registerHistoryApiProvider()`, REST under `/signalk/v2/api/history/`. Aggregates map directly to QuestDB SQL except `sma`/`ema` (computed client-side).
   - **v1** (`src/history-v1.ts`) — `app.registerHistoryProvider()`, WebSocket playback with chunked reads.
-- Retention (`src/retention.ts`) drops old daily partitions on a timer.
+- Retention (`src/retention.ts`) drops old daily partitions on a timer. Before a partition of `signalk_position` or `signalk` goes, the own vessel's rows the config keeps are copied, thinned, into `signalk_position_archive` / `signalk_archive` (`src/archive.ts`), and the drop waits for that copy to be applied. Reads add an archive table only for a range it covers (`ArchiveSpans`), so a recent window stays on the base table alone; v1 snapshots read it as one more per-table `LATEST ON` branch, never by wrapping the union.
 - Startup restore (`src/restore.ts`) optionally replays each vessel's last recorded position back into the live model after a server restart.
 - Console proxy (`src/console-proxy.ts`) reverse-proxies QuestDB's own web console so the embeddable webapp (`public/index.html`) can host it in the admin UI.
 

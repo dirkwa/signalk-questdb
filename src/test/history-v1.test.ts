@@ -920,3 +920,128 @@ describe("history-v1 source attribution", () => {
     assert.equal(deltas.length, 1);
   });
 });
+
+describe("history-v1 archive", () => {
+  // An archive that covers everything up to the end of 2024.
+  const archive = {
+    covers: (_table: string, from: string) =>
+      Date.parse(from) <= Date.parse("2024-12-31T23:59:59Z"),
+  };
+
+  it("leaves the archive out of reads it does not cover", async () => {
+    const captured: Captured[] = [];
+    const provider = createHistoryProviderV1(
+      mockClient(captured, [[0]]),
+      SELF,
+      noop,
+      archive,
+    );
+    await new Promise<boolean>((resolve) =>
+      provider.hasAnyData(
+        { startTime: new Date("2025-06-01T00:00:00Z"), playbackRate: 1 },
+        resolve,
+      ),
+    );
+    assert.doesNotMatch(captured[0].sql, /_archive/);
+  });
+
+  it("counts the archive when asked about a time it covers", async () => {
+    const captured: Captured[] = [];
+    const provider = createHistoryProviderV1(
+      mockClient(captured, [[3]]),
+      SELF,
+      noop,
+      archive,
+    );
+    const result = await new Promise<boolean>((resolve) =>
+      provider.hasAnyData(
+        { startTime: new Date("2024-01-01T00:00:00Z"), playbackRate: 1 },
+        resolve,
+      ),
+    );
+    assert.equal(result, true);
+    assert.match(captured[0].sql, /FROM signalk_archive /);
+    assert.match(captured[0].sql, /FROM signalk_position_archive /);
+  });
+
+  it("adds per-table LATEST ON branches and keeps the newest row per path", async () => {
+    const captured: Captured[] = [];
+    const rows: unknown[][] = [
+      // Base table: a recent depth. Archive: an older one for the same path,
+      // plus a position only the archive still holds.
+      [
+        "2024-11-02T10:00:00.000000Z",
+        "environment.depth.belowTransducer",
+        "self",
+        "4.2",
+        "number",
+      ],
+      [
+        "2024-10-01T10:00:00.000000Z",
+        "environment.depth.belowTransducer",
+        "self",
+        "9.9",
+        "number",
+      ],
+      [
+        "2024-10-01T10:00:00.000000Z",
+        "navigation.position",
+        "self",
+        "10.5,20.5",
+        "position",
+      ],
+    ];
+    const provider = createHistoryProviderV1(
+      mockClient(captured, rows),
+      SELF,
+      noop,
+      archive,
+    );
+    const deltas = await new Promise<unknown[]>((resolve) =>
+      provider.getHistory(new Date("2024-11-03T00:00:00Z"), "", (d) =>
+        resolve(d),
+      ),
+    );
+
+    const sql = captured[0].sql;
+    assert.equal((sql.match(/LATEST ON/g) || []).length, 5, sql);
+    assert.match(
+      sql,
+      /FROM signalk_archive WHERE ts <= '[^']+' LATEST ON ts PARTITION BY path, context\)/,
+    );
+    assert.match(
+      sql,
+      /FROM signalk_position_archive WHERE [^)]*LATEST ON ts PARTITION BY context\)/,
+    );
+
+    const values = JSON.stringify(deltas);
+    assert.match(values, /"value":4\.2/);
+    assert.doesNotMatch(values, /9\.9/);
+    assert.match(values, /"latitude":10\.5/);
+  });
+
+  it("streams archive rows in the playback union for a covered window", async () => {
+    const captured: Captured[] = [];
+    const provider = createHistoryProviderV1(
+      mockClient(captured, []),
+      SELF,
+      noop,
+      archive,
+    );
+    const stop = provider.streamHistory(
+      { write: () => {}, on: () => {} },
+      { startTime: new Date("2024-06-01T00:00:00Z"), playbackRate: 1 },
+      () => {},
+    );
+    const deadline = Date.now() + 2000;
+    while (captured.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    stop();
+    const branches = captured[0].sql.split(" UNION ALL ");
+    assert.equal(branches.length, 5, captured[0].sql);
+    assert.match(branches[3], /FROM signalk_archive WHERE ts >= /);
+    assert.match(branches[4], /FROM signalk_position_archive WHERE ts >= /);
+    assert.match(branches[4], /ORDER BY ts LIMIT 10000$/);
+  });
+});
