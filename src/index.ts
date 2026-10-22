@@ -3078,6 +3078,15 @@ export default (app: App) => {
           });
           return;
         }
+        // The rebuild carries over everything written during its copy, from
+        // the oldest line's time on: a GPX line from years back would make
+        // that years of rows.
+        if (legacyCleanupRunning) {
+          importReply(res, 409, {
+            error: "The string table is being rebuilt; import after it ends",
+          });
+          return;
+        }
         try {
           const session = gpxImports.start(() => {
             const gate = new WriterGate(w);
@@ -3551,6 +3560,13 @@ export default (app: App) => {
         if (activeMigration && activeMigration.state === "running") {
           res.status(409).json({
             error: "An import is running; wait for it or cancel it first",
+            rows: 0,
+          } satisfies LegacyImportRowsResponse);
+          return;
+        }
+        if (gpxImports.active) {
+          res.status(409).json({
+            error: "A GPX import is running; wait for it or abort it first",
             rows: 0,
           } satisfies LegacyImportRowsResponse);
           return;

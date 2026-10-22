@@ -128,11 +128,13 @@ interface Point {
 
 /** Count one point against a track name, bounded at MAX_NAMED names. */
 function tally(counts: Record<string, number>, name: string): void {
+  // Own properties only: a track named "constructor" is a name like any
+  // other, not the object's inherited function.
   const key =
-    name in counts || Object.keys(counts).length < MAX_NAMED
+    Object.hasOwn(counts, name) || Object.keys(counts).length < MAX_NAMED
       ? name
       : OTHER_NAMES;
-  counts[key] = (counts[key] ?? 0) + 1;
+  counts[key] = (Object.hasOwn(counts, key) ? counts[key]! : 0) + 1;
 }
 
 /** The document is not well-formed XML; rows before the error are kept. */

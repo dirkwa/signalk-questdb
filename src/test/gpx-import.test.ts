@@ -153,6 +153,17 @@ describe("GpxImport", () => {
     assert.deepEqual(summary.importedTracks, { "Eigenes Schiff": 1, "": 1 });
   });
 
+  it("counts tracks named like Object's own properties as names", async () => {
+    const { summary } = await run(
+      gpx(
+        trk("constructor", [pt(1, 1, "2024-06-01T00:00:00Z")]),
+        trk("toString", [pt(1, 1, "2024-06-01T00:00:00Z")]),
+        trk("toString", [pt(1, 1, "2024-06-01T00:01:00Z")]),
+      ),
+    );
+    assert.deepEqual(summary.skippedTracks, { constructor: 1, toString: 2 });
+  });
+
   it("names at most 100 tracks and counts the rest together", async () => {
     const many = Array.from({ length: 102 }, (_, i) =>
       trk(`AIS ${i}`, [pt(1, 1, "2024-06-01T00:00:00Z")]),
