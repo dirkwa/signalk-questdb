@@ -95,6 +95,9 @@ export function GpxImportSection({
   // this component, which may stop a scan but must not abort an import.
   const abort = useRef<AbortController | null>(null);
   const scanAbort = useRef<AbortController | null>(null);
+  // Set once this panel starts an import: the last-import status read on
+  // mount may arrive after that and must not replace the running one's.
+  const importStarted = useRef(false);
 
   // The last import, so a panel opened afterwards still shows its result.
   useEffect(() => {
@@ -102,7 +105,9 @@ export function GpxImportSection({
     fetch(GPX_IMPORT_API)
       .then((res) => res.json() as Promise<GpxImportResponse>)
       .then((body) => {
-        if (!cancelled && body.import) setStatus(body.import);
+        if (!cancelled && !importStarted.current && body.import) {
+          setStatus(body.import);
+        }
       })
       .catch(() => undefined);
     return () => {
@@ -154,6 +159,7 @@ export function GpxImportSection({
 
   const start = async () => {
     if (!file) return;
+    importStarted.current = true;
     const controller = new AbortController();
     abort.current = controller;
     setError(null);
@@ -183,12 +189,11 @@ export function GpxImportSection({
     if (last?.import) setStatus(last.import);
   };
 
+  // The local signal is only seen between requests, and a finish can wait
+  // minutes on QuestDB, so the server is always told as well, whoever started
+  // the import.
   const abortRunning = async () => {
-    if (abort.current) {
-      abort.current.abort();
-      return;
-    }
-    // An import this panel did not start: another tab, or one left behind.
+    abort.current?.abort();
     if (status) {
       const res = await fetch(
         `${GPX_IMPORT_API}/${encodeURIComponent(status.id)}`,
