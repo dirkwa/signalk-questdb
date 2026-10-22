@@ -3060,11 +3060,16 @@ export default (app: App) => {
         }
         // ILP would auto-create a missing archive with the wrong designated
         // timestamp, and every read of it would come back empty.
-        if (
-          (await client.designatedTimestamp(
+        let designated: string | null;
+        try {
+          designated = await client.designatedTimestamp(
             ARCHIVE_TABLES.signalk_position,
-          )) !== "ts"
-        ) {
+          );
+        } catch (err) {
+          importFailure(res, err);
+          return;
+        }
+        if (designated !== "ts") {
           importReply(res, 503, {
             error: `${ARCHIVE_TABLES.signalk_position} is missing; restart the plugin to create it`,
           });
