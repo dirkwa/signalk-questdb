@@ -164,6 +164,21 @@ describe("uploadGpx", () => {
     });
   });
 
+  it("reports an abort that came while the finish was waiting", async () => {
+    const { fetchFake, calls } = server();
+    const controller = new AbortController();
+    const finishing = (async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/finish")) controller.abort();
+      return fetchFake(url, init);
+    }) as typeof fetch;
+    await assert.rejects(run(finishing, controller.signal).done, {
+      name: "AbortError",
+    });
+    assert.ok(
+      calls.includes("DELETE /plugins/signalk-questdb/api/gpx-import/imp-1"),
+    );
+  });
+
   it("aborts the import on the server when cancelled", async () => {
     const { fetchFake, calls } = server();
     const controller = new AbortController();

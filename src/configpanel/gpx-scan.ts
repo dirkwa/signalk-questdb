@@ -345,6 +345,46 @@ function sorted(samples: number[]): [number, number, number][] {
 }
 
 /**
+ * Where `b` was at `ms`: interpolated between the samples either side of it,
+ * or the nearer one alone at the ends; null if `b` has no sample that close.
+ *
+ * Each group is sampled on its own clock, so the sample nearest in time can
+ * be minutes off, and at passage speed minutes are kilometres: comparing
+ * against it would make a second recorder of the same vessel look like
+ * another one.
+ */
+function positionAt(
+  b: [number, number, number][],
+  j: number,
+  ms: number,
+): [number, number] | null {
+  const before = b[j];
+  const after = b[j + 1];
+  if (
+    before &&
+    after &&
+    before[0] <= ms &&
+    ms <= after[0] &&
+    after[0] - before[0] <= 2 * MATCH_MS
+  ) {
+    const f =
+      after[0] === before[0] ? 0 : (ms - before[0]) / (after[0] - before[0]);
+    // Across the antimeridian the short way round is through ±180.
+    let dLon = after[2] - before[2];
+    if (dLon > 180) dLon -= 360;
+    else if (dLon < -180) dLon += 360;
+    return [before[1] + f * (after[1] - before[1]), before[2] + f * dLon];
+  }
+  const nearest = [before, after]
+    .filter(
+      (s): s is [number, number, number] =>
+        s !== undefined && Math.abs(s[0] - ms) <= MATCH_MS,
+    )
+    .sort((x, y) => Math.abs(x[0] - ms) - Math.abs(y[0] - ms))[0];
+  return nearest ? [nearest[1], nearest[2]] : null;
+}
+
+/**
  * Where `a` and `b` were at the same times, the median distance between
  * them and the first time they were that far apart; null if they never
  * overlap in time.
@@ -357,11 +397,10 @@ function compare(
   let j = 0;
   for (const [ms, lat, lon] of a) {
     while (j < b.length - 1 && b[j + 1]![0] <= ms) j++;
-    const near = [b[j], b[j + 1]].find(
-      (s) => s !== undefined && Math.abs(s[0] - ms) <= MATCH_MS,
-    );
-    if (near)
-      distances.push({ km: distanceKm(lat, lon, near[1], near[2]), at: ms });
+    const there = positionAt(b, j, ms);
+    if (there) {
+      distances.push({ km: distanceKm(lat, lon, there[0], there[1]), at: ms });
+    }
   }
   if (distances.length === 0) return null;
   const median = [...distances].sort((x, y) => x.km - y.km)[

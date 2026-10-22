@@ -131,9 +131,18 @@ export async function uploadGpx(upload: GpxUpload): Promise<GpxImportStatus> {
   }
 
   if (signal.aborted) await abort();
-  const finished = await request(`${url}/finish`, { method: "POST" });
+  // The finish can wait minutes on QuestDB; an abort meanwhile ends the wait,
+  // and one that came too late to stop it still wins over its reply.
+  let finished: Response;
+  try {
+    finished = await request(`${url}/finish`, { method: "POST", signal });
+  } catch (err) {
+    if (signal.aborted) await abort();
+    throw err;
+  }
   const done = await read(finished);
-  if (!finished.ok || !done.import) {
+  if (signal.aborted) await abort();
+  if (!finished.ok || !done.import || done.import.state !== "finished") {
     throw new GpxUploadError(
       done.error ?? "The import could not finish",
       done.import ?? null,

@@ -166,6 +166,37 @@ describe("scanGpx", () => {
     }
   });
 
+  it("does not mistake a second recorder at passage speed for another vessel", async () => {
+    // Same vessel, two recorders, 20 kn north (one degree of latitude in
+    // three hours), logging at different instants: their 5-minute samples
+    // are minutes apart, and minutes at 20 kn are kilometres.
+    const moving = (
+      name: string,
+      startMs: number,
+      stepS: number,
+      hours: number,
+    ) =>
+      trk(
+        name,
+        Array.from({ length: (hours * 3600) / stepS }, (_, i) => {
+          const ms = startMs + i * stepS * 1000;
+          const lat =
+            40 + (ms - Date.parse("2024-06-01T00:00:00Z")) / (3 * 3600 * 1000);
+          return pt(lat, 5, new Date(ms).toISOString());
+        }),
+      );
+    const groups = await scan(
+      gpx(
+        moving("Own Ship", Date.parse("2024-06-01T00:00:00Z"), 7, 6),
+        moving("Logbook", Date.parse("2024-06-01T00:02:30Z"), 11, 2),
+        moving("Logbook", Date.parse("2024-06-01T03:02:30Z"), 11, 2),
+      ),
+    );
+    const logbook = groups.find((g) => g.name === "Logbook")!;
+    assert.equal(logbook.conflict, null);
+    assert.equal(logbook.selected, true);
+  });
+
   it("counts points without a time but gives them no period", async () => {
     const [group] = await scan(gpx(trk("Own Ship", [pt(1, 2), pt(1, 2)])));
     assert.equal(group!.points, 2);
