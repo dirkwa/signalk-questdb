@@ -31,7 +31,7 @@ Both build outputs are shipped in the npm package; `prepublishOnly` rebuilds the
 ### Data flow
 
 - Subscribes to the Signal K **streambundle** for all paths and writes filtered/throttled deltas to QuestDB via **ILP over raw TCP** (`src/ilp-writer.ts`) — no QuestDB client library.
-- Three tables (`signalk`, `signalk_str`, `signalk_position`) defined and queried in `src/query-client.ts`. All use WAL mode + daily partitioning + dedup.
+- Three tables (`signalk`, `signalk_str`, `signalk_position`) defined and queried in `src/query-client.ts`. All use WAL mode + daily partitioning + dedup. The archives `signalk_archive` and `signalk_position_archive` are defined there too, with their base tables' columns and dedup keys and monthly partitions.
 - Reads come from two registered providers:
   - **v2** (`src/history-v2.ts`) — `app.registerHistoryApiProvider()`, REST under `/signalk/v2/api/history/`. Aggregates map directly to QuestDB SQL except `sma`/`ema` (computed client-side).
   - **v1** (`src/history-v1.ts`) — `app.registerHistoryProvider()`, WebSocket playback with chunked reads.
@@ -73,5 +73,5 @@ Their wire shapes live in `src/api-contract.ts` and are shared by both surfaces:
 - Prettier + eslint flat config (`eslint.config.ts`); run `npm run format` before committing.
 - The config panel uses React 19 with Module Federation — keep the federation `shared` block in sync with `package.json`'s React version.
 - **Classic JSX is load-bearing.** `jsxRuntime: "classic"` (vite.config.ts) and `"jsx": "react"` (panel tsconfig) must agree. The automatic runtime imports `react/jsx-runtime`, which is not in the federation `shared` scope, so the remote would carry its own copy of React's jsx runtime — a second React instance whose dispatcher is not the host's, so `useState` reads null and the panel fails to mount. At runtime, with no build error.
-- **Imports leaving `src/configpanel/` must be `import type`.** A value import pulls the module's runtime dependencies into the browser bundle (typebox via `config/schema`, `fs/promises` via `host-limits`). After changing panel imports, confirm with `grep -rl "typebox\|fs/promises" public/` — it must print nothing.
+- **Imports leaving `src/configpanel/` must be `import type`.** A value import pulls the module's runtime dependencies into the browser bundle (typebox via `config/schema`, `fs/promises` via `host-limits`, saxes via `gpx-import`). After changing panel imports, confirm with `grep -rl "typebox\|fs/promises\|saxes" public/` — it must print nothing.
 - `signalk.appIcon` and `signalk.displayName` in `package.json` control how the plugin appears in the Admin UI.
