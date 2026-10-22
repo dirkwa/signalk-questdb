@@ -125,8 +125,10 @@ export function GpxImportSection({
     (status?.state === "receiving" || status?.state === "finishing");
   useEffect(() => {
     if (!following) return;
-    const asked = generation.current;
     const timer = setInterval(() => {
+      // Per request: a poll asked before an abort is stale, one asked after
+      // it (an abort whose DELETE failed) is current again.
+      const asked = generation.current;
       fetch(GPX_IMPORT_API)
         .then((res) => res.json() as Promise<GpxImportResponse>)
         .then((body) => {
