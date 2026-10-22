@@ -580,6 +580,14 @@ and the archive), where retention never drops it, under the source
 1.5 GB, so the file is sent in slices and parsed as it arrives. Memory stays at
 one slice, whatever the file's size.
 
+In the configuration panel, **GPX track import** reads the chosen file in the
+browser first, which takes seconds even for a gigabyte, and lists its tracks by
+name with their points and period. It proposes the own vessel's tracks: the
+largest group whose name is not an AIS target's, and any other name that
+recurs. It flags a group that lay more than a kilometre from a larger one at
+the same time, since that was another vessel. Nothing is uploaded until
+**Import** is pressed; the import then shows its progress and can be aborted.
+
 - **Which tracks.** An export mixes the own track with AIS targets and with
   passages imported into the plotter from elsewhere, and GPX does not say whose
   a track is. The import takes the names of the tracks to import (`tracks`);
