@@ -69,6 +69,20 @@ describe("ArchiveSpans", () => {
     assert.equal(spans.covers("signalk", "2000-01-01", "2100-01-01"), false);
   });
 
+  it("is known only once a refresh has read every table", async () => {
+    let fail = true;
+    const spans = new ArchiveSpans(
+      client(() =>
+        fail ? new Error("QuestDB query failed (503)") : [[null, null]],
+      ),
+    );
+    await assert.rejects(spans.refresh());
+    assert.equal(spans.known, false);
+    fail = false;
+    await spans.refresh();
+    assert.equal(spans.known, true);
+  });
+
   it("keeps the known span when a refresh fails for another reason", async () => {
     let fail = false;
     const spans = new ArchiveSpans(

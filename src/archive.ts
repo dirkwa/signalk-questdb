@@ -61,8 +61,14 @@ export function readFrom(table: ArchivedTable, withArchive: boolean): string {
  */
 export class ArchiveSpans implements ArchiveReader {
   private readonly spans = new Map<ArchivedTable, [number, number]>();
+  private read = false;
 
   constructor(private readonly queryClient: Pick<QueryClient, "exec">) {}
+
+  /** Whether a refresh has read every archive table at least once. */
+  get known(): boolean {
+    return this.read;
+  }
 
   async refresh(): Promise<void> {
     for (const table of Object.keys(ARCHIVE_TABLES) as ArchivedTable[]) {
@@ -84,6 +90,7 @@ export class ArchiveSpans implements ArchiveReader {
         else throw err;
       }
     }
+    this.read = true;
   }
 
   covers(table: ArchivedTable, from: string, to: string): boolean {

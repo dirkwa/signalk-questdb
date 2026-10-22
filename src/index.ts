@@ -1069,7 +1069,7 @@ export default (app: App) => {
 
     // Reads add the archive only where it covers the asked range, so its span
     // must be known before a provider answers anything. If it cannot be read
-    // now, reads leave the archive out until retention's next copy refreshes
+    // now, reads leave the archive out until the heal heartbeat below reads
     // it.
     const archive = new ArchiveSpans(queryClient);
     try {
@@ -1400,6 +1400,13 @@ export default (app: App) => {
     // recording silently breaking heals itself instead of needing a restart.
     schemaHealTimer = setInterval(() => {
       void healSchemaTables();
+      if (!archive.known) {
+        archive.refresh().catch((err: unknown) => {
+          app.debug(
+            `Archive span still unknown: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
     }, SCHEMA_HEAL_INTERVAL_MS);
 
     // Watch for WAL suspensions. Detection alone is not enough — a suspended
