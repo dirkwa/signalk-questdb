@@ -310,8 +310,14 @@ arithmetic.
 
 `navigation.position` answers `first`, `last` and `middle_index` — each a point
 the vessel was at. Any other method runs `first`, and the column's `method` says
-so. A text path (rows in `signalk_str`) answers `first` and `last`;
-`middle_index` and the moving averages read the numeric table only.
+so. A text path (rows in `signalk_str`) answers `first`, `last` and
+`middle_index`. With a resolution, `average`, `min`, `max` and `mid` run `last`,
+the state in force at the bucket's end, and the column's `method` says so.
+`sma` and `ema` read the numeric table only, so a text path has no values for
+them.
+
+A method name outside the table above fails the request with an error naming
+the path and the method.
 
 Query example:
 

@@ -416,6 +416,36 @@ describe("history-v2 sample bucket guard", () => {
   });
 });
 
+describe("history-v2 aggregation method", () => {
+  it("rejects an unknown method before any query", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      makeMockClient(captured),
+      SELF_CONTEXT,
+    );
+
+    for (const path of ["navigation.speedOverGround", "navigation.position"]) {
+      await assert.rejects(
+        provider.getValues({
+          from: { toString: () => "2024-01-01T00:00:00Z" },
+          to: { toString: () => "2024-01-01T01:00:00Z" },
+          resolution: 60,
+          pathSpecs: [
+            {
+              path: "navigation.headingTrue",
+              aggregate: "last",
+              parameter: [],
+            },
+            { path, aggregate: "median", parameter: [] },
+          ],
+        } as any),
+        new RegExp(`${path}:median — unknown aggregation method`),
+      );
+    }
+    assert.equal(captured.length, 0, "must reject before querying QuestDB");
+  });
+});
+
 describe("history-v2 string-table fallback", () => {
   // Values live in `signalk` (numeric) or `signalk_str` (strings, and
   // booleans stored as "true"/"false" since #79). getValues only ever queried
@@ -525,6 +555,29 @@ describe("history-v2 string-table fallback", () => {
     assert.equal(result.values[0].method, "last");
   });
 
+  it("applies first() to text when first is requested", async () => {
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) =>
+        sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "on"]]
+          : [],
+      ),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("navigation.state", { resolution: 600, aggregate: "first" }),
+    );
+
+    assert.equal(result.values[0].method, "first");
+    const strSql = captured.find((c) => c.sql.includes("signalk_str"))!.sql;
+    assert.ok(
+      strSql.includes("first(value_str) as value_str"),
+      `expected first() on the string table, got: ${strSql}`,
+    );
+  });
+
   it("keeps the requested method for raw (non-downsampled) string reads", async () => {
     // Without a resolution no aggregate is applied at all, so nothing is
     // being misreported and the caller's choice stands.
@@ -594,6 +647,36 @@ describe("history-v2 string-table fallback", () => {
 
     const result = await provider.getValues(query("some.path"));
     assert.equal(result.data[0][1], "true");
+  });
+
+  it("degrades a downsampled read without aggregating a bare NULL", async () => {
+    // QuestDB rejects first(NULL) and last(NULL) ("NullConstant cannot be
+    // cast to SymbolFunction"), so the degraded kind stays a plain literal.
+    const captured: CapturedQuery[] = [];
+    const provider = createHistoryProviderV2(
+      mockClient(captured, (sql) => {
+        if (/\bvalue_kind\)/.test(sql)) {
+          throw new Error(
+            "QuestDB query failed (400): Invalid column: value_kind",
+          );
+        }
+        return sql.includes("signalk_str")
+          ? [["2024-01-01T00:00:00.000000Z", "on", null, "on", null, "x"]]
+          : [];
+      }),
+      SELF_CONTEXT,
+    );
+
+    const result = await provider.getValues(
+      query("navigation.state", { resolution: 600, aggregate: "first" }),
+    );
+
+    const retry = captured.at(-1)!.sql;
+    assert.ok(
+      retry.includes("signalk_str") && !/(first|last)\(NULL\)/.test(retry),
+      `expected no aggregate over NULL, got: ${retry}`,
+    );
+    assert.equal(result.data[0][1], "on");
   });
 
   it("aggregates a downsampled string path with last(), not avg()", async () => {
@@ -1892,16 +1975,42 @@ describe("history-v2 middle_index", () => {
     ]);
   });
 
-  it("does not read the string table for a text path", async () => {
+  it("picks the middle recorded text of each bucket for a text path", async () => {
     const captured: CapturedQuery[] = [];
     const response = await createHistoryProviderV2(
-      client(captured, []),
+      {
+        exec: async (sql: string) => {
+          captured.push({ sql });
+          const dataset = sql.includes("FROM signalk_str")
+            ? [["2024-01-01T00:00:00.000000Z", "true", "boolean"]]
+            : [];
+          return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+        },
+      } as unknown as QueryClientArg,
       SELF_CONTEXT,
-    ).getValues(request("navigation.state"));
+    ).getValues(request("electrical.switches.a.state"));
 
-    assert.equal(captured.length, 1, "expected no signalk_str fallback");
+    assert.equal(captured.length, 2, "expected one signalk_str fallback");
+    const sql = captured[1].sql;
+    assert.ok(
+      sql.includes("FROM signalk_str ") &&
+        sql.includes("row_number() OVER (PARTITION BY b ORDER BY ts)") &&
+        sql.includes("value_str, value_kind"),
+      `expected the string table's middle row, got: ${sql}`,
+    );
+    assert.equal(response.values[0].method, "middle_index");
+    assert.deepEqual(response.data, [["2024-01-01T00:00:00.000000Z", true]]);
+  });
+
+  it("keeps a numeric middle row without reading the string table", async () => {
+    const captured: CapturedQuery[] = [];
+    await createHistoryProviderV2(
+      client(captured, [["2024-01-01T00:00:00.000000Z", 3]]),
+      SELF_CONTEXT,
+    ).getValues(request("navigation.speedOverGround"));
+
+    assert.equal(captured.length, 1);
     assert.ok(!captured[0].sql.includes("signalk_str"), captured[0].sql);
-    assert.deepEqual(response.data, []);
   });
 });
 
@@ -2402,15 +2511,17 @@ describe("history-v2 holding unchanged values across empty buckets", () => {
 
   it("holds a boolean state from the string table, kind included", async () => {
     const strings = [
-      [minute(0), null, null, null],
-      [minute(1), "true", "boolean", minute(1)],
-      [minute(2), null, null, null],
+      [minute(0), null, null, null, null, null],
+      [minute(1), "true", "boolean", "true", "boolean", minute(1)],
+      [minute(2), null, null, null, null, null],
     ];
     const provider = createHistoryProviderV2(
       holdingClient([], {
         strings,
         stringSeed: [
           "2023-12-31T23:58:00.000000Z",
+          "false",
+          "boolean",
           "false",
           "boolean",
           "2023-12-31T23:58:00.000000Z",
@@ -2428,6 +2539,39 @@ describe("history-v2 holding unchanged values across empty buckets", () => {
     assert.deepEqual(
       result.data.map((r) => r[1]),
       [false, true, true],
+    );
+  });
+
+  it("holds a text bucket's last sample when the column picks first", async () => {
+    // The state in force after a bucket is its last sample, whichever value
+    // the bucket itself reports.
+    const strings = [
+      [minute(0), "anchored", null, "moored", null, minute(0)],
+      [minute(1), null, null, null, null, null],
+    ];
+    const captured: string[] = [];
+    const provider = createHistoryProviderV2(
+      holdingClient([], { strings }, captured),
+      SELF_CONTEXT,
+      false,
+      undefined,
+      undefined,
+      HOLD,
+    );
+
+    const result = await provider.getValues(
+      request("first", "navigation.state"),
+    );
+
+    assert.deepEqual(
+      result.data.map((r) => r[1]),
+      ["anchored", "moored"],
+    );
+    const strSql = captured.find((sql) => sql.includes("FROM signalk_str"));
+    assert.ok(
+      strSql?.includes("first(value_str) as value_str") &&
+        strSql.includes("last(value_str) as held_str"),
+      `expected first() with the last sample alongside, got: ${strSql}`,
     );
   });
 

@@ -57,6 +57,31 @@ type AggregateMethod = HistoryApi.AggregateMethod;
  */
 type ValueColumn = HistoryApi.ValueList[number];
 
+type TextPick = "first" | "last" | "middle_index";
+
+// The server passes the method after `path:` through without checking it, so
+// an unknown name reaches the provider verbatim.
+const AGGREGATE_METHODS: readonly AggregateMethod[] = [
+  "average",
+  "min",
+  "max",
+  "first",
+  "last",
+  "mid",
+  "middle_index",
+  "sma",
+  "ema",
+];
+const KNOWN_AGGREGATES: ReadonlySet<string> = new Set(AGGREGATE_METHODS);
+
+function checkAggregate(spec: PathSpec): void {
+  if (KNOWN_AGGREGATES.has(spec.aggregate)) return;
+  throw new Error(
+    `${spec.path}:${spec.aggregate} — unknown aggregation method; ` +
+      `use one of ${AGGREGATE_METHODS.join(", ")}`,
+  );
+}
+
 function aggregateToSql(method: AggregateMethod): string {
   switch (method) {
     case "average":
@@ -618,8 +643,9 @@ export function createHistoryProviderV2(
    * Read a path's rows from `signalk_str`.
    *
    * Numeric aggregates do not apply to text, so a downsampled request takes
-   * one representative value per bucket (`last` = the state in force at the
-   * bucket's end, which is what a state channel means) instead of averaging.
+   * one recorded value per bucket instead of averaging: `first` or
+   * `middle_index` when the caller picked one, otherwise `last` (the state
+   * in force at the bucket's end, which is what a state channel means).
    * Values are returned verbatim: booleans were stored as "true"/"false", so
    * a consumer can tell them apart from real numbers, and Grafana value
    * mappings work directly.
@@ -638,6 +664,7 @@ export function createHistoryProviderV2(
   async function readStringRows(
     where: string,
     range: ResolvedRange,
+    pick: TextPick,
     resolution?: number,
     seedWhere?: string,
   ): Promise<{ rows: [string, unknown][]; sourceDropped: boolean }> {
@@ -652,11 +679,27 @@ export function createHistoryProviderV2(
     // and path filters intact.
     const withoutSource = (clause: string) =>
       clause.replace(/ AND source (?:= '[^']*'|IS NULL)/g, "");
+    const sampled = !!resolution && resolution > 0;
     const sql = (withKind: boolean, withSource: boolean) => {
       const kind = withKind ? "value_kind" : "NULL";
+      // QuestDB has no first()/last() over a bare NULL, so the degraded read
+      // leaves the literal outside the aggregate.
+      const kindOf = (fn: "first" | "last") =>
+        withKind ? `${fn}(value_kind)` : "NULL";
       const clause = withSource ? where : withoutSource(where);
-      return resolution && resolution > 0
-        ? `SELECT ts, last(value_str) as value_str, last(${kind}) as value_kind, last(ts) as held_ts FROM signalk_str WHERE ${clause} ${sampleBy(range, resolution)} ORDER BY ts`
+      if (pick === "middle_index") {
+        return middleRowSql(
+          "signalk_str",
+          `value_str, ${kind} as value_kind`,
+          clause,
+          range,
+          resolution,
+        );
+      }
+      // The bucket's last sample rides along whatever the pick is: it is
+      // what an empty bucket after it holds (see holdThroughEmptyBuckets).
+      return sampled
+        ? `SELECT ts, ${pick}(value_str) as value_str, ${kindOf(pick)} as value_kind, last(value_str) as held_str, ${kindOf("last")} as held_kind, last(ts) as held_ts FROM signalk_str WHERE ${clause} ${sampleBy(range, resolution)} ORDER BY ts`
         : `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${clause} ORDER BY ts LIMIT 10000`;
     };
     // A read racing ensureTables()'s migration — or an external QuestDB the
@@ -690,22 +733,25 @@ export function createHistoryProviderV2(
     };
     const result = await run(true, true);
     let dataset = result.dataset;
-    // A text bucket's value is already its last sample, so an empty bucket
-    // takes the held row's text and kind as they are.
-    if (resolution && resolution > 0 && seedWhere && holdMs > 0) {
+    // An empty bucket takes the held row's last text and kind as they are.
+    // middle_index yields no row for an empty bucket, so it holds nothing,
+    // as it does for a number.
+    if (sampled && pick !== "middle_index" && seedWhere && holdMs > 0) {
       let seed: unknown[] | null = null;
-      if (dataset.length > 0 && dataset[0][3] === null) {
+      if (dataset.length > 0 && dataset[0][5] === null) {
         const kind = ranWithKind ? "value_kind" : "NULL";
         const clause = sourceDropped ? withoutSource(seedWhere) : seedWhere;
         const seedResult = await queryClient.exec(
-          `SELECT ts, value_str, ${kind} as value_kind, ts as held_ts FROM signalk_str WHERE ${clause} LIMIT -1`,
+          `SELECT ts, value_str, ${kind} as value_kind, value_str as held_str, ${kind} as held_kind, ts as held_ts FROM signalk_str WHERE ${clause} LIMIT -1`,
         );
         seed = seedResult.dataset[0] ?? null;
       }
       dataset = holdThroughEmptyBuckets(dataset, seed, holdMs, (row, held) => [
         row[0],
-        held[1],
-        held[2],
+        held[3],
+        held[4],
+        held[3],
+        held[4],
         null,
       ]);
     }
@@ -728,9 +774,11 @@ export function createHistoryProviderV2(
     const expandBySource =
       sourcePolicyAllEnabled && query.sourcePolicy === "all";
 
-    // Checked before any query runs, so a bad window fails the request whole
-    // instead of after the columns ahead of it were already read.
+    // Checked before any query runs, so a bad method or window fails the
+    // request whole instead of after the columns ahead of it were already
+    // read. An unknown method used to run as average under its own name.
     for (const spec of query.pathSpecs) {
+      checkAggregate(spec);
       if (isMovingAverage(spec.aggregate)) movingAverageWindow(spec);
     }
 
@@ -827,12 +875,10 @@ export function createHistoryProviderV2(
     // run at twice the ceiling.
     const sampledSpecs = columns.length;
     // navigation.position is served by its own table and never falls back;
-    // a moving average and middle_index have no text to fall back to.
+    // a moving average has no text to fall back to.
     const fallbackCapableSpecs = columns.filter(
       (spec) =>
-        spec.path !== "navigation.position" &&
-        !isMovingAverage(spec.aggregate) &&
-        spec.aggregate !== "middle_index",
+        spec.path !== "navigation.position" && !isMovingAverage(spec.aggregate),
     ).length;
 
     if (sampledSpecs > 0 && query.resolution && query.resolution > 0) {
@@ -962,9 +1008,28 @@ export function createHistoryProviderV2(
         continue;
       }
 
+      // Non-numeric paths (strings, and booleans stored as "true"/"false")
+      // live in signalk_str, which the numeric queries never touch, so a
+      // column the numeric table held nothing for is read from there.
+      const readText = async (pick: TextPick) => {
+        const strResult = await readStringRows(
+          where,
+          range,
+          pick,
+          query.resolution,
+          seedWhere,
+        );
+        if (strResult.sourceDropped) {
+          // The rows came back unfiltered because signalk_str has no `source`
+          // column. They are every source's rows, so the column must stop
+          // claiming to be one source's — labelling unfiltered data with a
+          // $source would be a lie the caller cannot detect.
+          delete valuesList[specIndex].$source;
+        }
+        columnData.set(specIndex, strResult.rows);
+      };
+
       if (spec.aggregate === "middle_index") {
-        // A text path has rows in signalk_str only; this reads the numeric
-        // table and leaves the column empty for one, like a moving average.
         const result = await queryClient.exec(
           middleRowSql(table, "value", where, range, query.resolution),
         );
@@ -972,7 +1037,11 @@ export function createHistoryProviderV2(
           r[0] as string,
           r[1],
         ]);
-        columnData.set(specIndex, rows);
+        if (rows.some(([, value]) => value !== null)) {
+          columnData.set(specIndex, rows);
+        } else {
+          await readText("middle_index");
+        }
         continue;
       }
 
@@ -1000,37 +1069,20 @@ export function createHistoryProviderV2(
           : row[1],
       ]);
 
-      // Non-numeric paths (strings, and booleans stored as "true"/"false")
-      // live in signalk_str, which this query never touches — they used to
-      // come back empty even though getPaths lists them. Fall back to the
-      // string table when the numeric one held nothing for this path.
       // Emptiness is judged on VALUES, not row count: a SAMPLE BY with
       // FILL(NULL) fabricates a row per bucket, so an all-null result is
       // still "no numeric data here". Not for an angular mean, though: its
       // null is a bucket whose samples cancelled, and the string table
       // holds no angles to fall back to.
       if (!angularMean && !rows.some(([, value]) => value !== null)) {
-        // Report the aggregate that was actually applied. Downsampled string
-        // rows always use last() — averaging text is meaningless — so leaving
-        // the caller's requested method in the response would label the
-        // series with an aggregation that never ran.
+        // first keeps its meaning on text; every aggregate that would compute
+        // a value takes last. Report the one actually applied, so the column
+        // never names an aggregation that did not run.
+        const pick: TextPick = spec.aggregate === "first" ? "first" : "last";
         if (query.resolution && query.resolution > 0) {
-          valuesList[specIndex].method = "last";
+          valuesList[specIndex].method = pick;
         }
-        const strResult = await readStringRows(
-          where,
-          range,
-          query.resolution,
-          seedWhere,
-        );
-        if (strResult.sourceDropped) {
-          // The rows came back unfiltered because signalk_str has no `source`
-          // column. They are every source's rows, so the column must stop
-          // claiming to be one source's — labelling unfiltered data with a
-          // $source would be a lie the caller cannot detect.
-          delete valuesList[specIndex].$source;
-        }
-        columnData.set(specIndex, strResult.rows);
+        await readText(pick);
         continue;
       }
 
