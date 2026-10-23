@@ -1,0 +1,51 @@
+name: QuestDB live
+
+# The unit suites fake QuestDB's /exec endpoint, so SQL that QuestDB itself
+# rejects passes them. This runs the history providers against a real
+# QuestDB: the image the plugin's managed container pulls by default.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-24.04
+    services:
+      questdb:
+        image: questdb/questdb:latest
+        ports:
+          - 9000:9000
+          - 9009:9009
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - run: npm install
+
+      - run: npx tsc
+
+      - name: Wait for QuestDB
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:9000/exec?query=SELECT%201" > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::QuestDB did not answer on port 9000"
+          exit 1
+
+      - name: Live suite
+        env:
+          QUESTDB_URL: http://127.0.0.1:9000
+        run: node --test dist/test/history-live.test.js
