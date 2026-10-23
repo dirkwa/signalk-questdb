@@ -34,7 +34,7 @@ jobs:
 
       - run: npm install
 
-      - run: npx tsc
+      - run: npm run build:all
 
       - name: Wait for QuestDB
         run: |
