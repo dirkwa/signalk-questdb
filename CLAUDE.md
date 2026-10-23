@@ -64,7 +64,7 @@ Their wire shapes live in `src/api-contract.ts` and are shared by both surfaces:
 
 `src/test/` contains `node:test` suites for ILP encoding, time range parsing, query building, and v2 history. They run against the **compiled** JS in `dist/test/`, so always build before testing.
 
-`src/test/history-live.test.ts` runs the v2 provider against a real QuestDB and is skipped unless `QUESTDB_URL` is set; the `QuestDB live` workflow runs it against the `questdb/questdb:latest` image. It drops the plugin's tables when it finishes and refuses an instance whose tables hold rows, so point it only at a throwaway QuestDB; the file's header says how to start one.
+`src/test/history-live.test.ts` runs the v2 provider against a real QuestDB. It drops the plugin's tables, so run it only against a throwaway instance; its header says how.
 
 ## Conventions
 

@@ -51,12 +51,13 @@ describe(
     const url = new URL(QUESTDB_URL ?? "http://127.0.0.1:9000");
     const client = new QueryClient(url.hostname, Number(url.port || 9000));
 
-    async function rowCount(table: string): Promise<number> {
+    /** The table's row count, or null when it does not exist. */
+    async function rowCount(table: string): Promise<number | null> {
       try {
         const result = await client.exec(`SELECT count() FROM ${table}`);
         return Number(result.dataset[0][0]);
       } catch (err) {
-        if (/does not exist/.test(String(err))) return 0;
+        if (/does not exist/.test(String(err))) return null;
         throw err;
       }
     }
@@ -65,23 +66,22 @@ describe(
       const deadline = Date.now() + APPLY_TIMEOUT_MS;
       let count = 0;
       while (Date.now() < deadline) {
-        count = await rowCount(table);
+        count = (await rowCount(table)) ?? 0;
         if (count >= expected) return;
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
       assert.fail(`${table}: ${count} of ${expected} rows after apply`);
     }
 
-    // Set once the tables are known to hold nothing of anyone else's, so a
-    // refused instance keeps its tables: `after` runs even when `before`
-    // throws.
+    // Set once none of the tables exists, so the suite drops only tables it
+    // created: `after` runs even when `before` throws.
     let ownsTables = false;
 
     before(async () => {
       for (const table of TABLES) {
-        if ((await rowCount(table)) > 0) {
+        if ((await rowCount(table)) !== null) {
           throw new Error(
-            `${table} already holds rows; point QUESTDB_URL at a throwaway instance`,
+            `${table} already exists; point QUESTDB_URL at a throwaway instance`,
           );
         }
       }
@@ -89,7 +89,19 @@ describe(
       await client.ensureTables();
 
       const writer = new ILPWriter(url.hostname, ILP_PORT);
-      await writer.connect();
+      try {
+        await writer.connect();
+        writeFixtures(writer);
+      } finally {
+        await writer.disconnect();
+      }
+
+      await waitForRows("signalk", 6);
+      await waitForRows("signalk_str", 3);
+      await waitForRows("signalk_position", 2);
+    });
+
+    function writeFixtures(writer: ILPWriter): void {
       const sog = "navigation.speedOverGround";
       // Bucket 0: 2, 4, 9 — bucket 1: 6 — bucket 2: empty.
       writer.write(sog, "self", 2, at(10), "gps.main");
@@ -120,12 +132,7 @@ describe(
         at(40),
         "gps.main",
       );
-      await writer.disconnect();
-
-      await waitForRows("signalk", 6);
-      await waitForRows("signalk_str", 3);
-      await waitForRows("signalk_position", 2);
-    });
+    }
 
     after(async () => {
       if (!ownsTables) return;

@@ -25,6 +25,8 @@ jobs:
           - 9009:9009
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
