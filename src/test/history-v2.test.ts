@@ -3039,6 +3039,23 @@ describe("history-v2 archive", () => {
     );
   });
 
+  it("counts the archive's grid in the bucket budget", async () => {
+    // 400,000 one-second buckets: a numeric path budgets two grids (its own
+    // and the text fallback's), which fits the million, and a third for the
+    // archive, which does not.
+    const ask = (from: string) =>
+      merged([], [], []).getValues({
+        ...request(
+          from,
+          new Date(Date.parse(from) + 400_000_000).toISOString(),
+          "environment.depth.belowTransducer",
+        ),
+        resolution: 1,
+      });
+    await assert.rejects(ask("2024-06-01T00:00:00Z"), /1200000 sample buckets/);
+    await ask("2025-06-01T00:00:00Z");
+  });
+
   it("still reads the union for middle_index, which needs one order", async () => {
     const captured: CapturedQuery[] = [];
     await valuesOf(

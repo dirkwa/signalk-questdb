@@ -588,23 +588,22 @@ function positionColumns(pick: "first" | "last"): BucketColumns {
 
 /**
  * The rows of two reads ordered by time (column 0), paired where both have
- * the same time and in time order throughout.
+ * the same time and in time order throughout. Yielded rather than collected,
+ * so a merge holds the two reads and its result, not a third copy.
  */
-function pairByTime(
+function* pairByTime(
   own: unknown[][],
   kept: unknown[][],
-): [unknown[] | null, unknown[] | null][] {
-  const pairs: [unknown[] | null, unknown[] | null][] = [];
+): Generator<[unknown[] | null, unknown[] | null]> {
   let i = 0;
   let j = 0;
   while (i < own.length || j < kept.length) {
     const a = i < own.length ? String(own[i][0]) : null;
     const b = j < kept.length ? String(kept[j][0]) : null;
-    if (a !== null && (b === null || a < b)) pairs.push([own[i++], null]);
-    else if (a === null || b! < a) pairs.push([null, kept[j++]]);
-    else pairs.push([own[i++], kept[j++]]);
+    if (a !== null && (b === null || a < b)) yield [own[i++], null];
+    else if (a === null || b! < a) yield [null, kept[j++]];
+    else yield [own[i++], kept[j++]];
   }
-  return pairs;
 }
 
 export function createHistoryProviderV2(
@@ -679,7 +678,7 @@ export function createHistoryProviderV2(
       ).dataset;
     const own = await read(base);
     const kept = await read(ARCHIVE_TABLES[base]);
-    return pairByTime(own, kept).map((pair) => {
+    return Array.from(pairByTime(own, kept), (pair) => {
       const filled = pair.filter(
         (row): row is unknown[] => row !== null && Number(row[1]) > 0,
       );
@@ -719,9 +718,12 @@ export function createHistoryProviderV2(
     const own = await read(base);
     if (!archive.covers(base, range.from, range.to)) return own;
     const kept = await read(ARCHIVE_TABLES[base]);
-    return pairByTime(own, kept)
-      .flatMap((pair) => pair.filter((row) => row !== null))
-      .slice(0, RAW_LIMIT);
+    const rows: unknown[][] = [];
+    for (const pair of pairByTime(own, kept)) {
+      rows.push(...pair.filter((row) => row !== null));
+      if (rows.length >= RAW_LIMIT) break;
+    }
+    return rows.slice(0, RAW_LIMIT);
   }
 
   /** What the numeric seed is read from: the window `seedRangeWhere` names. */
@@ -1122,13 +1124,26 @@ export function createHistoryProviderV2(
       (spec) =>
         spec.path !== "navigation.position" && !isMovingAverage(spec.aggregate),
     ).length;
+    // A column the archive covers costs one more: readSampled() samples the
+    // base table and the archive each on the whole grid. middle_index reads
+    // their union in one query.
+    const archivedSpecs = columns.filter(
+      (spec) =>
+        spec.aggregate !== "middle_index" &&
+        archive.covers(
+          spec.path === "navigation.position" ? "signalk_position" : "signalk",
+          range.from,
+          range.to,
+        ),
+    ).length;
 
     if (sampledSpecs > 0 && query.resolution && query.resolution > 0) {
       const rangeSec = (Date.parse(range.to) - Date.parse(range.from)) / 1000;
       const bucketsPerSeries = Math.ceil(
         rangeSec / effectiveResolution(query.resolution),
       );
-      const worstCaseQueries = sampledSpecs + fallbackCapableSpecs;
+      const worstCaseQueries =
+        sampledSpecs + fallbackCapableSpecs + archivedSpecs;
       const buckets = bucketsPerSeries * worstCaseQueries;
       if (buckets > MAX_SAMPLE_BUCKETS) {
         throw new Error(
@@ -1162,9 +1177,11 @@ export function createHistoryProviderV2(
       const isPosition = spec.path === "navigation.position";
       const base = isPosition ? "signalk_position" : "signalk";
       // A middle row needs both tables' rows in one order, so middle_index
-      // still reads their union. Every other read goes through readSampled()
-      // or readRaw().
-      const table = readFrom(base, archive.covers(base, range.from, range.to));
+      // reads their union, as the numeric seed does over its short window.
+      // Over a long range the archive covers that still sorts every row in
+      // it. Every other read goes through readSampled() or readRaw().
+      const union = () =>
+        readFrom(base, archive.covers(base, range.from, range.to));
 
       if (isPosition) {
         const where = buildRangeWhere(range, safeContext) + sourceWhere;
@@ -1182,7 +1199,7 @@ export function createHistoryProviderV2(
         if (posAgg === "middle_index") {
           dataset = (
             await queryClient.exec(
-              middleRowSql(table, "lat, lon", where, range, query.resolution),
+              middleRowSql(union(), "lat, lon", where, range, query.resolution),
             )
           ).dataset;
         } else if (query.resolution && query.resolution > 0) {
@@ -1284,7 +1301,7 @@ export function createHistoryProviderV2(
 
       if (spec.aggregate === "middle_index") {
         const result = await queryClient.exec(
-          middleRowSql(table, "value", where, range, query.resolution),
+          middleRowSql(union(), "value", where, range, query.resolution),
         );
         const rows: [string, unknown][] = result.dataset.map((r) => [
           r[0] as string,
