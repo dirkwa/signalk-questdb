@@ -22,6 +22,7 @@ import {
   ARCHIVE_TABLES,
   NO_ARCHIVE,
   readFrom,
+  type ArchivedTable,
   type ArchiveReader,
 } from "./archive.js";
 
@@ -410,6 +411,9 @@ function normalizeContext(context: string, selfContext: string): string {
 // sane chart while keeping the worst case bounded.
 const MAX_SAMPLE_BUCKETS = 1_000_000;
 
+// The rows a read without a resolution returns at most.
+const RAW_LIMIT = 10_000;
+
 // Upper bound on columns ONE path may expand into under sourcePolicy=all.
 // The bucket cap above only applies to requests that named a resolution, so
 // these are the only things bounding an unresolved expansion.
@@ -448,6 +452,161 @@ function sampleBy(range: ResolvedRange, resolution: number): string {
   return `SAMPLE BY ${effectiveResolution(resolution)}s FROM '${from}' TO '${to}' FILL(NULL)`;
 }
 
+/**
+ * A group of a sampled bucket's columns: `sql` is how one table selects
+ * them. Where the archive covers the range, each table selects `parts`
+ * instead, and `merge` turns the parts of the tables that had rows in the
+ * bucket (one or both, in table order) into the same `width` columns.
+ */
+interface BucketColumns {
+  sql: string;
+  parts: string[];
+  width: number;
+  merge(rows: unknown[][]): unknown[];
+}
+
+const numbers = (values: unknown[]): number[] =>
+  values.filter((v): v is number => typeof v === "number");
+
+const total = (values: unknown[]): number =>
+  numbers(values).reduce((a, b) => a + b, 0);
+
+/** The least or greatest number, or null where there is none, as in SQL. */
+function extreme(values: unknown[], pick: "min" | "max"): number | null {
+  const found = numbers(values);
+  return found.length === 0 ? null : Math[pick](...found);
+}
+
+/**
+ * The row whose time (part `at`) is earliest, or latest. QuestDB writes
+ * every timestamp in one fixed-width ISO form, so the strings compare in
+ * time order.
+ */
+function byTime(rows: unknown[][], at: number, latest: boolean): unknown[] {
+  return rows.reduce((best, row) => {
+    const [a, b] = [String(row[at]), String(best[at])];
+    return (latest ? a > b : a < b) ? row : best;
+  });
+}
+
+/** A numeric bucket's `method` value, as aggregateToSql() computes it. */
+function valueColumns(method: AggregateMethod): BucketColumns {
+  const sql = `${aggregateToSql(method)} as agg_value`;
+  switch (method) {
+    case "min":
+    case "max":
+      return {
+        sql,
+        parts: [`${method}(value)`],
+        width: 1,
+        merge: (rows) => [
+          extreme(
+            rows.map((r) => r[0]),
+            method,
+          ),
+        ],
+      };
+    case "first":
+    case "last":
+      return {
+        sql,
+        parts: [`${method}(value)`, method === "first" ? "min(ts)" : "max(ts)"],
+        width: 1,
+        merge: (rows) => [byTime(rows, 1, method === "last")[0]],
+      };
+    case "mid":
+      return {
+        sql,
+        parts: ["min(value)", "max(value)"],
+        width: 1,
+        merge: (rows) => {
+          const low = extreme(
+            rows.map((r) => r[0]),
+            "min",
+          );
+          const high = extreme(
+            rows.map((r) => r[1]),
+            "max",
+          );
+          return [low === null || high === null ? null : (low + high) / 2];
+        },
+      };
+    default: {
+      // A mean of the two means would weigh a bucket's few archived rows
+      // as much as its many recorded ones.
+      return {
+        sql,
+        parts: ["sum(value)", "count(value)"],
+        width: 1,
+        merge: (rows) => {
+          const count = total(rows.map((r) => r[1]));
+          return [count === 0 ? null : total(rows.map((r) => r[0])) / count];
+        },
+      };
+    }
+  }
+}
+
+/** ANGULAR_BUCKET_SQL's mean angle and floor, summed across the tables. */
+const ANGULAR_COLUMNS: BucketColumns = {
+  sql: ANGULAR_BUCKET_SQL,
+  parts: ["sum(sin(value))", "sum(cos(value))", "count(value)", "min(value)"],
+  width: 2,
+  merge: (rows) => {
+    const column = (i: number) => rows.map((r) => r[i]);
+    const count = total(column(2));
+    if (count === 0) return [null, null];
+    const [sin, cos] = [total(column(0)) / count, total(column(1)) / count];
+    return [
+      Math.hypot(sin, cos) < NO_DIRECTION ? null : Math.atan2(sin, cos),
+      extreme(column(3), "min"),
+    ];
+  },
+};
+
+/** HELD_SQL's last sample and its time, from the table that took it last. */
+const HELD_COLUMNS: BucketColumns = {
+  sql: HELD_SQL,
+  parts: ["last(value)", "last(ts)"],
+  width: 2,
+  merge: (rows) => byTime(rows, 1, true),
+};
+
+/** A position bucket's `pick` fix, as one lat/lon pair from one table. */
+function positionColumns(pick: "first" | "last"): BucketColumns {
+  return {
+    sql: `${pick}(lat) as lat, ${pick}(lon) as lon`,
+    parts: [
+      `${pick}(lat)`,
+      `${pick}(lon)`,
+      pick === "first" ? "min(ts)" : "max(ts)",
+    ],
+    width: 2,
+    merge: (rows) => byTime(rows, 2, pick === "last").slice(0, 2),
+  };
+}
+
+/**
+ * The rows of two reads ordered by time (column 0), paired where both have
+ * the same time and in time order throughout.
+ */
+function pairByTime(
+  own: unknown[][],
+  kept: unknown[][],
+): [unknown[] | null, unknown[] | null][] {
+  const pairs: [unknown[] | null, unknown[] | null][] = [];
+  let i = 0;
+  let j = 0;
+  while (i < own.length || j < kept.length) {
+    const a = i < own.length ? String(own[i][0]) : null;
+    const b = j < kept.length ? String(kept[j][0]) : null;
+    if (a !== null && (b === null || a < b)) pairs.push([own[i++], null]);
+    else if (a === null || b! < a) pairs.push([null, kept[j++]]);
+    else pairs.push([own[i++], kept[j++]]);
+  }
+  return pairs;
+}
+
 export function createHistoryProviderV2(
   queryClient: QueryClient,
   selfContext: string,
@@ -480,6 +639,89 @@ export function createHistoryProviderV2(
     const from = validateTimestamp(range.from);
     const since = new Date(Date.parse(from) - holdMs).toISOString();
     return `ts >= '${since}' AND ts < '${from}' AND context = '${safeContext}'`;
+  }
+
+  /**
+   * `base` sampled over the range in `groups`' columns, one row a bucket.
+   *
+   * Where the archive covers the range, each table is sampled on its own
+   * and the two grids merged here. QuestDB samples their union only after
+   * sorting every row in range by time: the tracks plugin's history import
+   * asks once for everything since 1970, and that sort of 5.5 M own
+   * positions went past QuestDB's memory limit. Each table alone is sampled
+   * in the order it is stored, and the merge holds two grids of buckets.
+   */
+  async function readSampled(
+    base: ArchivedTable,
+    where: string,
+    range: ResolvedRange,
+    resolution: number,
+    groups: BucketColumns[],
+  ): Promise<unknown[][]> {
+    const grid = sampleBy(range, resolution);
+    if (!archive.covers(base, range.from, range.to)) {
+      const columns = groups.map((group) => group.sql).join(", ");
+      const result = await queryClient.exec(
+        `SELECT ts, ${columns} FROM ${base} WHERE ${where} ${grid} ORDER BY ts`,
+      );
+      return result.dataset;
+    }
+    // Aliased, since two groups may select the same aggregate, and led by
+    // the bucket's row count, which FILL(NULL) leaves null where it is 0.
+    const parts = ["count()", ...groups.flatMap((group) => group.parts)]
+      .map((part, i) => `${part} p${i}`)
+      .join(", ");
+    const read = async (table: string) =>
+      (
+        await queryClient.exec(
+          `SELECT ts, ${parts} FROM ${table} WHERE ${where} ${grid} ORDER BY ts`,
+        )
+      ).dataset;
+    const own = await read(base);
+    const kept = await read(ARCHIVE_TABLES[base]);
+    return pairByTime(own, kept).map((pair) => {
+      const filled = pair.filter(
+        (row): row is unknown[] => row !== null && Number(row[1]) > 0,
+      );
+      const row: unknown[] = [(pair[0] ?? pair[1])![0]];
+      let at = 2;
+      for (const group of groups) {
+        row.push(
+          ...(filled.length === 0
+            ? Array<unknown>(group.width).fill(null)
+            : group.merge(
+                filled.map((r) => r.slice(at, at + group.parts.length)),
+              )),
+        );
+        at += group.parts.length;
+      }
+      return row;
+    });
+  }
+
+  /**
+   * The first rows of `base` in the range, in time order, under the LIMIT
+   * every raw read has: from each table on its own and merged here where the
+   * archive covers the range, for the reason readSampled() gives.
+   */
+  async function readRaw(
+    base: ArchivedTable,
+    columns: string,
+    where: string,
+    range: ResolvedRange,
+  ): Promise<unknown[][]> {
+    const read = async (table: string) =>
+      (
+        await queryClient.exec(
+          `SELECT ts, ${columns} FROM ${table} WHERE ${where} ORDER BY ts LIMIT ${RAW_LIMIT}`,
+        )
+      ).dataset;
+    const own = await read(base);
+    if (!archive.covers(base, range.from, range.to)) return own;
+    const kept = await read(ARCHIVE_TABLES[base]);
+    return pairByTime(own, kept)
+      .flatMap((pair) => pair.filter((row) => row !== null))
+      .slice(0, RAW_LIMIT);
   }
 
   /** What the numeric seed is read from: the window `seedRangeWhere` names. */
@@ -700,7 +942,7 @@ export function createHistoryProviderV2(
       // what an empty bucket after it holds (see holdThroughEmptyBuckets).
       return sampled
         ? `SELECT ts, ${pick}(value_str) as value_str, ${kindOf(pick)} as value_kind, last(value_str) as held_str, ${kindOf("last")} as held_kind, last(ts) as held_ts FROM signalk_str WHERE ${clause} ${sampleBy(range, resolution)} ORDER BY ts`
-        : `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${clause} ORDER BY ts LIMIT 10000`;
+        : `SELECT ts, value_str, ${kind} as value_kind FROM signalk_str WHERE ${clause} ORDER BY ts LIMIT ${RAW_LIMIT}`;
     };
     // A read racing ensureTables()'s migration — or an external QuestDB the
     // plugin does not own — must degrade, not fail the request. Two columns
@@ -919,6 +1161,9 @@ export function createHistoryProviderV2(
       const sourceWhere = buildSourceWhere(spec);
       const isPosition = spec.path === "navigation.position";
       const base = isPosition ? "signalk_position" : "signalk";
+      // A middle row needs both tables' rows in one order, so middle_index
+      // still reads their union. Every other read goes through readSampled()
+      // or readRaw().
       const table = readFrom(base, archive.covers(base, range.from, range.to));
 
       if (isPosition) {
@@ -933,19 +1178,24 @@ export function createHistoryProviderV2(
             ? spec.aggregate
             : "first";
         if (posAgg !== spec.aggregate) valuesList[specIndex].method = "first";
-        let sql: string;
+        let dataset: unknown[][];
         if (posAgg === "middle_index") {
-          sql = middleRowSql(table, "lat, lon", where, range, query.resolution);
+          dataset = (
+            await queryClient.exec(
+              middleRowSql(table, "lat, lon", where, range, query.resolution),
+            )
+          ).dataset;
         } else if (query.resolution && query.resolution > 0) {
-          sql = `SELECT ts, ${posAgg}(lat) as lat, ${posAgg}(lon) as lon FROM ${table} WHERE ${where} ${sampleBy(range, query.resolution)} ORDER BY ts`;
+          dataset = await readSampled(base, where, range, query.resolution, [
+            positionColumns(posAgg),
+          ]);
         } else {
-          sql = `SELECT ts, lat, lon FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
+          dataset = await readRaw(base, "lat, lon", where, range);
         }
-        const result = await queryClient.exec(sql);
         // A position goes out as a `[longitude, latitude]` pair — GeoJSON
         // order, as the History API's OpenAPI schema defines and the other
         // providers emit — not as the data model's `{latitude, longitude}`.
-        const rows: [string, unknown][] = result.dataset.map((row) => [
+        const rows: [string, unknown][] = dataset.map((row) => [
           row[0] as string,
           row[1] !== null && row[2] !== null ? [row[2], row[1]] : null,
         ]);
@@ -968,17 +1218,20 @@ export function createHistoryProviderV2(
         // gap ages values out instead of stretching the window across it.
         const window = movingAverageWindow(spec);
         const angular = isAngular(unitsOf(spec.path, requestedContext));
-        const bucket = angular ? ANGULAR_BUCKET_SQL : "avg(value) as agg_value";
+        const bucket = angular ? ANGULAR_COLUMNS : valueColumns("average");
         const sampled = !!query.resolution && query.resolution > 0;
-        const sql = sampled
-          ? `SELECT ts, ${bucket}, ${HELD_SQL} FROM ${table} WHERE ${where} ${sampleBy(range, query.resolution!)} ORDER BY ts`
-          : `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
-        const result = await queryClient.exec(sql);
         // Held before averaging: an unchanged value is still a sample of
         // the window, not a hole in it.
         const dataset = sampled
-          ? await holdNumericBuckets(result.dataset, seedWhere, seedFrom)
-          : result.dataset;
+          ? await holdNumericBuckets(
+              await readSampled(base, where, range, query.resolution!, [
+                bucket,
+                HELD_COLUMNS,
+              ]),
+              seedWhere,
+              seedFrom,
+            )
+          : await readRaw(base, "value", where, range);
         // An angular series keeps one convention throughout: [0, 2π) unless
         // a sample (or a bucket's lowest sample) was negative.
         const floors = dataset.map((r) =>
@@ -1050,18 +1303,20 @@ export function createHistoryProviderV2(
       const angularMean =
         spec.aggregate === "average" &&
         isAngular(unitsOf(spec.path, requestedContext));
-      const aggExpr = angularMean
-        ? ANGULAR_BUCKET_SQL
-        : `${aggregateToSql(spec.aggregate)} as agg_value`;
+      const value = angularMean
+        ? ANGULAR_COLUMNS
+        : valueColumns(spec.aggregate);
       const sampled = !!query.resolution && query.resolution > 0;
-      const sql = sampled
-        ? `SELECT ts, ${aggExpr}, ${HELD_SQL} FROM ${table} WHERE ${where} ${sampleBy(range, query.resolution!)} ORDER BY ts`
-        : `SELECT ts, value FROM ${table} WHERE ${where} ORDER BY ts LIMIT 10000`;
-
-      const result = await queryClient.exec(sql);
       const dataset = sampled
-        ? await holdNumericBuckets(result.dataset, seedWhere, seedFrom)
-        : result.dataset;
+        ? await holdNumericBuckets(
+            await readSampled(base, where, range, query.resolution!, [
+              value,
+              HELD_COLUMNS,
+            ]),
+            seedWhere,
+            seedFrom,
+          )
+        : await readRaw(base, "value", where, range);
       const rows: [string, unknown][] = dataset.map((row) => [
         row[0] as string,
         angularMean && row.length > 2 && row[1] !== null
