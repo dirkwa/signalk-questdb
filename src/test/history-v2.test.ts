@@ -3039,21 +3039,55 @@ describe("history-v2 archive", () => {
     );
   });
 
-  it("counts the archive's grid in the bucket budget", async () => {
-    // 400,000 one-second buckets: a numeric path budgets two grids (its own
-    // and the text fallback's), which fits the million, and a third for the
-    // archive, which does not.
-    const ask = (from: string) =>
+  it("counts the archive's grid in the bucket budget, up to the cap", async () => {
+    // One-second buckets of a numeric path: its own grid, the text
+    // fallback's and, where the archive covers the range, the archive's.
+    const ask = (from: string, buckets: number) =>
       merged([], [], []).getValues({
         ...request(
           from,
-          new Date(Date.parse(from) + 400_000_000).toISOString(),
+          new Date(Date.parse(from) + buckets * 1000).toISOString(),
           "environment.depth.belowTransducer",
         ),
         resolution: 1,
       });
-    await assert.rejects(ask("2024-06-01T00:00:00Z"), /1200000 sample buckets/);
-    await ask("2025-06-01T00:00:00Z");
+    await ask("2024-06-01T00:00:00Z", 333_333);
+    await assert.rejects(
+      ask("2024-06-01T00:00:00Z", 333_334),
+      /up to 1000002 sample buckets/,
+    );
+    await ask("2025-06-01T00:00:00Z", 500_000);
+  });
+
+  it("leaves the archive out of another vessel's reads, which it never holds", async () => {
+    const other = "vessels.urn:mrn:imo:mmsi:987654321";
+    for (const aggregate of ["first", "middle_index"]) {
+      const captured: CapturedQuery[] = [];
+      await merged(captured, [], []).getValues({
+        ...request(
+          "2024-06-01T00:00:00Z",
+          "2024-06-02T00:00:00Z",
+          "navigation.position",
+        ),
+        context: other,
+        pathSpecs: [{ path: "navigation.position", aggregate, parameter: [] }],
+      });
+      assert.equal(captured.length, 1, aggregate);
+      assert.doesNotMatch(captured[0].sql, /_archive/, aggregate);
+    }
+    // Still within the budget at two grids, which the archive would make
+    // three.
+    await merged([], [], []).getValues({
+      ...request(
+        "2024-06-01T00:00:00Z",
+        new Date(
+          Date.parse("2024-06-01T00:00:00Z") + 400_000_000,
+        ).toISOString(),
+        "environment.depth.belowTransducer",
+      ),
+      context: other,
+      resolution: 1,
+    });
   });
 
   it("still reads the union for middle_index, which needs one order", async () => {

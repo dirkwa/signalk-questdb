@@ -95,10 +95,11 @@ describe(
       } finally {
         await writer.disconnect();
       }
-      // What retention or a GPX import would have kept: speeds 8 and 1.5
-      // beside the recorded bucket 0 and 1 alone in bucket 2, a heading of
-      // 3° beside the recorded 359° and 1°, a fix inside bucket 0 and the
-      // only one of bucket 1. Only the provider given the archive reads them.
+      // What retention or a GPX import would have kept: speeds of 8 and 1.5
+      // beside bucket 0's recorded ones and a speed of 1 alone in bucket 2,
+      // a heading of 3° beside the recorded 359° and 1°, a fix inside bucket
+      // 0 and the only fix of bucket 1. Only the provider given the archive
+      // reads them.
       const kept = (seconds: number, path: string, value: number) =>
         `('${at(seconds).toISOString()}', '${path}', 'self', 'gps.main', ${value})`;
       await client.exec(

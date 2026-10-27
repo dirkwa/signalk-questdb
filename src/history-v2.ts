@@ -643,22 +643,23 @@ export function createHistoryProviderV2(
   /**
    * `base` sampled over the range in `groups`' columns, one row a bucket.
    *
-   * Where the archive covers the range, each table is sampled on its own
-   * and the two grids merged here. QuestDB samples their union only after
-   * sorting every row in range by time: the tracks plugin's history import
-   * asks once for everything since 1970, and that sort of 5.5 M own
-   * positions went past QuestDB's memory limit. Each table alone is sampled
-   * in the order it is stored, and the merge holds two grids of buckets.
+   * With the archive, each table is sampled on its own and the two grids
+   * merged here. QuestDB samples their union only after sorting every row in
+   * range by time: the tracks plugin's history import asks once for
+   * everything since 1970, and that sort of 5.5 M own positions went past
+   * QuestDB's memory limit. Each table alone is sampled in the order it is
+   * stored, and the merge holds the two grids and the merged one.
    */
   async function readSampled(
     base: ArchivedTable,
+    withArchive: boolean,
     where: string,
     range: ResolvedRange,
     resolution: number,
     groups: BucketColumns[],
   ): Promise<unknown[][]> {
     const grid = sampleBy(range, resolution);
-    if (!archive.covers(base, range.from, range.to)) {
+    if (!withArchive) {
       const columns = groups.map((group) => group.sql).join(", ");
       const result = await queryClient.exec(
         `SELECT ts, ${columns} FROM ${base} WHERE ${where} ${grid} ORDER BY ts`,
@@ -700,14 +701,14 @@ export function createHistoryProviderV2(
 
   /**
    * The first rows of `base` in the range, in time order, under the LIMIT
-   * every raw read has: from each table on its own and merged here where the
-   * archive covers the range, for the reason readSampled() gives.
+   * every raw read has: with the archive, from each table on its own and
+   * merged here, for the reason readSampled() gives.
    */
   async function readRaw(
     base: ArchivedTable,
+    withArchive: boolean,
     columns: string,
     where: string,
-    range: ResolvedRange,
   ): Promise<unknown[][]> {
     const read = async (table: string) =>
       (
@@ -716,7 +717,7 @@ export function createHistoryProviderV2(
         )
       ).dataset;
     const own = await read(base);
-    if (!archive.covers(base, range.from, range.to)) return own;
+    if (!withArchive) return own;
     const kept = await read(ARCHIVE_TABLES[base]);
     const rows: unknown[][] = [];
     for (const pair of pairByTime(own, kept)) {
@@ -1029,6 +1030,18 @@ export function createHistoryProviderV2(
     const requestedContext = query.context ?? "vessels.self";
     const storedContext = normalizeContext(requestedContext, selfContext);
     const safeContext = validateIdentifier(storedContext);
+    // Whether each table's reads include its archive. The archive holds only
+    // the own vessel (archive.ts), so another vessel's reads leave it out.
+    // Decided once, so the bucket budget counts the reads that then run even
+    // when a refresh of the archive's spans lands in between.
+    const archived: Record<ArchivedTable, boolean> = {
+      signalk:
+        storedContext === "self" &&
+        archive.covers("signalk", range.from, range.to),
+      signalk_position:
+        storedContext === "self" &&
+        archive.covers("signalk_position", range.from, range.to),
+    };
 
     // Expand each spec into the COLUMNS it will produce. Under
     // sourcePolicy=all a path with no explicit sourceRef becomes one column
@@ -1130,11 +1143,9 @@ export function createHistoryProviderV2(
     const archivedSpecs = columns.filter(
       (spec) =>
         spec.aggregate !== "middle_index" &&
-        archive.covers(
-          spec.path === "navigation.position" ? "signalk_position" : "signalk",
-          range.from,
-          range.to,
-        ),
+        archived[
+          spec.path === "navigation.position" ? "signalk_position" : "signalk"
+        ],
     ).length;
 
     if (sampledSpecs > 0 && query.resolution && query.resolution > 0) {
@@ -1180,8 +1191,7 @@ export function createHistoryProviderV2(
       // reads their union, as the numeric seed does over its short window.
       // Over a long range the archive covers that still sorts every row in
       // it. Every other read goes through readSampled() or readRaw().
-      const union = () =>
-        readFrom(base, archive.covers(base, range.from, range.to));
+      const union = () => readFrom(base, archived[base]);
 
       if (isPosition) {
         const where = buildRangeWhere(range, safeContext) + sourceWhere;
@@ -1203,11 +1213,16 @@ export function createHistoryProviderV2(
             )
           ).dataset;
         } else if (query.resolution && query.resolution > 0) {
-          dataset = await readSampled(base, where, range, query.resolution, [
-            positionColumns(posAgg),
-          ]);
+          dataset = await readSampled(
+            base,
+            archived[base],
+            where,
+            range,
+            query.resolution,
+            [positionColumns(posAgg)],
+          );
         } else {
-          dataset = await readRaw(base, "lat, lon", where, range);
+          dataset = await readRaw(base, archived[base], "lat, lon", where);
         }
         // A position goes out as a `[longitude, latitude]` pair — GeoJSON
         // order, as the History API's OpenAPI schema defines and the other
@@ -1241,14 +1256,18 @@ export function createHistoryProviderV2(
         // the window, not a hole in it.
         const dataset = sampled
           ? await holdNumericBuckets(
-              await readSampled(base, where, range, query.resolution!, [
-                bucket,
-                HELD_COLUMNS,
-              ]),
+              await readSampled(
+                base,
+                archived[base],
+                where,
+                range,
+                query.resolution!,
+                [bucket, HELD_COLUMNS],
+              ),
               seedWhere,
               seedFrom,
             )
-          : await readRaw(base, "value", where, range);
+          : await readRaw(base, archived[base], "value", where);
         // An angular series keeps one convention throughout: [0, 2π) unless
         // a sample (or a bucket's lowest sample) was negative.
         const floors = dataset.map((r) =>
@@ -1326,14 +1345,18 @@ export function createHistoryProviderV2(
       const sampled = !!query.resolution && query.resolution > 0;
       const dataset = sampled
         ? await holdNumericBuckets(
-            await readSampled(base, where, range, query.resolution!, [
-              value,
-              HELD_COLUMNS,
-            ]),
+            await readSampled(
+              base,
+              archived[base],
+              where,
+              range,
+              query.resolution!,
+              [value, HELD_COLUMNS],
+            ),
             seedWhere,
             seedFrom,
           )
-        : await readRaw(base, "value", where, range);
+        : await readRaw(base, archived[base], "value", where);
       const rows: [string, unknown][] = dataset.map((row) => [
         row[0] as string,
         angularMean && row.length > 2 && row[1] !== null
