@@ -3075,6 +3075,40 @@ describe("history-v2 archive", () => {
       assert.equal(captured.length, 1, aggregate);
       assert.doesNotMatch(captured[0].sql, /_archive/, aggregate);
     }
+    // Nor do its hold seed and its source discovery: the base table's first
+    // bucket is empty, so the seed is read, and sourcePolicy=all asks which
+    // sources recorded the path.
+    for (const [context, archived] of [
+      [other, false],
+      ["vessels.self", true],
+    ] as const) {
+      const captured: CapturedQuery[] = [];
+      const own = [[T0, null, null, null]];
+      await createHistoryProviderV2(
+        tables(captured, own, []),
+        SELF_CONTEXT,
+        true,
+        () => {},
+        () => undefined,
+        600_000,
+        archive,
+      ).getValues({
+        ...request(
+          "2024-06-01T00:00:00Z",
+          "2024-06-01T00:01:00Z",
+          "environment.depth.belowTransducer",
+        ),
+        context,
+        sourcePolicy: "all",
+      });
+      const seed = captured.find(({ sql }) => / LIMIT -1$/.test(sql));
+      const sources = captured.find(({ sql }) =>
+        /SELECT DISTINCT source FROM signalk_archive /.test(sql),
+      );
+      assert.ok(seed, `${context}: the seed is read`);
+      assert.equal(/_archive/.test(seed!.sql), archived, `${context}: seed`);
+      assert.equal(sources !== undefined, archived, `${context}: sources`);
+    }
     // Still within the budget at two grids, which the archive would make
     // three.
     await merged([], [], []).getValues({

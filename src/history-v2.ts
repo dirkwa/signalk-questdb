@@ -727,11 +727,14 @@ export function createHistoryProviderV2(
     return rows.slice(0, RAW_LIMIT);
   }
 
-  /** What the numeric seed is read from: the window `seedRangeWhere` names. */
-  function seedSource(range: ResolvedRange): string {
+  /**
+   * What the numeric seed is read from: the window `seedRangeWhere` names,
+   * with the archive only for the own vessel, the only one it holds.
+   */
+  function seedSource(range: ResolvedRange, own: boolean): string {
     const from = validateTimestamp(range.from);
     const since = new Date(Date.parse(from) - holdMs).toISOString();
-    return readFrom("signalk", archive.covers("signalk", since, from));
+    return readFrom("signalk", own && archive.covers("signalk", since, from));
   }
 
   /** The numeric table's last `[value, ts]` before the range, or null. */
@@ -802,6 +805,7 @@ export function createHistoryProviderV2(
     path: string,
     range: ResolvedRange,
     safeContext: string,
+    withArchive: boolean,
   ): Promise<(string | null)[]> {
     const safePath = validateIdentifier(path);
     const rangeWhere = buildRangeWhere(range, safeContext);
@@ -811,7 +815,7 @@ export function createHistoryProviderV2(
     const tables = [
       `SELECT DISTINCT source FROM ${table} WHERE ${rangeWhere}${pathWhere}`,
     ];
-    if (archive.covers(table, range.from, range.to)) {
+    if (withArchive) {
       tables.push(
         `SELECT DISTINCT source FROM ${ARCHIVE_TABLES[table]} WHERE ${rangeWhere}${pathWhere}`,
       );
@@ -1069,7 +1073,14 @@ export function createHistoryProviderV2(
             `the sources explicitly with paths=<path>|<sourceRef>`,
         );
       }
-      const sources = await distinctSources(spec.path, range, safeContext);
+      const sources = await distinctSources(
+        spec.path,
+        range,
+        safeContext,
+        archived[
+          spec.path === "navigation.position" ? "signalk_position" : "signalk"
+        ],
+      );
       if (sources.length === 0) {
         // Nothing recorded in range, or a database with no `source` column:
         // keep the unexpanded column so the caller still gets the series
@@ -1237,7 +1248,7 @@ export function createHistoryProviderV2(
 
       const where = `${buildRangeWhere(range, safeContext)} AND path = '${safePath}'${sourceWhere}`;
       const seedWhere = `${seedRangeWhere(range, safeContext)} AND path = '${safePath}'${sourceWhere}`;
-      const seedFrom = seedSource(range);
+      const seedFrom = seedSource(range, storedContext === "self");
 
       if (isMovingAverage(spec.aggregate)) {
         // The window runs over the series at the requested resolution — one
