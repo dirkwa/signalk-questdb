@@ -18,7 +18,7 @@ import type {
   SourceRef,
   history as HistoryApi,
 } from "@signalk/server-api";
-import { ARCHIVE_TABLES } from "../archive.js";
+import { ARCHIVE_TABLES, ArchiveSpans } from "../archive.js";
 import { createHistoryProviderV2 } from "../history-v2.js";
 import { ILPWriter } from "../ilp-writer.js";
 import { QueryClient } from "../query-client.js";
@@ -95,10 +95,46 @@ describe(
       } finally {
         await writer.disconnect();
       }
+      // What retention or a GPX import would have kept: speeds of 8 and 1.5
+      // beside bucket 0's recorded ones and a speed of 1 alone in bucket 2,
+      // a heading of 3° beside the recorded 359° and 1°, a fix inside bucket
+      // 0 and the only fix of bucket 1. Only the provider given the archive
+      // reads them.
+      const kept = (seconds: number, path: string, value: number) =>
+        `('${at(seconds).toISOString()}', '${path}', 'self', 'gps.main', ${value})`;
+      await client.exec(
+        `INSERT INTO ${ARCHIVE_TABLES.signalk} (ts, path, context, source, value) VALUES ` +
+          [
+            kept(40, "navigation.speedOverGround", 8),
+            kept(55, "navigation.speedOverGround", 1.5),
+            kept(130, "navigation.speedOverGround", 1),
+            kept(30, "navigation.headingTrue", 3 * DEG),
+          ].join(", "),
+      );
+      const archiveWriter = new ILPWriter(url.hostname, ILP_PORT);
+      try {
+        await archiveWriter.connect();
+        for (const [seconds, latitude, longitude] of [
+          [20, 60.15, 24.95],
+          [100, 60.3, 25.1],
+        ]) {
+          archiveWriter.writePositionAtNanos(
+            "self",
+            { latitude, longitude },
+            BigInt(at(seconds).getTime()) * 1_000_000n,
+            "import.gpx",
+            ARCHIVE_TABLES.signalk_position,
+          );
+        }
+      } finally {
+        await archiveWriter.disconnect();
+      }
 
       await waitForRows("signalk", 6);
       await waitForRows("signalk_str", 3);
       await waitForRows("signalk_position", 2);
+      await waitForRows(ARCHIVE_TABLES.signalk_position, 2);
+      await waitForRows(ARCHIVE_TABLES.signalk, 4);
     });
 
     function writeFixtures(writer: ILPWriter): void {
@@ -303,6 +339,93 @@ describe(
         await provider.getContexts(range as HistoryApi.ContextsRequest),
         ["vessels.self"],
       );
+    });
+
+    describe("with the archive", () => {
+      const spans = new ArchiveSpans(client);
+      const archived = createHistoryProviderV2(
+        client,
+        SELF_CONTEXT,
+        false,
+        undefined,
+        (path) => (path === "navigation.headingTrue" ? "rad" : undefined),
+        0,
+        spans,
+      );
+      before(() => spans.refresh());
+      const archivedColumn = async (
+        path: string,
+        aggregate: string,
+        extra: Partial<ValuesArg> = {},
+      ) =>
+        (await archived.getValues(request(path, aggregate, extra))).data.map(
+          (row) => row[1],
+        );
+
+      it("weighs a bucket's average by both tables' rows", async () => {
+        // (2 + 4 + 9 + 8 + 1.5) / 5, then 6 recorded alone, then 1 archived
+        // alone.
+        assert.deepEqual(
+          await archivedColumn("navigation.speedOverGround", "average"),
+          [4.9, 6, 1],
+        );
+      });
+
+      it("takes min, max, mid, first and last over both tables", async () => {
+        const sog = "navigation.speedOverGround";
+        // Bucket 0 is recorded 2, 4, 9 and archived 8, 1.5 (at 55 s, last).
+        for (const [method, expected] of [
+          ["min", [1.5, 6, 1]],
+          ["max", [9, 6, 1]],
+          ["mid", [5.25, 6, 1]],
+          ["first", [2, 6, 1]],
+          ["last", [1.5, 6, 1]],
+        ] as const) {
+          assert.deepEqual(await archivedColumn(sog, method), expected, method);
+        }
+      });
+
+      it("averages an angle over both tables as one vector", async () => {
+        const [mean, ...rest] = await archivedColumn(
+          "navigation.headingTrue",
+          "average",
+        );
+        const angles = [359 * DEG, 1 * DEG, 3 * DEG];
+        const expected = Math.atan2(
+          angles.reduce((sum, a) => sum + Math.sin(a), 0),
+          angles.reduce((sum, a) => sum + Math.cos(a), 0),
+        );
+        assert.ok(
+          Math.abs((mean as number) - expected) < 1e-9,
+          `expected ${expected} rad, got ${mean}`,
+        );
+        assert.deepEqual(rest, [null, null]);
+      });
+
+      it("takes the earlier fix for first and the later for last", async () => {
+        assert.deepEqual(await archivedColumn("navigation.position", "first"), [
+          [24.9, 60.1],
+          [25.1, 60.3],
+          null,
+        ]);
+        assert.deepEqual(await archivedColumn("navigation.position", "last"), [
+          [25.0, 60.2],
+          [25.1, 60.3],
+          null,
+        ]);
+      });
+
+      it("reads raw positions from both tables in time order", async () => {
+        const raw = await archived.getValues(
+          request("navigation.position", "first", { resolution: undefined }),
+        );
+        assert.deepEqual(
+          raw.data.map((row) => row[0]),
+          [10, 20, 40, 100].map((s) =>
+            at(s).toISOString().replace(".000Z", ".000000Z"),
+          ),
+        );
+      });
     });
   },
 );

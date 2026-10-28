@@ -43,7 +43,13 @@ export const NO_ARCHIVE: ArchiveReader = { covers: () => false };
  * The merge has to declare `ts` its designated timestamp again, or SAMPLE BY
  * and LATEST ON reject it, and that declaration is only true because of the
  * ORDER BY. A time filter on the outer query still reaches both tables as an
- * interval scan (verified with EXPLAIN on QuestDB 9.4 and 10.0).
+ * interval scan (verified with EXPLAIN on QuestDB 9.4 and 10.0), but the
+ * ORDER BY then sorts every row in range, so its memory grows with the
+ * range. And SAMPLE BY … FROM … TO … FILL(NULL) over it adds a bucket past
+ * TO that repeats the last one (QuestDB 9.4). The v2 provider's sampled and
+ * raw reads therefore read each table on its own and merge the rows
+ * themselves; this union is for reads that need one order across both
+ * tables, or that a short window bounds.
  */
 export function readFrom(table: ArchivedTable, withArchive: boolean): string {
   if (!withArchive) return table;

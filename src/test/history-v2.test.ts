@@ -2727,34 +2727,414 @@ describe("history-v2 archive", () => {
       pathSpecs: [{ path, aggregate: "first", parameter: [] }],
     }) as any;
 
-  it("reads a covered position range from the base table merged with the archive", async () => {
+  // QuestDB's answers to a merged read: `own` from the base table, `kept`
+  // from its archive, each row the bucket's time, its row count and the
+  // parts readSampled() asked for.
+  const tables = (
+    captured: CapturedQuery[],
+    own: unknown[][],
+    kept: unknown[][],
+  ) =>
+    ({
+      exec: async (sql: string) => {
+        captured.push({ sql });
+        const dataset = /FROM signalk(_position)?_archive WHERE/.test(sql)
+          ? kept
+          : / FROM signalk(_position)? WHERE/.test(sql)
+            ? own
+            : [];
+        return { columns: [], dataset, count: dataset.length, timestamp: 0 };
+      },
+    }) as any;
+  const merged = (
+    captured: CapturedQuery[],
+    own: unknown[][],
+    kept: unknown[][],
+    units?: string,
+  ) =>
+    createHistoryProviderV2(
+      tables(captured, own, kept),
+      SELF_CONTEXT,
+      false,
+      () => {},
+      () => units,
+      0,
+      archive,
+    );
+  const valuesOf = async (
+    p: ReturnType<typeof merged>,
+    path: string,
+    aggregate: string,
+    // null reads the raw rows.
+    resolution: number | null = 60,
+  ) =>
+    (
+      await p.getValues({
+        ...request("2024-06-01T00:00:00Z", "2024-06-01T00:04:00Z", path),
+        resolution: resolution ?? undefined,
+        pathSpecs: [{ path, aggregate, parameter: [] }],
+      })
+    ).data;
+  const T0 = "2024-06-01T00:00:00.000000Z";
+  const T1 = "2024-06-01T00:01:00.000000Z";
+  const T2 = "2024-06-01T00:02:00.000000Z";
+  const T3 = "2024-06-01T00:03:00.000000Z";
+  const at = (bucket: string, seconds: number) =>
+    bucket.replace(
+      ":00.000000Z",
+      `:${String(seconds).padStart(2, "0")}.000000Z`,
+    );
+
+  it("samples a covered range from each table on its own, never their union", async () => {
     const captured: CapturedQuery[] = [];
-    await provider(captured).getValues(
+    await merged(captured, [], []).getValues(
       request(
         "2024-06-01T00:00:00Z",
         "2024-06-02T00:00:00Z",
         "navigation.position",
       ),
     );
+    assert.equal(captured.length, 2);
+    assert.match(captured[0].sql, / FROM signalk_position WHERE ts >= /);
     assert.match(
-      captured[0].sql,
-      /FROM \(\(SELECT ts, context, source, lat, lon FROM signalk_position UNION ALL SELECT ts, context, source, lat, lon FROM signalk_position_archive\) ORDER BY ts\) TIMESTAMP\(ts\) WHERE ts >= /,
+      captured[1].sql,
+      / FROM signalk_position_archive WHERE ts >= /,
     );
-    assert.match(captured[0].sql, /SAMPLE BY 60s/);
+    for (const { sql } of captured) {
+      assert.doesNotMatch(sql, /UNION/);
+      assert.match(
+        sql,
+        /^SELECT ts, count\(\) p0, first\(lat\) p1, first\(lon\) p2, min\(ts\) p3 FROM /,
+      );
+      assert.match(
+        sql,
+        /SAMPLE BY 60s FROM '2024-06-01T00:00:00\.000Z' TO '2024-06-02T00:00:00\.000Z' FILL\(NULL\) ORDER BY ts$/,
+      );
+    }
   });
 
-  it("reads a numeric path through the archive too", async () => {
+  it("samples a covered numeric path from each table on its own too", async () => {
     const captured: CapturedQuery[] = [];
-    await provider(captured).getValues(
+    await merged(captured, [], []).getValues(
       request(
         "2024-06-01T00:00:00Z",
         "2024-06-02T00:00:00Z",
         "environment.depth.belowTransducer",
       ),
     );
+    assert.match(captured[0].sql, / FROM signalk WHERE ts >= /);
+    assert.match(captured[1].sql, / FROM signalk_archive WHERE ts >= /);
+    for (const { sql } of captured.slice(0, 2)) {
+      assert.doesNotMatch(sql, /UNION/);
+      assert.match(
+        sql,
+        /^SELECT ts, count\(\) p0, first\(value\) p1, min\(ts\) p2, last\(value\) p3, last\(ts\) p4 FROM /,
+      );
+    }
+  });
+
+  it("takes each bucket's position from the table that has one, and the earlier fix where both do", async () => {
+    const own = [
+      [T0, 3, 10, 20, at(T0, 5)],
+      [T1, null, null, null, null],
+      [T2, 2, 12, 22, at(T2, 30)],
+      [T3, null, null, null, null],
+    ];
+    const kept = [
+      [T0, null, null, null, null],
+      [T1, 1, 11, 21, at(T1, 40)],
+      [T2, 4, 13, 23, at(T2, 10)],
+      [T3, null, null, null, null],
+    ];
+    const data = await valuesOf(
+      merged([], own, kept),
+      "navigation.position",
+      "first",
+    );
+    assert.deepEqual(data, [
+      [T0, [20, 10]],
+      [T1, [21, 11]],
+      [T2, [23, 13]],
+      [T3, null],
+    ]);
+  });
+
+  it("takes the later fix for last, and never an empty bucket's", async () => {
+    const own = [
+      [T0, 2, 10, 20, at(T0, 50)],
+      [T1, 1, 12, 22, at(T1, 5)],
+      [T2, null, null, null, null],
+    ];
+    const kept = [
+      [T0, 1, 11, 21, at(T0, 20)],
+      [T1, null, null, null, null],
+      [T2, 1, 13, 23, at(T2, 5)],
+    ];
+    const data = await valuesOf(
+      merged([], own, kept),
+      "navigation.position",
+      "last",
+    );
+    assert.deepEqual(data, [
+      [T0, [20, 10]],
+      [T1, [22, 12]],
+      [T2, [23, 13]],
+    ]);
+  });
+
+  it("weighs a merged average by each table's row count", async () => {
+    // [ts, count, sum(value), count(value), last(value), last(ts)]
+    const own = [[T0, 1, 2, 1, 2, at(T0, 1)]];
+    const kept = [[T0, 3, 30, 3, 10, at(T0, 2)]];
+    const data = await valuesOf(
+      merged([], own, kept),
+      "environment.depth.belowTransducer",
+      "average",
+    );
+    // (2 + 30) / 4, not the mean of 2 and 10.
+    assert.deepEqual(data, [[T0, 8]]);
+  });
+
+  it("merges min, max, mid, first and last the way one table computes them", async () => {
+    const depth = "environment.depth.belowTransducer";
+    const held = (s: number) => [7, at(T0, s)];
+    const cases: [string, unknown[][], unknown[][], number][] = [
+      ["min", [[T0, 2, 5, ...held(1)]], [[T0, 2, 3, ...held(2)]], 3],
+      ["max", [[T0, 2, 5, ...held(1)]], [[T0, 2, 3, ...held(2)]], 5],
+      // (lowest of 6 and 4) + (highest of 9 and 7), halved.
+      ["mid", [[T0, 2, 6, 9, ...held(1)]], [[T0, 2, 4, 7, ...held(2)]], 6.5],
+      [
+        "first",
+        [[T0, 2, 1, at(T0, 9), ...held(1)]],
+        [[T0, 2, 2, at(T0, 4), ...held(2)]],
+        2,
+      ],
+      [
+        "last",
+        [[T0, 2, 1, at(T0, 9), ...held(1)]],
+        [[T0, 2, 2, at(T0, 4), ...held(2)]],
+        1,
+      ],
+    ];
+    for (const [method, own, kept, expected] of cases) {
+      const data = await valuesOf(merged([], own, kept), depth, method);
+      assert.deepEqual(data, [[T0, expected]], method);
+    }
+  });
+
+  it("averages an angle across both tables as one vector", async () => {
+    // [ts, count, sum(sin), sum(cos), count(value), min(value), last(value), last(ts)]
+    // Three samples east in the base table, one north in the archive: the
+    // mean leans east by three to one, not half way.
+    const own = [[T0, 3, 3, 0, 3, Math.PI / 2, 1, at(T0, 1)]];
+    const kept = [[T0, 1, 0, 1, 1, 0, 0, at(T0, 2)]];
+    const data = await valuesOf(
+      merged([], own, kept, "rad"),
+      "navigation.headingTrue",
+      "average",
+    );
+    assert.equal(data.length, 1);
+    assert.ok(Math.abs((data[0][1] as number) - Math.atan2(3, 1)) < 1e-12);
+  });
+
+  it("finds no direction where the two tables' angles cancel", async () => {
+    const own = [[T0, 1, 1, 0, 1, Math.PI / 2, 1, at(T0, 1)]];
+    const kept = [[T0, 1, -1, 0, 1, (3 * Math.PI) / 2, 0, at(T0, 2)]];
+    const data = await valuesOf(
+      merged([], own, kept, "rad"),
+      "navigation.headingTrue",
+      "average",
+    );
+    assert.deepEqual(data, [[T0, null]]);
+  });
+
+  it("holds an empty bucket from the table that took the last sample", async () => {
+    const captured: CapturedQuery[] = [];
+    // [ts, count, sum(value), count(value), last(value), last(ts)]
+    const own = [
+      [T0, 1, 4, 1, 4, at(T0, 10)],
+      [T1, null, null, null, null, null],
+    ];
+    const kept = [
+      [T0, 1, 6, 1, 6, at(T0, 50)],
+      [T1, null, null, null, null, null],
+    ];
+    const p = createHistoryProviderV2(
+      tables(captured, own, kept),
+      SELF_CONTEXT,
+      false,
+      () => {},
+      () => undefined,
+      600_000,
+      archive,
+    );
+    const { data } = await p.getValues({
+      ...request(
+        "2024-06-01T00:00:00Z",
+        "2024-06-01T00:02:00Z",
+        "environment.depth.belowTransducer",
+      ),
+      pathSpecs: [
+        {
+          path: "environment.depth.belowTransducer",
+          aggregate: "average",
+          parameter: [],
+        },
+      ],
+    });
+    assert.deepEqual(data, [
+      [T0, 5],
+      [T1, 6],
+    ]);
+  });
+
+  it("reads raw rows from each table on its own, merged in time order", async () => {
+    const captured: CapturedQuery[] = [];
+    const own = [
+      [at(T0, 1), 1],
+      [at(T0, 3), 3],
+    ];
+    const kept = [
+      [at(T0, 2), 2],
+      [at(T0, 4), 4],
+    ];
+    const data = await valuesOf(
+      merged(captured, own, kept),
+      "environment.depth.belowTransducer",
+      "average",
+      null,
+    );
+    assert.deepEqual(data, [
+      [at(T0, 1), 1],
+      [at(T0, 2), 2],
+      [at(T0, 3), 3],
+      [at(T0, 4), 4],
+    ]);
     assert.match(
       captured[0].sql,
-      /FROM signalk_archive\) ORDER BY ts\) TIMESTAMP\(ts\) WHERE /,
+      /^SELECT ts, value FROM signalk WHERE .* ORDER BY ts LIMIT 10000$/,
+    );
+    assert.match(
+      captured[1].sql,
+      /^SELECT ts, value FROM signalk_archive WHERE .* ORDER BY ts LIMIT 10000$/,
+    );
+  });
+
+  it("keeps a merged raw read to the limit one table has", async () => {
+    const rows = (offset: number) =>
+      Array.from({ length: 10_000 }, (_, i) => [
+        new Date(Date.parse(T0) + (2 * i + offset) * 10).toISOString(),
+        offset,
+      ]);
+    const data = await valuesOf(
+      merged([], rows(0), rows(1)),
+      "environment.depth.belowTransducer",
+      "average",
+      null,
+    );
+    assert.equal(data.length, 10_000);
+    assert.deepEqual(
+      data.slice(0, 4).map((row) => row[1]),
+      [0, 1, 0, 1],
+    );
+  });
+
+  it("counts the archive's grid in the bucket budget, up to the cap", async () => {
+    // One-second buckets of a numeric path: its own grid, the text
+    // fallback's and, where the archive covers the range, the archive's.
+    const ask = (from: string, buckets: number) =>
+      merged([], [], []).getValues({
+        ...request(
+          from,
+          new Date(Date.parse(from) + buckets * 1000).toISOString(),
+          "environment.depth.belowTransducer",
+        ),
+        resolution: 1,
+      });
+    await ask("2024-06-01T00:00:00Z", 333_333);
+    await assert.rejects(
+      ask("2024-06-01T00:00:00Z", 333_334),
+      /up to 1000002 sample buckets/,
+    );
+    await ask("2025-06-01T00:00:00Z", 500_000);
+  });
+
+  it("leaves the archive out of another vessel's reads, which it never holds", async () => {
+    const other = "vessels.urn:mrn:imo:mmsi:987654321";
+    for (const aggregate of ["first", "middle_index"]) {
+      const captured: CapturedQuery[] = [];
+      await merged(captured, [], []).getValues({
+        ...request(
+          "2024-06-01T00:00:00Z",
+          "2024-06-02T00:00:00Z",
+          "navigation.position",
+        ),
+        context: other,
+        pathSpecs: [{ path: "navigation.position", aggregate, parameter: [] }],
+      });
+      assert.equal(captured.length, 1, aggregate);
+      assert.doesNotMatch(captured[0].sql, /_archive/, aggregate);
+    }
+    // Nor do its hold seed and its source discovery: the base table's first
+    // bucket is empty, so the seed is read, and sourcePolicy=all asks which
+    // sources recorded the path.
+    for (const [context, archived] of [
+      [other, false],
+      ["vessels.self", true],
+    ] as const) {
+      const captured: CapturedQuery[] = [];
+      const own = [[T0, null, null, null]];
+      await createHistoryProviderV2(
+        tables(captured, own, []),
+        SELF_CONTEXT,
+        true,
+        () => {},
+        () => undefined,
+        600_000,
+        archive,
+      ).getValues({
+        ...request(
+          "2024-06-01T00:00:00Z",
+          "2024-06-01T00:01:00Z",
+          "environment.depth.belowTransducer",
+        ),
+        context,
+        sourcePolicy: "all",
+      });
+      const seed = captured.find(({ sql }) => / LIMIT -1$/.test(sql));
+      const sources = captured.find(({ sql }) =>
+        /SELECT DISTINCT source FROM signalk_archive /.test(sql),
+      );
+      assert.ok(seed, `${context}: the seed is read`);
+      assert.equal(/_archive/.test(seed!.sql), archived, `${context}: seed`);
+      assert.equal(sources !== undefined, archived, `${context}: sources`);
+    }
+    // Still within the budget at two grids, which the archive would make
+    // three.
+    await merged([], [], []).getValues({
+      ...request(
+        "2024-06-01T00:00:00Z",
+        new Date(
+          Date.parse("2024-06-01T00:00:00Z") + 400_000_000,
+        ).toISOString(),
+        "environment.depth.belowTransducer",
+      ),
+      context: other,
+      resolution: 1,
+    });
+  });
+
+  it("still reads the union for middle_index, which needs one order", async () => {
+    const captured: CapturedQuery[] = [];
+    await valuesOf(
+      merged(captured, [], []),
+      "navigation.position",
+      "middle_index",
+    );
+    assert.equal(captured.length, 1);
+    assert.match(
+      captured[0].sql,
+      /FROM \(\(SELECT ts, context, source, lat, lon FROM signalk_position UNION ALL SELECT ts, context, source, lat, lon FROM signalk_position_archive\) ORDER BY ts\) TIMESTAMP\(ts\) WHERE ts >= /,
     );
   });
 
