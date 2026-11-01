@@ -1,6 +1,7 @@
 import type { history as HistoryApi } from "@signalk/server-api";
 import { IRouter, type Response as ExpressResponse } from "express";
-import { waitForContainerManager } from "signalk-container-helper";
+import { errMsg, waitForContainerManager } from "signalk-container-helper";
+import { waitForQuestdb } from "./questdb-ready.js";
 import type {
   ContainerConfig,
   ContainerManagerApi,
@@ -172,6 +173,18 @@ const FULL_EXPORT_TABLE_SET: ReadonlySet<string> = new Set(FULL_EXPORT_TABLES);
 // hang on the web-console `301` redirect until it times out.) signalk-container
 // emits this as `--health-*` run flags (see its `healthcheck` ContainerConfig
 // field).
+/** Where the plugin reaches QuestDB, asked `again` after QuestDB did not answer. */
+type EndpointResolver = (options?: {
+  again?: boolean;
+}) => Promise<{ http: Endpoint; ilp: Endpoint }>;
+
+/** An update refused while a start holds the lifecycle lock. */
+const STILL_STARTING =
+  "The plugin is still starting QuestDB; try again once it is recording";
+
+/** How long a retry probes for the LAN-exposure host; the wait itself polls. */
+const RETRY_PROBE_DEADLINE_MS = 5_000;
+
 const QUESTDB_HEALTHCHECK = {
   test: [
     "CMD",
@@ -556,7 +569,7 @@ export default (app: App) => {
     containers: ContainerManagerApi,
     name: string,
     containerConfig: ContainerConfig,
-  ): Promise<() => Promise<{ http: Endpoint; ilp: Endpoint }>> {
+  ): Promise<EndpointResolver> {
     const httpPort = config.questdbHttpPort ?? QUESTDB_INTERNAL_HTTP_PORT;
     const ilpPort = config.questdbIlpPort ?? QUESTDB_INTERNAL_ILP_PORT;
     const pgPort = config.questdbPgPort ?? QUESTDB_INTERNAL_PG_PORT;
@@ -601,13 +614,20 @@ export default (app: App) => {
       // by probing, which only works once QuestDB is up. The resolver runs
       // after ensureRunning() on both call sites, so defer the probe into
       // the closure (and memoize: the endpoint can't change while the
-      // container config that produced it is live).
+      // container config that produced it is live). Asked `again`, it probes
+      // anew: a QuestDB that was not answering yet left the gateway, the
+      // fallback, which need not be where it is.
       let endpoints: { http: Endpoint; ilp: Endpoint } | null = null;
-      return async () => {
-        if (!endpoints) {
+      return async (options) => {
+        if (!endpoints || options?.again) {
           const skHost = config.exposeToContainers
-            ? await resolveLanExposureHost(containers, httpPort, (msg) =>
-                app.debug(msg),
+            ? await resolveLanExposureHost(
+                containers,
+                httpPort,
+                (msg) => app.debug(msg),
+                options?.again
+                  ? { deadlineMs: RETRY_PROBE_DEADLINE_MS }
+                  : undefined,
               )
             : "127.0.0.1";
           endpoints = lanExposureEndpoints(skHost, httpPort, ilpPort);
@@ -914,6 +934,8 @@ export default (app: App) => {
       },
     };
 
+    // Managed mode: where the container is now, which a recreate can change.
+    let refreshEndpoints: EndpointResolver | null = null;
     if (config.managedContainer !== false) {
       // Two phases in one call: poll for the manager global, then wait for
       // runtime detection to settle. The previous code read the global ONCE,
@@ -1016,6 +1038,7 @@ export default (app: App) => {
           containerConfig,
         );
         if (signal.aborted) return;
+        refreshEndpoints = resolveEndpoints;
 
         app.setPluginStatus("Starting QuestDB container...");
         // Clear any prior clamp so a run that no longer clamps (e.g. the host
@@ -1052,32 +1075,47 @@ export default (app: App) => {
       }
     }
 
-    const { host: httpHost, port: httpPort } = questdbEndpoints.http;
-    const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
+    let { host: httpHost, port: httpPort } = questdbEndpoints.http;
 
     app.debug("connecting to QuestDB at %s:%d", httpHost, httpPort);
     queryClient = new QueryClient(httpHost, httpPort);
 
     app.setPluginStatus("Waiting for QuestDB to become ready...");
-    const deadline = Date.now() + 30000;
-    while (Date.now() < deadline) {
-      if (signal.aborted) {
-        queryClient = null;
-        return;
-      }
-      if (await queryClient.isHealthy()) break;
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    let questdb = queryClient;
+    let notResponding = false;
+    const refresh = refreshEndpoints;
+    try {
+      await waitForQuestdb(() => questdb.isHealthy(), {
+        signal,
+        // A container recreated during the wait can come back on another port.
+        beforeRetry: refresh
+          ? async () => {
+              const resolved = await refresh({ again: true });
+              if (signal.aborted) return;
+              questdbEndpoints = resolved;
+              ({ host: httpHost, port: httpPort } = resolved.http);
+              questdb = queryClient = new QueryClient(httpHost, httpPort);
+            }
+          : undefined,
+        onAttemptFailed: (err, nextDelayMs) => {
+          app.debug(`QuestDB readiness attempt failed: ${errMsg(err)}`);
+          notResponding = true;
+          publishError(
+            `QuestDB not responding at ${httpHost}:${httpPort} — retrying in ${Math.round(nextDelayMs / 1000)}s`,
+          );
+        },
+      });
+    } catch (err) {
+      if (!signal.aborted) throw err;
     }
-
     if (signal.aborted) {
       queryClient = null;
       return;
     }
-
-    if (!(await queryClient.isHealthy())) {
-      publishError(`QuestDB not responding at ${httpHost}:${httpPort}`);
-      return;
-    }
+    // It answers now: the error was this wait's own, and must not hold back
+    // the recording line once the writer is up.
+    if (notResponding) pluginErrorActive = false;
+    const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
 
     app.setPluginStatus("Creating tables...");
     // A migration that degrades (dedup off on an external table) is worth a
@@ -2058,6 +2096,13 @@ export default (app: App) => {
             });
             return;
           }
+          // A start holds the lifecycle lock until QuestDB answers, which it
+          // waits for as long as the plugin runs: queued behind it, this
+          // request would hang until then.
+          if (startAbort) {
+            res.status(409).json({ error: STILL_STARTING });
+            return;
+          }
           // Captured at route entry, before ANY await: a stop() that lands
           // during the release fetch below must already invalidate this
           // update, not just one that lands after the lock is acquired.
@@ -2092,6 +2137,12 @@ export default (app: App) => {
             return;
           }
           const newTag = stable.tag_name;
+
+          // Asked again: a restart during the release fetch above starts anew.
+          if (startAbort) {
+            res.status(409).json({ error: STILL_STARTING });
+            return;
+          }
 
           // Run the mutating update under the lifecycle lock so a concurrent
           // purge/start can't interleave with the pull + recreate + reconnect.
