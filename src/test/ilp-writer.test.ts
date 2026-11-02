@@ -1226,6 +1226,9 @@ describe("ILPWriter disconnect", () => {
       assert.equal(await settled(disconnecting, 100), "unsettled");
       assert.equal(await settled(disconnecting, 3000), "resolved");
     } finally {
+      // Stopped first, or the socket's close schedules a reconnect; not
+      // awaited, as it may be what hangs.
+      void writer.disconnect();
       socket?.destroy();
       (accepted as net.Socket | null)?.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
