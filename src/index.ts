@@ -1,6 +1,11 @@
 import type { history as HistoryApi } from "@signalk/server-api";
 import { IRouter, type Response as ExpressResponse } from "express";
-import { errMsg, waitForContainerManager } from "signalk-container-helper";
+import { readFileSync } from "fs";
+import {
+  errMsg,
+  updateImageAfterPluginUpdate,
+  waitForContainerManager,
+} from "signalk-container-helper";
 import { waitForQuestdb } from "./questdb-ready.js";
 import type {
   ContainerConfig,
@@ -10,6 +15,7 @@ import type {
   UlimitClamp,
 } from "signalk-container-helper";
 import { ILPWriter } from "./ilp-writer.js";
+import { refreshImage } from "./image-refresh.js";
 import { QueryClient, isReadOnlySQL } from "./query-client.js";
 import type { QuestDBResult } from "./query-client.js";
 import { Config, ConfigSchema, normalizeConfig } from "./config/schema.js";
@@ -142,6 +148,13 @@ interface App {
   savePluginOptions: (config: unknown, cb: (err?: Error) => void) => void;
   [key: string]: unknown;
 }
+
+/** This plugin's own version, which an update of it changes. */
+const PLUGIN_VERSION = (
+  JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { version: string }
+).version;
 
 // signalk-container's API, imported rather than mirrored. The 156-line
 // hand-written copy that used to live here drifted by construction: it was
@@ -294,6 +307,8 @@ export default (app: App) => {
   // OLD config/version, so we must not report success or persist a new version
   // as if the change applied. Cleared at the top of each ensureRunning attempt.
   let containerWedged: string | null = null;
+  // The image check after a plugin update, while it waits for a free link.
+  let imageCheckAbort: AbortController | null = null;
   // Whether this QuestDB's wal_tables() exposes the errorTag/errorMessage
   // columns (present on current builds, absent on an older pinned version).
   // Probed once via the richer status query and cached so an old build does
@@ -951,6 +966,217 @@ export default (app: App) => {
     } finally {
       if (timeoutTimer) clearTimeout(timeoutTimer);
     }
+  }
+
+  // The update button's recreate, wait and reconnect, and the image check's
+  // after a plugin update. Runs under the lifecycle lock; `generation` is the
+  // one the caller started from, and a stop() or purge that ended it fails
+  // the rest. A wedged container defers the recreate: `containerWedged` then
+  // says so. `background`, as for the image check, sends progress to the
+  // debug log, as no one is waiting on it. With `refresh`, the container is
+  // recreated on the image a pull just brought for the tag it already runs,
+  // where that differs from the one it runs.
+  async function recreateQuestdb(
+    tag: string,
+    generation: number,
+    containers: ContainerManagerApi,
+    { background, refresh }: { background: boolean; refresh: boolean },
+  ): Promise<{ ilpHost: string; ilpPort: number }> {
+    const assertNotStopped = () => {
+      if (generation !== lifecycleGeneration)
+        throw new Error("plugin stopped while the update was running");
+    };
+    const progress = (line: string) => {
+      if (background) app.debug(line);
+      else app.setPluginStatus(line);
+    };
+    const updateMount = await resolveQuestdbDataMount(containers);
+    progress(`Starting QuestDB ${tag}...`);
+    const updateConfig: ContainerConfig = {
+      image: "questdb/questdb",
+      tag,
+      volumes: updateMount.volumes,
+      env: {
+        ...buildContainerEnv(currentConfig ?? {}),
+        ...updateMount.env,
+      },
+      restart: "unless-stopped",
+      resources: currentConfig ? buildResourceLimits(currentConfig) : undefined,
+      ulimits: QUESTDB_ULIMITS,
+      healthcheck: QUESTDB_HEALTHCHECK,
+      // The tag names what it did before, so only this recreates on the image
+      // the pull brought. Through ensureRunning rather than recreate(), which
+      // drops the container's addresses and may pick another host port.
+      ...(refresh ? { autoUpdateOnFloatingTag: true } : {}),
+    };
+    const resolveUpdateEndpoints = await applyQuestdbNetworking(
+      currentConfig ?? ({} as Config),
+      containers,
+      QUESTDB_CONTAINER_NAME,
+      updateConfig,
+    );
+    // Clear any prior clamp before re-running so a no-longer-clamping
+    // update doesn't leave a stale warning. The recreate must not
+    // happen after a stop/purge teardown, so gate it on the
+    // generation one more time.
+    assertNotStopped();
+    ulimitClamp = null;
+    containerWedged = null;
+    containerEpoch++;
+    await containers.ensureRunning(QUESTDB_CONTAINER_NAME, updateConfig, {
+      onUlimitClamped,
+      onContainerWedged,
+    });
+    assertNotStopped();
+
+    // The QuestDB version just changed, so the cached wal_tables()
+    // column shape may no longer match (the errorTag/errorMessage
+    // columns could appear on an upgrade or disappear on a downgrade).
+    // Force the next /api/status to re-probe instead of trusting a
+    // stale capability flag.
+    walTablesHasErrorColumns = null;
+
+    // Re-resolve so the export endpoints and status line reflect the
+    // current endpoint. The version bump keeps the same container name
+    // and networking, so the endpoint is stable — the existing
+    // QueryClient/ILPWriter stay valid (and the registered history
+    // providers keep their reference). On the LAN path this await
+    // probes for the reachable host, so it's long enough for a stop()
+    // to land mid-flight — re-check before touching plugin state.
+    const updatedEndpoints = await resolveUpdateEndpoints();
+    assertNotStopped();
+    questdbEndpoints = updatedEndpoints;
+    const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
+
+    // Wait for the recreated container to answer, then reconnect ILP.
+    // Locals are captured because stop() nulls the module bindings:
+    // reading them again mid-loop would throw, and the generation
+    // checks after every await are what keep a concurrent teardown
+    // from being resurrected by the reconnect.
+    const client = queryClient;
+    if (client) {
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        assertNotStopped();
+        if (await client.isHealthy()) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    assertNotStopped();
+    const ilpWriter = writer;
+    if (ilpWriter) {
+      try {
+        await ilpWriter.disconnect();
+      } catch {
+        /* ignore */
+      }
+      assertNotStopped();
+      await ilpWriter.connect();
+      // A stop() that landed during connect() has already nulled
+      // `writer`, so nothing would ever disconnect this fresh
+      // connection — close it ourselves before failing the update.
+      if (generation !== lifecycleGeneration) {
+        try {
+          await ilpWriter.disconnect();
+        } catch {
+          /* ignore */
+        }
+        assertNotStopped();
+      }
+    }
+    return { ilpHost, ilpPort };
+  }
+
+  /** The running QuestDB's version, from `build()`; null where it does not say. */
+  async function runningQuestdbVersion(
+    client: QueryClient,
+  ): Promise<string | null> {
+    const result = await client.exec("SELECT build()");
+    const build = result.dataset.length > 0 ? String(result.dataset[0][0]) : "";
+    return build.match(/QuestDB\s+([\d.]+)/)?.[1] ?? null;
+  }
+
+  // After the plugin itself was updated, its first start moves QuestDB on a
+  // floating tag such as `latest` to the latest release, once, on a free
+  // link. signalk-container pulls an image only when it is missing, so such
+  // a tag otherwise stays on whatever release the first install found.
+  function checkImageAfterPluginUpdate(containers: ContainerManagerApi): void {
+    // One check at a time; stop() aborts it too.
+    imageCheckAbort?.abort();
+    const abort = new AbortController();
+    imageCheckAbort = abort;
+    const generation = lifecycleGeneration;
+    const tag = currentConfig?.questdbVersion ?? "latest";
+    updateImageAfterPluginUpdate({
+      manager: containers,
+      pluginVersion: PLUGIN_VERSION,
+      // Beside the data directory, which is QuestDB's own.
+      stateFile: `${app.getDataDirPath()}.image-check.json`,
+      tag,
+      versionSource: { githubReleases: "questdb/questdb" },
+      currentVersion: async () =>
+        queryClient ? runningQuestdbVersion(queryClient) : null,
+      update: (signal) =>
+        refreshImage(
+          {
+            containers,
+            name: QUESTDB_CONTAINER_NAME,
+            image: "questdb/questdb",
+            withLock: withLifecycleLock,
+            current: () => generation === lifecycleGeneration && pluginRunning,
+            configuredTag: () => currentConfig?.questdbVersion ?? "latest",
+            // On a link that was metered, the check may come hours later, in
+            // the middle of work the recreate would break.
+            blocked: () =>
+              legacyCleanupRunning
+                ? "the string table is being rebuilt"
+                : containerWedged
+                  ? "the container is wedged"
+                  : activeMigration?.state === "running"
+                    ? "an InfluxDB import is running"
+                    : gpxImports.active
+                      ? "a GPX import is running"
+                      : questdbExportsRunning > 0
+                        ? "an export is running"
+                        : null,
+            recreate: async (newTag) => {
+              await recreateQuestdb(newTag, generation, containers, {
+                background: true,
+                refresh: true,
+              });
+            },
+            restore: async (newTag) => {
+              await recreateQuestdb(newTag, generation, containers, {
+                background: true,
+                refresh: false,
+              });
+            },
+            debug: (msg) => app.debug(msg),
+            error: (msg) => app.error(msg),
+            reportDown: (msg) => {
+              app.error(msg);
+              publishError(msg);
+            },
+          },
+          tag,
+          signal,
+        ),
+      signal: abort.signal,
+    })
+      .then((outcome) =>
+        app.debug(
+          `QuestDB image check after the plugin update to ${PLUGIN_VERSION}: ${outcome}`,
+        ),
+      )
+      .catch((err: unknown) => {
+        if (abort.signal.aborted) return;
+        app.error(
+          `QuestDB image check after the plugin update to ${PLUGIN_VERSION} failed: ${errMsg(err)}`,
+        );
+      })
+      .finally(() => {
+        if (imageCheckAbort === abort) imageCheckAbort = null;
+      });
   }
 
   // Runs the actual startup. Always invoked through the lifecycle lock (see
@@ -1707,6 +1933,9 @@ export default (app: App) => {
     // Any earlier return/throw leaves the flag false, so a half-started
     // plugin rejects lifecycle-dependent requests like /api/update/apply.
     pluginRunning = true;
+    // Not awaited: it waits for a free link, and its recreate for the
+    // lifecycle lock this start still holds.
+    if (managedContainers) checkImageAfterPluginUpdate(managedContainers);
 
     // Repopulate the model from history — only now, because the guard below
     // reads pluginRunning and everything before this point can still throw
@@ -1827,6 +2056,7 @@ export default (app: App) => {
       // resurrecting a writer/client after this teardown ran.
       lifecycleGeneration++;
       startAbort?.abort();
+      imageCheckAbort?.abort();
       pluginRunning = false;
 
       // A start aborted before its restore ran would otherwise leave tracking
@@ -2186,14 +2416,8 @@ export default (app: App) => {
             return;
           }
 
-          // Get running QuestDB version via SQL
-          const buildResult = await queryClient.exec("SELECT build()");
-          const buildStr =
-            buildResult.dataset.length > 0
-              ? (buildResult.dataset[0][0] as string)
-              : "";
-          const versionMatch = buildStr.match(/QuestDB\s+([\d.]+)/);
-          const currentVersion = versionMatch ? versionMatch[1] : "unknown";
+          const currentVersion =
+            (await runningQuestdbVersion(queryClient)) ?? "unknown";
 
           // Get latest stable release from GitHub
           const ghRes = await fetch(
@@ -2329,102 +2553,13 @@ export default (app: App) => {
             // the plugin claim a version the still-running old container is not
             // actually on, surviving restarts.
 
-            const updateMount = await resolveQuestdbDataMount(containers);
-            app.setPluginStatus(`Starting QuestDB ${newTag}...`);
-            const updateConfig: ContainerConfig = {
-              image: "questdb/questdb",
-              tag: newTag,
-              volumes: updateMount.volumes,
-              env: {
-                ...buildContainerEnv(currentConfig ?? {}),
-                ...updateMount.env,
-              },
-              restart: "unless-stopped",
-              resources: currentConfig
-                ? buildResourceLimits(currentConfig)
-                : undefined,
-              ulimits: QUESTDB_ULIMITS,
-              healthcheck: QUESTDB_HEALTHCHECK,
-            };
-            const resolveUpdateEndpoints = await applyQuestdbNetworking(
-              currentConfig ?? ({} as Config),
+            const { ilpHost, ilpPort } = await recreateQuestdb(
+              newTag,
+              updateGeneration,
               containers,
-              QUESTDB_CONTAINER_NAME,
-              updateConfig,
+              { background: false, refresh: false },
             );
-            // Clear any prior clamp before re-running so a no-longer-clamping
-            // update doesn't leave a stale warning. The recreate must not
-            // happen after a stop/purge teardown, so gate it on the
-            // generation one more time.
-            assertNotStopped();
-            ulimitClamp = null;
-            containerWedged = null;
-            containerEpoch++;
-            await containers.ensureRunning(
-              QUESTDB_CONTAINER_NAME,
-              updateConfig,
-              {
-                onUlimitClamped,
-                onContainerWedged,
-              },
-            );
-            assertNotStopped();
 
-            // The QuestDB version just changed, so the cached wal_tables()
-            // column shape may no longer match (the errorTag/errorMessage
-            // columns could appear on an upgrade or disappear on a downgrade).
-            // Force the next /api/status to re-probe instead of trusting a
-            // stale capability flag.
-            walTablesHasErrorColumns = null;
-
-            // Re-resolve so the export endpoints and status line reflect the
-            // current endpoint. The version bump keeps the same container name
-            // and networking, so the endpoint is stable — the existing
-            // QueryClient/ILPWriter stay valid (and the registered history
-            // providers keep their reference). On the LAN path this await
-            // probes for the reachable host, so it's long enough for a stop()
-            // to land mid-flight — re-check before touching plugin state.
-            const updatedEndpoints = await resolveUpdateEndpoints();
-            assertNotStopped();
-            questdbEndpoints = updatedEndpoints;
-            const { host: ilpHost, port: ilpPort } = questdbEndpoints.ilp;
-
-            // Wait for the recreated container to answer, then reconnect ILP.
-            // Locals are captured because stop() nulls the module bindings:
-            // reading them again mid-loop would throw, and the generation
-            // checks after every await are what keep a concurrent teardown
-            // from being resurrected by the reconnect.
-            const client = queryClient;
-            if (client) {
-              const deadline = Date.now() + 30000;
-              while (Date.now() < deadline) {
-                assertNotStopped();
-                if (await client.isHealthy()) break;
-                await new Promise((resolve) => setTimeout(resolve, 500));
-              }
-            }
-            assertNotStopped();
-            const ilpWriter = writer;
-            if (ilpWriter) {
-              try {
-                await ilpWriter.disconnect();
-              } catch {
-                /* ignore */
-              }
-              assertNotStopped();
-              await ilpWriter.connect();
-              // A stop() that landed during connect() has already nulled
-              // `writer`, so nothing would ever disconnect this fresh
-              // connection — close it ourselves before failing the update.
-              if (updateGeneration !== lifecycleGeneration) {
-                try {
-                  await ilpWriter.disconnect();
-                } catch {
-                  /* ignore */
-                }
-                assertNotStopped();
-              }
-            }
             // Persist the new version only now that the recreate is confirmed
             // (a wedge deferred it — the old container is still running).
             if (!containerWedged && currentConfig) {
@@ -2911,6 +3046,8 @@ export default (app: App) => {
           // later wakes up returns early instead of recreating the container.
           lifecycleGeneration++;
           startAbort?.abort();
+          // A check that outlived the purge would download the image again.
+          imageCheckAbort?.abort();
           // Silences a restart in flight now; the teardown below clears the
           // alert once it has the lock.
           watchdog?.stop();

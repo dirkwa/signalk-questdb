@@ -132,6 +132,51 @@ rootless Podman.
 | Container network             | `sk-network` | Shared Podman/Docker network QuestDB joins in managed mode, so the companion signalk-grafana reaches it by container DNS; host-port publication is separate ("Bind to 0.0.0.0") |
 | Bind to 0.0.0.0               | `false`      | Publish QuestDB's ports on all interfaces (see Connectivity)                                                                                                                    |
 
+### QuestDB updates
+
+The panel's **update check** compares the running QuestDB with its latest stable
+release. **Update** pulls that release, recreates the container on it and saves
+it as the image version.
+
+After the plugin itself was updated, and at its very first start, the plugin
+also checks once on its own, in the background. It does so only in managed mode,
+and only where the image version is a tag that moves, such as the default
+`latest`. If QuestDB runs an older release than the latest stable one, the
+plugin pulls the tag again and recreates the container on it. The image version
+stays `latest`. Without this check, QuestDB on `latest` would stay on whatever
+release the first install pulled, because signalk-container pulls an image only
+when it is missing. An image version that names one release, such as `9.4.3`,
+stays as it is, and so does one that **Update** saved while the check was
+waiting. QuestDB is down while it starts again, as with **Update**. Progress
+goes to the debug log, and failures go to the server log. A recreate that fails
+half way and leaves QuestDB stopped or without a container is followed by a
+start, as the plugin's own start would do. Only if that fails too does the
+status line say so.
+
+With [signalk-internet](https://github.com/meri-imperiumi/signalk-internet)
+enabled, the check waits for a free link. On a metered, captive or offline link
+it asks again from time to time, for as long as the plugin runs. Without
+signalk-internet, the link counts as free. Telling the two apart needs
+signalk-container 1.38.0 or later; with an older one, the check does not run. A
+failure to read the running or the latest version is also tried again later.
+
+The check is done once QuestDB runs the latest release, or once its container
+runs the image the pull brought, even if QuestDB still reports an older release
+afterwards. It then waits for the next plugin update. The next start checks
+again wherever the container keeps its old image, or where the new one cannot
+be told from the old:
+
+- the plugin stopped first;
+- the download failed, or something else failed before the recreate;
+- an InfluxDB import, a GPX import or an export was running;
+- the string table was being rebuilt;
+- the container was stopped, which the check leaves as it is;
+- the container was wedged;
+- the tag on Docker Hub did not name the latest release yet.
+
+A tag that never reaches the latest release, such as `9` while the latest is
+`10.1.0`, therefore costs a pull and a look at GitHub at every start.
+
 ## Recording
 
 ### Schema
