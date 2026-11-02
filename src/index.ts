@@ -310,10 +310,17 @@ export default (app: App) => {
   // The watchdog's probe and restart, and what they learn from the plugin's
   // own queries (watchdog-checks.ts).
   let watchdogChecks: WatchdogChecks | null = null;
-  const questdbClientOptions = {
-    onErrorResponse: (body: string) => watchdogChecks?.noteErrorResponse(body),
-    onResponse: () => watchdogChecks?.noteResponse(),
-  };
+  // A client reports to the watchdog of the start that created it: a request
+  // of an earlier start that ends late tells nothing about the container now.
+  const questdbClientOptions = (generation: number) => ({
+    onErrorResponse: (body: string) => {
+      if (generation === lifecycleGeneration)
+        watchdogChecks?.noteErrorResponse(body);
+    },
+    onResponse: () => {
+      if (generation === lifecycleGeneration) watchdogChecks?.noteResponse();
+    },
+  });
   // The watchdog's error is the one on the status line, so its recovery may
   // replace it with the recording line. Any other error published since
   // stays.
@@ -1149,7 +1156,11 @@ export default (app: App) => {
     let { host: httpHost, port: httpPort } = questdbEndpoints.http;
 
     app.debug("connecting to QuestDB at %s:%d", httpHost, httpPort);
-    queryClient = new QueryClient(httpHost, httpPort, questdbClientOptions);
+    queryClient = new QueryClient(
+      httpHost,
+      httpPort,
+      questdbClientOptions(lifecycleGeneration),
+    );
 
     app.setPluginStatus("Waiting for QuestDB to become ready...");
     let questdb = queryClient;
@@ -1168,7 +1179,7 @@ export default (app: App) => {
               questdb = queryClient = new QueryClient(
                 httpHost,
                 httpPort,
-                questdbClientOptions,
+                questdbClientOptions(lifecycleGeneration),
               );
             }
           : undefined,
@@ -3926,10 +3937,17 @@ export default (app: App) => {
             }
 
             // Also bounds the streaming below: a client that stops reading
-            // must not hold the export past it (see drained()).
-            const exportDeadline = AbortSignal.timeout(300000);
+            // must not hold the export past it (see drained()). A client that
+            // leaves ends it at once, as in /api/full-export: during a slow
+            // query QuestDB may send nothing for minutes.
+            const clientLeft = new AbortController();
+            res.once("close", () => clientLeft.abort());
+            const exportSignal = AbortSignal.any([
+              AbortSignal.timeout(300000),
+              clientLeft.signal,
+            ]);
             const qdbRes = await fetch(expUrl.toString(), {
-              signal: exportDeadline,
+              signal: exportSignal,
             });
             if (!qdbRes.ok || !qdbRes.body) {
               const body = await qdbRes.text().catch(() => "");
@@ -3954,7 +3972,7 @@ export default (app: App) => {
                   complete = true;
                   break;
                 }
-                if (!res.write(value) && !(await drained(res, exportDeadline)))
+                if (!res.write(value) && !(await drained(res, exportSignal)))
                   break;
               }
             } catch (streamErr) {
