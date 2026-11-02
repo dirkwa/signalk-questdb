@@ -32,6 +32,9 @@
 // Restarts are bounded: at most one per `minRestartGapMs`, and at most
 // `maxRestarts` within `restartWindowMs`. A restart that does not help would
 // otherwise turn into a loop that takes recording down every few minutes.
+// A restart that failed (its stop or start threw) counts against neither: it
+// may have left the container stopped, and recording stays off until the
+// container runs, so it is tried again after `failedRetryGapMs`.
 
 export type WatchdogReason = "out-of-memory" | "unresponsive";
 
@@ -80,6 +83,7 @@ export interface WatchdogOptions {
   minRestartGapMs?: number;
   maxRestarts?: number;
   restartWindowMs?: number;
+  failedRetryGapMs?: number;
   // Monotonic milliseconds for the spans; wall-clock milliseconds for the
   // times the messages name. A Pi without a clock battery steps its wall
   // clock at boot, which must not move a restart.
@@ -93,6 +97,7 @@ const DEFAULT_OUT_OF_MEMORY_CHECKS = 2;
 const DEFAULT_MIN_RESTART_GAP_MS = 15 * 60_000;
 const DEFAULT_MAX_RESTARTS = 3;
 const DEFAULT_RESTART_WINDOW_MS = 6 * 3_600_000;
+const DEFAULT_FAILED_RETRY_GAP_MS = 5 * 60_000;
 
 // QuestDB's message when the instance as a whole is at its memory cap
 // (io.questdb.std.Unsafe). The same text in 9.x and 10.x.
@@ -148,6 +153,8 @@ export class QuestdbWatchdog {
   // must not start over when it does.
   private failing = 0;
   private restarts: number[] = [];
+  // When a restart last failed.
+  private failedAt: number | null = null;
   // Set once a held-back restart has been reported, so a long incident does
   // not repeat the same report every minute.
   private heldBack = false;
@@ -159,6 +166,7 @@ export class QuestdbWatchdog {
   private readonly minRestartGapMs: number;
   private readonly maxRestarts: number;
   private readonly restartWindowMs: number;
+  private readonly failedRetryGapMs: number;
   private readonly now: () => number;
   private readonly wallNow: () => number;
 
@@ -179,6 +187,8 @@ export class QuestdbWatchdog {
       options.minRestartGapMs ?? DEFAULT_MIN_RESTART_GAP_MS;
     this.maxRestarts = Math.max(1, options.maxRestarts ?? DEFAULT_MAX_RESTARTS);
     this.restartWindowMs = options.restartWindowMs ?? DEFAULT_RESTART_WINDOW_MS;
+    this.failedRetryGapMs =
+      options.failedRetryGapMs ?? DEFAULT_FAILED_RETRY_GAP_MS;
     this.now = options.now ?? (() => performance.now());
     this.wallNow = options.wallNow ?? Date.now;
   }
@@ -261,6 +271,14 @@ export class QuestdbWatchdog {
     message: string,
   ): Promise<void> {
     const now = this.now();
+    if (this.failedAt !== null && now - this.failedAt < this.failedRetryGapMs) {
+      // Reported with the failure; not a hold-back.
+      this.deps.debug(
+        `QuestDB watchdog: ${LABEL[reason]}; the failed restart is tried ` +
+          `again at ${this.iso(this.failedAt + this.failedRetryGapMs)}`,
+      );
+      return;
+    }
     this.restarts = this.restarts.filter(
       (at) => now - at < this.restartWindowMs,
     );
@@ -317,10 +335,13 @@ export class QuestdbWatchdog {
     try {
       outcome = await this.deps.restart();
     } catch (err) {
+      this.restarts.pop();
+      this.failedAt = now;
       if (this.stopped) return;
       const text =
         `restarting the QuestDB container failed: ` +
-        `${err instanceof Error ? err.message : String(err)}`;
+        `${err instanceof Error ? err.message : String(err)}; trying again ` +
+        `in ${Math.round(this.failedRetryGapMs / 60_000)} min`;
       this.deps.log(`QuestDB watchdog: ${text}`);
       this.deps.status(`QuestDB ${LABEL[reason]}: ${text}`);
       this.deps.notify("alert", `QuestDB is ${LABEL[reason]}; ${text}.`);

@@ -832,7 +832,9 @@ logs the outcome. Once QuestDB answers again the notification returns to normal;
 when it answered right after the restart, the notification keeps the time and
 the reason. Restarts are rate limited, spaced apart and capped per few hours of
 the plugin running; past that the plugin logs that the restart is held back and
-keeps the alert up.
+keeps the alert up. A restart that fails, because stopping or starting the
+container failed, counts against none of these limits: the plugin tries again a
+few minutes later, since the container may be left stopped.
 
 The plugin leaves a container alone if someone else stopped it. If the plugin
 stopped the container itself and could not start it again, or one of its stops
