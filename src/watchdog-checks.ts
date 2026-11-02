@@ -309,6 +309,13 @@ export class WatchdogChecks {
     if (state !== "running" && !(state === "stopped" && this.leftStopped)) {
       return { state: "called-off", why: `the container is ${state}` };
     }
+    if (state === "running" && this.deps.stops.pending > 0) {
+      // Another stop would only queue behind the one that hangs, and hold the
+      // lifecycle lock for its deadline each time this is tried again.
+      throw new Error(
+        "a stop sent earlier has not finished, and no other is sent until it has",
+      );
+    }
     // A WAL skip validated against the container before the restart must
     // not run against the one after it.
     this.deps.bumpEpoch();
@@ -322,6 +329,11 @@ export class WatchdogChecks {
       );
     }
     if (this.deps.ended()) return pluginStopping;
+    // The instance this start brings up gets its grace from here, also when
+    // the start misses its deadline and lands later; a limit the old
+    // instance hit is no evidence against it.
+    this.answeredAt = this.now();
+    this.limit = null;
     await bounded(
       containers.start(name),
       this.timing.containerCallMs,
@@ -341,8 +353,7 @@ export class WatchdogChecks {
       ).catch(() => {});
       return pluginStopping;
     }
-    // The new instance gets its full grace, and a limit the old one hit is
-    // no evidence against it.
+    // And from here, once the start is done.
     this.answeredAt = this.now();
     this.limit = null;
     const deadline = this.now() + this.timing.answerMs;

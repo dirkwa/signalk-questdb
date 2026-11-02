@@ -1231,6 +1231,8 @@ export default (app: App) => {
       // stuck on a cheerful "Recording" while every sample is dropped.
       onUnhealthy: (msg) => publishError(msg),
       onHealthy: () => {
+        // The watchdog's error stays until the watchdog clears it.
+        if (watchdogStatusShown) return;
         // The writer recovered: the error is no longer current, so the
         // recording line may take the status entry back.
         pluginErrorActive = false;
@@ -1599,6 +1601,7 @@ export default (app: App) => {
           "QuestDB history recording has recovered.",
           "normal:recovered",
         );
+        if (watchdogStatusShown) return;
         app.setPluginStatus(recordingStatus(ilpHost, ilpPort));
       },
       debug: (msg) => app.debug(msg),

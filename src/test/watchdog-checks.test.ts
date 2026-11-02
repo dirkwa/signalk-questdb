@@ -584,8 +584,9 @@ describe("WatchdogChecks.restart", () => {
   });
 
   it("keeps a late stop its own across a later restart", async () => {
-    // The first restart's stop hangs; a later restart stops and starts the
-    // container; then the first stop ends after all and stops the new one.
+    // The first restart's stop hangs, though the container did stop; a later
+    // restart starts it again; then the first stop ends after all and stops
+    // the new one.
     const h = makeHarness();
     let finish!: () => void;
     h.stopImpl = () =>
@@ -596,7 +597,7 @@ describe("WatchdogChecks.restart", () => {
         };
       });
     await assert.rejects(h.checks.restart(), /did not finish/);
-    h.stopImpl = null;
+    h.state = "stopped";
     h.healthCost = 1000;
     assert.equal((await h.checks.restart()).state, "answering");
     finish();
@@ -606,6 +607,41 @@ describe("WatchdogChecks.restart", () => {
       state: "unresponsive",
       message: "the container is stopped since the watchdog stopped it",
     });
+  });
+
+  it("issues no second stop while one of its stops hangs", async () => {
+    const h = makeHarness();
+    h.stopImpl = () => new Promise<void>(() => {});
+    await assert.rejects(h.checks.restart(), /did not finish/);
+    const epoch = h.epoch;
+    await assert.rejects(
+      h.checks.restart(),
+      /a stop sent earlier has not finished/,
+    );
+    assert.equal(h.calls.filter((c) => c === "stop").length, 1);
+    assert.equal(h.epoch, epoch, "nothing was restarted");
+  });
+
+  it("gives a start that lands after its deadline its grace", async () => {
+    const h = makeHarness();
+    h.checks.noteErrorResponse(LIMIT_BODY);
+    h.clock = 5 * 60_000;
+    h.healthy = false;
+    let land!: () => void;
+    h.startImpl = () =>
+      new Promise<void>((resolve) => {
+        land = () => {
+          h.state = "running";
+          resolve();
+        };
+      });
+    await assert.rejects(h.checks.restart(), /starting the container/);
+    land();
+    await new Promise((resolve) => setImmediate(resolve));
+    // Booting: not silent for long enough, and the old instance's limit is
+    // no evidence against it.
+    h.clock += 4 * 60_000;
+    assert.equal((await h.checks.probe()).state, "skip");
   });
 
   it("starts a container whose stop ended long after its deadline", async () => {

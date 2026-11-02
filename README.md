@@ -834,18 +834,18 @@ the reason. Restarts are rate limited, spaced apart and capped per few hours of
 the plugin running; past that the plugin logs that the restart is held back and
 keeps the alert up. A restart that fails, because stopping or starting the
 container failed, counts against none of these limits: the plugin tries again a
-few minutes later, since the container may be left stopped.
+few minutes later, since the container may be left stopped. It reports the
+first failure; while the retries keep failing, they go to the debug log only.
 
-The plugin leaves a container alone if someone else stopped it. If the plugin
-stopped the container itself and could not start it again, or one of its stops
-took the container down only after its deadline, it starts the container at the
-next restart. Once the container has been seen running with none of the
-plugin's stops pending, a later stop is someone else's again; one made earlier,
-while a stop of the plugin's is still pending or before the plugin has seen the
-container running again, counts as the plugin's. An external
-QuestDB is never restarted. A QuestDB that is already stuck when the plugin
-starts, as after a Signal K restart while it was stuck, is not covered:
-restarting the plugin stops the container and starts it afresh.
+The plugin leaves a container alone if someone else stopped it, and starts one
+that its own restart left stopped. One exception: a container stopped by hand
+while a stop of the plugin's is still pending, or right after a restart of the
+plugin's before the plugin has seen it running again, may be started again too.
+While a stop of the plugin's hangs, it sends no further stop. An external
+QuestDB is never restarted. A
+QuestDB that is already stuck when the plugin starts, as after a Signal K
+restart while it was stuck, is not covered: restarting the plugin stops the
+container and starts it afresh.
 
 The managed container runs with QuestDB's query caches off: history reads put
 their time range into the SQL, so the caches never got a hit, and on older

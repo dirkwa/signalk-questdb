@@ -34,7 +34,9 @@
 // otherwise turn into a loop that takes recording down every few minutes.
 // A restart that failed (its stop or start threw) counts against neither: it
 // may have left the container stopped, and recording stays off until the
-// container runs, so it is tried again after `failedRetryGapMs`.
+// container runs, so it is tried again `failedRetryGapMs` after it failed.
+// The first failure is reported; the retries after it only in the debug log,
+// until one gets through.
 
 export type WatchdogReason = "out-of-memory" | "unresponsive";
 
@@ -153,7 +155,7 @@ export class QuestdbWatchdog {
   // must not start over when it does.
   private failing = 0;
   private restarts: number[] = [];
-  // When a restart last failed.
+  // When the last restart failed; null once one got through.
   private failedAt: number | null = null;
   // Set once a held-back restart has been reported, so a long incident does
   // not repeat the same report every minute.
@@ -249,6 +251,8 @@ export class QuestdbWatchdog {
     if (verdict.state === "ok") {
       this.failing = 0;
       this.heldBack = false;
+      // The incident is over: the next one is reported afresh.
+      this.failedAt = null;
       // QuestDB came back by itself: while a restart was held back, or after
       // one that it did not answer at first.
       this.clearAlert("QuestDB answers again.");
@@ -306,28 +310,37 @@ export class QuestdbWatchdog {
       return;
     }
     this.heldBack = false;
+    // The failure before this retry was reported, and its alert is still up.
+    const retrying = this.failedAt !== null;
 
-    let lines: string[] = [];
-    try {
-      lines = await this.deps.recentErrors();
-    } catch {
-      // Best effort: the restart does not wait on the log.
+    if (retrying) {
+      this.deps.debug(
+        `QuestDB watchdog: QuestDB is ${LABEL[reason]}: ${message}. ` +
+          `Retrying the restart that failed.`,
+      );
+    } else {
+      let lines: string[] = [];
+      try {
+        lines = await this.deps.recentErrors();
+      } catch {
+        // Best effort: the restart does not wait on the log.
+      }
+      if (this.stopped) return;
+      this.deps.log(
+        `QuestDB watchdog: QuestDB is ${LABEL[reason]}: ${message}. ` +
+          `Restarting the QuestDB container.` +
+          (lines.length > 0
+            ? ` QuestDB's last errors: ${lines.join(" | ")}`
+            : ""),
+      );
+      this.deps.status(`QuestDB ${LABEL[reason]}: restarting the container`);
+      this.alerting = true;
+      this.deps.notify(
+        "alert",
+        `QuestDB is ${LABEL[reason]} (${message}). Restarting the QuestDB ` +
+          `container; history is not recorded meanwhile.`,
+      );
     }
-    if (this.stopped) return;
-    this.deps.log(
-      `QuestDB watchdog: QuestDB is ${LABEL[reason]}: ${message}. ` +
-        `Restarting the QuestDB container.` +
-        (lines.length > 0
-          ? ` QuestDB's last errors: ${lines.join(" | ")}`
-          : ""),
-    );
-    this.deps.status(`QuestDB ${LABEL[reason]}: restarting the container`);
-    this.alerting = true;
-    this.deps.notify(
-      "alert",
-      `QuestDB is ${LABEL[reason]} (${message}). Restarting the QuestDB ` +
-        `container; history is not recorded meanwhile.`,
-    );
 
     this.restarts.push(now);
     this.failing = 0;
@@ -336,12 +349,15 @@ export class QuestdbWatchdog {
       outcome = await this.deps.restart();
     } catch (err) {
       this.restarts.pop();
-      this.failedAt = now;
+      // A call that ran to its deadline took that long to fail.
+      this.failedAt = this.now();
       if (this.stopped) return;
-      const text =
-        `restarting the QuestDB container failed: ` +
-        `${err instanceof Error ? err.message : String(err)}; trying again ` +
-        `in ${Math.round(this.failedRetryGapMs / 60_000)} min`;
+      const failure = `restarting the QuestDB container failed: ${err instanceof Error ? err.message : String(err)}`;
+      if (retrying) {
+        this.deps.debug(`QuestDB watchdog: ${failure}`);
+        return;
+      }
+      const text = `${failure}; trying again in ${Math.round(this.failedRetryGapMs / 60_000)} min`;
       this.deps.log(`QuestDB watchdog: ${text}`);
       this.deps.status(`QuestDB ${LABEL[reason]}: ${text}`);
       this.deps.notify("alert", `QuestDB is ${LABEL[reason]}; ${text}.`);
@@ -361,6 +377,7 @@ export class QuestdbWatchdog {
       );
       return;
     }
+    this.failedAt = null;
     const seconds = Math.round((this.now() - now) / 1000);
     if (outcome.state === "not-answering") {
       const text =

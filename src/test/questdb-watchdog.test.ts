@@ -288,33 +288,70 @@ describe("QuestdbWatchdog", () => {
     assert.equal(h.watchdog.alertOutstanding, true);
   });
 
-  it("tries a failed restart again after five minutes, outside the limits", async () => {
+  it("tries a failed restart again five minutes after it failed, outside the limits", async () => {
     const h = makeHarness();
     h.set(DOWN);
     h.restartWith(new Error("runtime gone"));
-    await checks(h, 3);
-    assert.equal(h.restarts, 1);
+    // The restart takes two minutes to fail, as a call that runs to its
+    // deadline does.
+    let fail!: () => void;
+    h.holdRestart(new Promise<void>((resolve) => (fail = resolve)));
+    const first = checks(h, 3);
+    while (h.restarts === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    h.advance(120_000);
+    fail();
+    await first;
     assert.match(h.logs[1], /runtime gone; trying again in 5 min$/);
     await checks(h, 4);
     assert.equal(h.restarts, 1, "not within five minutes of the failure");
     await checks(h, 1);
     assert.equal(h.restarts, 2);
-    // Failed restarts count against neither limit, and the wait between
-    // them is no hold-back.
+    // Failed restarts count against neither limit. The first failure was
+    // reported; the retries after it stay quiet.
     for (let i = 0; i < 5; i++) await checks(h, 5);
     assert.equal(h.restarts, 7);
-    assert.equal(h.logs.filter((l) => /held back/.test(l)).length, 0);
-    // A restart that gets through counts again.
+    assert.equal(h.logs.length, 2);
+    assert.equal(h.statuses.length, 2);
+    assert.equal(h.notes.length, 2);
+    // A restart that gets through is reported, and counts again.
     h.restartWith({ state: "answering" });
     await checks(h, 5);
     assert.equal(h.restarts, 8);
+    assert.match(h.logs[2], /answers again/);
     assert.equal(h.notes.at(-1)?.state, "normal");
     await checks(h, 6);
     assert.equal(h.restarts, 8, "held back within 15 minutes");
-    assert.match(
-      h.logs.find((l) => /held back/.test(l)) ?? "",
-      /restarted 1 time\(s\) in the last 6 h/,
-    );
+    assert.match(h.logs[3], /restarted 1 time\(s\) in the last 6 h/);
+    // And the next failure is reported again.
+    h.advance(15 * 60_000);
+    h.restartWith(new Error("runtime gone again"));
+    await checks(h, 1);
+    assert.equal(h.restarts, 9);
+    assert.match(h.logs.at(-1) ?? "", /runtime gone again; trying again/);
+  });
+
+  it("reports a new incident after QuestDB recovered from a failed restart", async () => {
+    const h = makeHarness();
+    h.set(DOWN);
+    h.restartWith(new Error("runtime gone"));
+    await checks(h, 3);
+    assert.equal(h.logs.length, 2);
+    // QuestDB comes back by itself.
+    h.set(OK);
+    await checks(h, 1);
+    assert.equal(h.notes.at(-1)?.state, "normal");
+    // Days later it fails again: reported like the first time.
+    h.advance(3 * 24 * 3_600_000);
+    h.set(DOWN);
+    await checks(h, 3);
+    assert.equal(h.restarts, 2);
+    assert.equal(h.logs.length, 4);
+    assert.match(h.logs[2], /Restarting the QuestDB container/);
+    assert.match(h.logs[3], /runtime gone; trying again in 5 min$/);
+    assert.equal(h.notes.at(-1)?.state, "alert");
+    assert.equal(h.watchdog.alertOutstanding, true);
   });
 
   it("keeps the alert when QuestDB does not answer after the restart, and clears it once it does", async () => {
