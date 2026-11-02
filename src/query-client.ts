@@ -48,11 +48,41 @@ export function isReadOnlySQL(sql: string): boolean {
   return READ_ONLY_SQL.test(sql) && !DANGEROUS_SQL.test(sql);
 }
 
+export interface QueryClientOptions {
+  // Sees the body of every error response, so the watchdog can tell QuestDB
+  // running out of memory from the errors the plugin's own reads already get
+  // (see questdb-watchdog.ts).
+  onErrorResponse?: (body: string) => void;
+  // Called whenever QuestDB answered, with any status: the watchdog tells a
+  // busy QuestDB from one that answers nothing by when it last did.
+  onResponse?: () => void;
+}
+
 export class QueryClient {
   private baseUrl: string;
 
-  constructor(host: string, port: number) {
+  constructor(
+    host: string,
+    port: number,
+    private options: QueryClientOptions = {},
+  ) {
     this.baseUrl = `http://${host}:${port}`;
+  }
+
+  private noteResponse(): void {
+    try {
+      this.options.onResponse?.();
+    } catch {
+      // An observer must not change what the caller sees.
+    }
+  }
+
+  private noteErrorResponse(body: string): void {
+    try {
+      this.options.onErrorResponse?.(body);
+    } catch {
+      // Same as noteResponse.
+    }
   }
 
   async exec(sql: string, timeoutMs = 30000): Promise<QuestDBResult> {
@@ -81,9 +111,11 @@ export class QueryClient {
       signal: AbortSignal.timeout(timeoutMs),
       headers: { "Statement-Timeout": String(timeoutMs) },
     });
+    this.noteResponse();
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
+      this.noteErrorResponse(body);
       throw new Error(`QuestDB query failed (${res.status}): ${body}`);
     }
 
@@ -107,9 +139,11 @@ export class QueryClient {
       signal: AbortSignal.timeout(timeoutMs),
       headers: { "Statement-Timeout": String(timeoutMs) },
     });
+    this.noteResponse();
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
+      this.noteErrorResponse(body);
       throw new Error(`QuestDB CSV export failed (${res.status}): ${body}`);
     }
 
@@ -117,13 +151,25 @@ export class QueryClient {
   }
 
   async isHealthy(): Promise<boolean> {
+    return (await this.health()).ok;
+  }
+
+  // The health check with its own answer: `error` is QuestDB's error body
+  // when it answered with one. The watchdog tells a QuestDB failing even
+  // `SELECT 1` at its memory cap from one that is merely slow by it, which
+  // the observers cannot: they see every request's answers.
+  async health(): Promise<{ ok: boolean; error?: string }> {
     try {
       const res = await fetch(`${this.baseUrl}/exec?query=SELECT+1`, {
         signal: AbortSignal.timeout(5000),
       });
-      return res.ok;
+      this.noteResponse();
+      if (res.ok) return { ok: true };
+      const error = await res.text().catch(() => "");
+      this.noteErrorResponse(error);
+      return { ok: false, error };
     } catch {
-      return false;
+      return { ok: false };
     }
   }
 

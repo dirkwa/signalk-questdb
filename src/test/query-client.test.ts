@@ -296,6 +296,97 @@ describe("QueryClient statement timeout header", () => {
   });
 });
 
+describe("QueryClient error responses", () => {
+  // The watchdog learns that QuestDB is out of memory from the errors the
+  // plugin's own reads get, so every error body must reach the observer —
+  // and an observer must never change what the caller sees.
+  const BODY =
+    '{"query":"SELECT 1","error":"global RSS memory limit exceeded","position":0}';
+
+  async function withErrorServer(
+    run: (port: number) => Promise<void>,
+  ): Promise<void> {
+    const http = await import("node:http");
+    const server = http.createServer((_req, res) => {
+      res.statusCode = 400;
+      res.setHeader("content-type", "application/json");
+      // fetch keeps connections alive, and an open one keeps server.close()
+      // from finishing, which can hold the suite open in a sandbox.
+      res.setHeader("connection", "close");
+      res.end(BODY);
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    try {
+      await run((server.address() as { port: number }).port);
+    } finally {
+      server.close();
+    }
+  }
+
+  it("passes exec, CSV and health-check error bodies to the observer", async () => {
+    await withErrorServer(async (port) => {
+      const seen: string[] = [];
+      let responses = 0;
+      const client = new QueryClient("127.0.0.1", port, {
+        onErrorResponse: (body) => seen.push(body),
+        onResponse: () => responses++,
+      });
+      await assert.rejects(client.exec("SELECT 1"), /global RSS memory/);
+      await assert.rejects(client.execCsv("SELECT 1"), /global RSS memory/);
+      assert.equal(await client.isHealthy(), false);
+      assert.deepEqual(seen, [BODY, BODY, BODY]);
+      // An error answer is still an answer: QuestDB is busy or failing, not
+      // gone.
+      assert.equal(responses, 3);
+    });
+  });
+
+  it("reports no response when nothing answers", async () => {
+    const net = await import("node:net");
+    // A port that refuses: bind one, note it, and close it again.
+    const probe = net.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    let responses = 0;
+    const client = new QueryClient("127.0.0.1", port, {
+      onResponse: () => responses++,
+    });
+    assert.equal(await client.isHealthy(), false);
+    await assert.rejects(client.exec("SELECT 1"));
+    assert.equal(responses, 0);
+  });
+
+  it("returns the health check's own error answer", async () => {
+    // What the watchdog tells a QuestDB failing even SELECT 1 at its cap by:
+    // the observers see every request's answers, this only its own.
+    await withErrorServer(async (port) => {
+      const client = new QueryClient("127.0.0.1", port);
+      assert.deepEqual(await client.health(), { ok: false, error: BODY });
+    });
+  });
+
+  it("keeps the caller's error when the observer throws", async () => {
+    await withErrorServer(async (port) => {
+      const client = new QueryClient("127.0.0.1", port, {
+        onErrorResponse: () => {
+          throw new Error("observer broke");
+        },
+        onResponse: () => {
+          throw new Error("observer broke");
+        },
+      });
+      await assert.rejects(
+        client.exec("SELECT 1"),
+        /QuestDB query failed \(400\)/,
+      );
+      assert.equal(await client.isHealthy(), false);
+    });
+  });
+});
+
 describe("QueryClient.ensureTables schema migration", () => {
   it("creates signalk_str with value_kind and migrates existing tables", async () => {
     // CREATE TABLE IF NOT EXISTS leaves a pre-existing table untouched, so

@@ -804,6 +804,52 @@ shown on the status card as **WAL suspended**. Two causes need two remedies:
   shows those numbers and offers **Skip**; if the stuck segment is the newest
   one, skipping drops the entire pending backlog, and the panel says so.
 
+### Out of memory or not answering
+
+QuestDB caps the native memory it tracks at 90 % of the container's memory
+limit (691 MiB under the 768 MB default) and fails any allocation past the cap
+with `global RSS memory limit exceeded`. When something holds memory at the
+cap, queries fail, the WAL apply job then suspends the tables, and in the end
+QuestDB stops accepting HTTP connections. The JVM stays up throughout, so the
+container's restart policy never acts.
+
+In managed mode the plugin checks for this every minute while it runs, and
+restarts the QuestDB container when:
+
+- QuestDB recently reported its global memory limit, and over consecutive
+  checks its native memory is still held at that limit, it fails even the
+  health check with it, or it has stopped answering. A single large query
+  frees what it held when it ends, so it does not count, nor does a client that
+  keeps asking for one.
+- the container is running but QuestDB has answered nothing for several
+  minutes, over consecutive checks. A QuestDB busy with a long statement still
+  answers it in the end, and no check counts while a parquet export streams
+  from it.
+
+Before the restart the plugin writes QuestDB's message and its last error lines
+to the server log, shows the reason on the status card, and raises the Signal K
+notification `notifications.signalk-questdb.watchdog`. After the restart it
+logs the outcome. Once QuestDB answers again the notification returns to normal;
+when it answered right after the restart, the notification keeps the time and
+the reason. Restarts are rate limited, spaced apart and capped per few hours of
+the plugin running; past that the plugin logs that the restart is held back and
+keeps the alert up.
+
+The plugin leaves a container alone if someone else stopped it. If the plugin
+stopped the container itself and could not start it again, or one of its stops
+took the container down only after its deadline, it starts the container at the
+next restart. Once the container has been seen running with none of the
+plugin's stops pending, a later stop is someone else's again; one made earlier,
+while a stop of the plugin's is still pending or before the plugin has seen the
+container running again, counts as the plugin's. An external
+QuestDB is never restarted. A QuestDB that is already stuck when the plugin
+starts, as after a Signal K restart while it was stuck, is not covered:
+restarting the plugin stops the container and starts it afresh.
+
+The managed container runs with QuestDB's query caches off: history reads put
+their time range into the SQL, so the caches never got a hit, and on older
+QuestDB releases they held memory.
+
 ### Performance (Pi and other low-power hosts)
 
 - **Default sampling rate** of 2000 ms limits each path to one write per two
