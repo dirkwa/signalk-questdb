@@ -1208,18 +1208,25 @@ describe("ILPWriter disconnect", () => {
       flushIntervalMs: 10,
       timing: { disconnectTimeoutMs: 200 },
     });
+    // disconnect() lets go of the socket at once; on a writer that hangs,
+    // nothing else would close it.
+    let socket: net.Socket | null = null;
     try {
       await writer.connect();
+      socket = (writer as unknown as { socket: net.Socket | null }).socket;
       // More than the kernel takes, so the end of the stream never goes out.
       const ts = new Date("2024-06-15T12:00:00.000Z");
       for (let i = 0; i < 400_000; i++) {
         writer.write("navigation.speedOverGround", "self", i, ts);
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
-      assert.equal(await settled(writer.disconnect(), 3000), "resolved");
+      assert.ok(socket?.writableLength, "the kernel took the whole stream");
+      // Still waiting for the end of the stream, and given up at the deadline.
+      const disconnecting = writer.disconnect();
+      assert.equal(await settled(disconnecting, 100), "unsettled");
+      assert.equal(await settled(disconnecting, 3000), "resolved");
     } finally {
-      // On a writer that hangs, nothing else would close its socket.
-      (writer as unknown as { socket: net.Socket | null }).socket?.destroy();
+      socket?.destroy();
       (accepted as net.Socket | null)?.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
