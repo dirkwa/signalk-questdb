@@ -3,9 +3,8 @@
 #
 # Calls the shared SignalK reusable workflow which tests this
 # plugin across Linux x64, Linux arm64, macOS, and Windows on
-# Node 22 + 24. armv7/Cerbo GX and the Signal K integration
-# test are opt-in — the auto-run job below disables armv7 and
-# enables integration; use the manual trigger to override.
+# Node 24 + 26. The auto-run job below also runs the Signal K
+# integration test; the manual trigger can turn it off.
 # ─────────────────────────────────────────────────────────────
 
 name: SignalK Plugin CI
@@ -40,15 +39,10 @@ on:
         default: ""
         type: string
       node-versions:
-        description: 'JSON array of Node versions, example: ["22","24"]'
+        description: 'JSON array of Node versions, example: ["24","26"]'
         required: false
-        default: '["22", "24"]'
+        default: '["24", "26"]'
         type: string
-      enable-armv7:
-        description: Run armv7 (Cerbo GX) tests via QEMU
-        required: false
-        default: false
-        type: boolean
       enable-signalk-integration:
         description: Start SignalK server and install plugin for integration testing
         required: false
@@ -60,6 +54,10 @@ on:
         default: '["latest"]'
         type: string
 
+# The shared workflow only reads the repository; it asks for no more.
+permissions:
+  contents: read
+
 jobs:
   # ── Automatic runs (push / pull request) ──────────────────
   test-plugin-auto:
@@ -69,8 +67,7 @@ jobs:
       test-command: npm test
       build-command: npm run build --if-present
       format-check-command: npm run ci-lint
-      node-versions: '["22", "24"]'
-      enable-armv7: false
+      node-versions: '["24", "26"]'
       enable-signalk-integration: true
       signalk-server-versions: '["latest"]'
 
@@ -84,6 +81,5 @@ jobs:
       format-check-command: ${{ inputs.format-check-command }}
       coverage-command: ${{ inputs.coverage-command }}
       node-versions: ${{ inputs.node-versions }}
-      enable-armv7: ${{ inputs.enable-armv7 }}
       enable-signalk-integration: ${{ inputs.enable-signalk-integration }}
       signalk-server-versions: ${{ inputs.signalk-server-versions }}

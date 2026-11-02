@@ -37,7 +37,7 @@
     "test:panel": "npm run build:panel-test && node --test \"dist-panel-test/src/test/panel/**/*.test.js\""
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "author": "Dirk Wahrheit <dirkwahrheit@gmail.com>",
   "license": "SEE LICENSE IN LICENSE.md",
@@ -57,7 +57,7 @@
     "@module-federation/vite": "^1.20.4",
     "@signalk/server-api": "latest",
     "@types/express": "^5.0.0",
-    "@types/node": "^22.0.0",
+    "@types/node": "^24.0.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",

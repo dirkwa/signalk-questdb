@@ -43,7 +43,7 @@ InfluxDB history can be imported.
 
 ### Requirements
 
-- Node.js 22 or newer
+- Node.js 24 or newer
 - QuestDB 8.1 or newer (resolution queries use `SAMPLE BY … FROM … TO`). This
   applies to an external QuestDB and to a pinned **QuestDB image version** in
   managed mode; `latest` always qualifies
