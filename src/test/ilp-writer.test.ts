@@ -188,10 +188,10 @@ describe("ILPWriter", () => {
         `expected one drain listener, found ${listeners}`,
       );
     } finally {
-      // No graceful end(): the server never reads, so disconnect()'s flush
-      // would wait forever. `stopped` also stops the close handler scheduling
-      // a reconnect that would outlive the test, and the accepted socket is
-      // destroyed because server.close() waits on live connections.
+      // No graceful end(): the server never reads, so disconnect() would
+      // wait out its deadline. `stopped` also stops the close handler
+      // scheduling a reconnect that would outlive the test, and the accepted
+      // socket is destroyed because server.close() waits on live connections.
       if (writer) {
         (writer as unknown as { stopped: boolean }).stopped = true;
       }
@@ -1026,5 +1026,212 @@ describe("ILPWriter timestamp watch", () => {
     // The watch is over: what is written now is not reported.
     writer.writeAtNanos("a.b", "self", 1, 1n);
     assert.equal(writer.endTimestampWatch(), null);
+  });
+});
+
+describe("ILPWriter disconnect", () => {
+  // The plugin's update route closes the writer and connects it again at
+  // once, all under the plugin's lifecycle lock: neither call may hang.
+  const settled = <T>(p: Promise<T>, ms: number) =>
+    Promise.race([
+      p.then(
+        () => "resolved",
+        () => "rejected",
+      ),
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve("unsettled"), ms),
+      ),
+    ]);
+
+  it("settles a connect that fails right after a disconnect", async () => {
+    let accepted: net.Socket | null = null;
+    const server = net.createServer((socket) => {
+      accepted = socket;
+      socket.resume();
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      timing: { initialReconnectDelay: 20, maxReconnectDelay: 40 },
+    });
+    let closed: Promise<void> | null = null;
+    try {
+      await writer.connect();
+      // Nothing listens any more: the next connect is refused.
+      closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      await writer.disconnect();
+      assert.equal(await settled(writer.connect(), 2000), "rejected");
+    } finally {
+      await writer.disconnect();
+      (accepted as net.Socket | null)?.destroy();
+      await (closed ??
+        new Promise<void>((resolve) => server.close(() => resolve())));
+    }
+  });
+
+  it("does not count its own disconnect as a dropped connection", async () => {
+    const server = net.createServer((socket) => socket.resume());
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+    let unhealthy = 0;
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      onUnhealthy: () => unhealthy++,
+      timing: {
+        initialReconnectDelay: 20,
+        maxReconnectDelay: 40,
+        stableConnectionMs: 60_000,
+        unhealthyAfterFlaps: 1,
+      },
+    });
+    try {
+      await writer.connect();
+      for (let i = 0; i < 3; i++) {
+        await writer.disconnect();
+        await writer.connect();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(unhealthy, 0, "a disconnect was counted as a flap");
+      const open = await new Promise<number>((resolve, reject) =>
+        server.getConnections((err, n) => (err ? reject(err) : resolve(n))),
+      );
+      assert.equal(open, 1, "one connection, the last one");
+    } finally {
+      await writer.disconnect();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("leaves a writer disconnected that was still connecting", async () => {
+    const server = net.createServer((socket) => socket.resume());
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+    const writer = new ILPWriter("127.0.0.1", port);
+    const state = writer as unknown as {
+      connected: boolean;
+      flushTimer: NodeJS.Timeout | null;
+    };
+    try {
+      const connecting = writer.connect();
+      await writer.disconnect();
+      // Cut short by the disconnect, which is no failure to report.
+      assert.equal(await settled(connecting, 2000), "resolved");
+      assert.equal(state.connected, false);
+      assert.equal(state.flushTimer, null, "a flush timer outlived it");
+    } finally {
+      await writer.disconnect();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("keeps a socket that is still closing out of the next connection", async () => {
+    const server = net.createServer((socket) => socket.resume());
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+    let unhealthy = 0;
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      onUnhealthy: () => unhealthy++,
+      timing: {
+        initialReconnectDelay: 20,
+        maxReconnectDelay: 40,
+        stableConnectionMs: 60_000,
+        unhealthyAfterFlaps: 1,
+      },
+    });
+    try {
+      await writer.connect();
+      // A caller that does not wait for the disconnect to finish, first of a
+      // connected socket, then of one still connecting.
+      let closing = writer.disconnect();
+      await writer.connect();
+      await closing;
+      await writer.disconnect();
+      writer.connect().catch(() => {});
+      closing = writer.disconnect();
+      await writer.connect();
+      await closing;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(unhealthy, 0, "the old socket's close counted as a flap");
+      assert.equal(
+        (writer as unknown as { connected: boolean }).connected,
+        true,
+      );
+    } finally {
+      await writer.disconnect();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("ends a connect that never completes when it disconnects", async () => {
+    // A connect left pending, as to a host that drops the SYN.
+    const realConnect = net.Socket.prototype.connect;
+    net.Socket.prototype.connect = function (this: net.Socket) {
+      (this as unknown as { connecting: boolean }).connecting = true;
+      return this;
+    } as typeof realConnect;
+    try {
+      // Nothing was sent on it, so it goes at once, not at the deadline.
+      const writer = new ILPWriter("127.0.0.1", 9, undefined, {
+        timing: { disconnectTimeoutMs: 60_000 },
+      });
+      const connecting = writer.connect();
+      net.Socket.prototype.connect = realConnect;
+      assert.equal(await settled(writer.disconnect(), 2000), "resolved");
+      assert.equal(await settled(connecting, 2000), "resolved");
+      assert.equal(
+        (writer as unknown as { connected: boolean }).connected,
+        false,
+      );
+    } finally {
+      net.Socket.prototype.connect = realConnect;
+    }
+  });
+
+  it("gives up on a QuestDB that stopped reading", async () => {
+    let accepted: net.Socket | null = null;
+    const server = net.createServer((socket) => {
+      accepted = socket;
+      socket.pause();
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const port = (server.address() as net.AddressInfo).port;
+    const writer = new ILPWriter("127.0.0.1", port, undefined, {
+      flushIntervalMs: 10,
+      timing: { disconnectTimeoutMs: 200 },
+    });
+    // disconnect() lets go of the socket at once; on a writer that hangs,
+    // nothing else would close it.
+    let socket: net.Socket | null = null;
+    try {
+      await writer.connect();
+      socket = (writer as unknown as { socket: net.Socket | null }).socket;
+      // More than the kernel takes, so the end of the stream never goes out.
+      const ts = new Date("2024-06-15T12:00:00.000Z");
+      for (let i = 0; i < 400_000; i++) {
+        writer.write("navigation.speedOverGround", "self", i, ts);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.ok(socket?.writableLength, "the kernel took the whole stream");
+      // Still waiting for the end of the stream, and given up at the deadline.
+      const disconnecting = writer.disconnect();
+      assert.equal(await settled(disconnecting, 100), "unsettled");
+      assert.equal(await settled(disconnecting, 3000), "resolved");
+    } finally {
+      // Stopped first, or the socket's close schedules a reconnect; not
+      // awaited, as it may be what hangs.
+      void writer.disconnect();
+      socket?.destroy();
+      (accepted as net.Socket | null)?.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

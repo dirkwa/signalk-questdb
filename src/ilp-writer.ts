@@ -26,6 +26,11 @@ const STABLE_CONNECTION_MS = 5000;
 // a permanently-green "Recording" status.
 const UNHEALTHY_AFTER_FLAPS = 5;
 
+// How long disconnect() lets the socket send what is buffered. A QuestDB that
+// has stopped reading never takes it, and the plugin's stop and update wait
+// on disconnect() under the plugin's lifecycle lock.
+const DISCONNECT_TIMEOUT_MS = 10_000;
+
 // Upper bound on lines retained while disconnected. QuestDB being down must not
 // grow the buffer without limit on a Pi/Cerbo. When full we drop the OLDEST
 // lines — for a live history feed the most recent samples are the ones worth
@@ -122,6 +127,7 @@ export class ILPWriter {
   private readonly maxReconnectDelay: number;
   private readonly stableConnectionMs: number;
   private readonly unhealthyAfterFlaps: number;
+  private readonly disconnectTimeoutMs: number;
   // How often buffered lines are committed. Unlike `timing`, this is a real
   // production knob (wired to the plugin's ilpFlushIntervalMs config) — see
   // the DEFAULT_FLUSH_INTERVAL_MS comment for the batching rationale.
@@ -144,6 +150,7 @@ export class ILPWriter {
         maxReconnectDelay?: number;
         stableConnectionMs?: number;
         unhealthyAfterFlaps?: number;
+        disconnectTimeoutMs?: number;
       };
     },
   ) {
@@ -159,6 +166,7 @@ export class ILPWriter {
     this.maxReconnectDelay = t.maxReconnectDelay ?? MAX_RECONNECT_DELAY_MS;
     this.stableConnectionMs = t.stableConnectionMs ?? STABLE_CONNECTION_MS;
     this.unhealthyAfterFlaps = t.unhealthyAfterFlaps ?? UNHEALTHY_AFTER_FLAPS;
+    this.disconnectTimeoutMs = t.disconnectTimeoutMs ?? DISCONNECT_TIMEOUT_MS;
     this.reconnectDelay = this.initialReconnectDelay;
   }
 
@@ -170,8 +178,19 @@ export class ILPWriter {
     return new Promise((resolve, reject) => {
       const socket = new net.Socket();
       this.socket = socket;
+      // Once disconnect() has let go of this socket, its events are stale:
+      // they end this connect() and leave the writer's state alone. Its
+      // `close` coming after the next connect() began would otherwise end
+      // that attempt and count as a dropped connection. A connect that
+      // disconnect() cut short resolves, as one that got through before it
+      // did: a stop during the plugin's start is no failure of the start.
+      const current = () => this.socket === socket;
 
       socket.connect(this.port, this.host, () => {
+        if (!current()) {
+          resolve();
+          return;
+        }
         this.connected = true;
         this.connecting = false;
         this.connectedAt = Date.now();
@@ -187,10 +206,9 @@ export class ILPWriter {
       });
 
       socket.on("error", (err) => {
-        if (this.connecting) {
-          this.connecting = false;
-          reject(err);
-        }
+        // Fails a connect still in progress; a no-op once it connected.
+        reject(err);
+        if (current()) this.connecting = false;
         this.debug(`ILP socket error: ${err.message}`);
       });
 
@@ -200,6 +218,11 @@ export class ILPWriter {
       // lives here — the connect() rejection path deliberately does NOT also
       // reschedule, which would double-count flaps and run two timers.
       socket.on("close", () => {
+        if (!current()) {
+          // disconnect() destroyed it before it connected: no error came.
+          resolve();
+          return;
+        }
         const wasStable = this.connected && !this.stableTimer;
         const upForMs = this.connectedAt ? Date.now() - this.connectedAt : 0;
         this.connected = false;
@@ -680,18 +703,31 @@ export class ILPWriter {
       this.flush(true);
     }
 
-    return new Promise((resolve) => {
-      if (!this.socket) {
-        resolve();
-        return;
-      }
-      this.socket.end(() => {
-        this.socket?.destroy();
-        this.socket = null;
-        this.connected = false;
-        this.awaitingDrain = false;
+    // The writer is disconnected from here on, whatever the socket still
+    // does (see connect()), so a connect() right after this starts clean.
+    const socket = this.socket;
+    const wasConnected = this.connected;
+    this.socket = null;
+    this.connected = false;
+    this.connecting = false;
+    this.awaitingDrain = false;
+    if (!socket || socket.closed) return;
+    // Resolves once the socket has closed, having sent what is buffered. A
+    // QuestDB that has stopped reading never takes the rest: past the
+    // deadline the socket is destroyed, and the batches it still held go
+    // back into the buffer (see writeBatch). A socket that never connected
+    // holds nothing and goes at once.
+    await new Promise<void>((resolve) => {
+      const deadline = setTimeout(
+        () => socket.destroy(),
+        this.disconnectTimeoutMs,
+      );
+      socket.once("close", () => {
+        clearTimeout(deadline);
         resolve();
       });
+      if (wasConnected) socket.end(() => socket.destroy());
+      else socket.destroy();
     });
   }
 }
