@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run ci-lint` — eslint + prettier --check (used in CI)
 - Run a single test file: `node --test dist/test/history-v2.test.js` (after `npm run build`)
 
-Node ≥ 22 is required (uses the built-in test runner).
+Node ≥ 24 is required (uses the built-in test runner).
 
 ## Architecture
 
@@ -21,7 +21,7 @@ This is a Signal K **server plugin** that ingests vessel data into a managed **Q
 
 ### Two surfaces
 
-1. **Plugin runtime** (`src/index.ts` and siblings) — compiled by `tsc` to `dist/`, loaded by Signal K server as `main` (`dist/index.js`). The package is **ESM** (`"type": "module"`): `src/index.ts` ends in `export default`, and Signal K's `importOrRequire()` unwraps it. Node ≥ 20.19 can `require()` an ESM module, so this works on both supported Node versions.
+1. **Plugin runtime** (`src/index.ts` and siblings) — compiled by `tsc` to `dist/`, loaded by Signal K server as `main` (`dist/index.js`). The package is **ESM** (`"type": "module"`): `src/index.ts` ends in `export default`, and Signal K's `importOrRequire()` unwraps it. Node ≥ 20.19 can `require()` an ESM module, which every Node version the plugin supports does.
 2. **React config panel** (`src/configpanel/`) — TypeScript + JSX, bundled by **Vite** (`vite.config.ts`) via **Module Federation** into `public/remoteEntry.js`, exposed to the Signal K Admin UI as `./PluginConfigurationPanel`. React 19 is shared as a singleton with the host UI. It has its own `tsconfig.json` (browser libs, classic JSX, `noEmit`) so DOM types never reach the Node compile.
 
    Because the package is `"type": "module"`, the server injects the panel's script tag with `type="module"`, and the Admin UI then loads it as an **ESM remote**: `await import(remoteEntry.js)` expecting exported `get`/`init` (see the admin UI's `views/Webapps/dynamicutilities.ts`). Vite's federation output provides exactly that.

@@ -15,11 +15,11 @@ updates:
           - patch
     ignore:
       # @types/node major versions track the Node.js major. Pin to the
-      # lowest supported runtime (Node 22 per package.json engines) so
+      # lowest supported runtime (Node 24 per package.json engines) so
       # types reflect what's actually available on every supported version.
-      # Allow updates within the v22.x line; ignore v23+.
+      # Allow updates within the v24.x line; ignore v25+.
       - dependency-name: "@types/node"
-        versions: [">=23"]
+        versions: [">=25"]
 
   - package-ecosystem: github-actions
     directory: "/"

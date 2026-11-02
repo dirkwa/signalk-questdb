@@ -136,7 +136,7 @@ reviews:
           must narrow `unknown` and avoid `any`.
         - The configpanel is TypeScript too, with its own `tsconfig.json`
           (browser libs, `noEmit`), checked by `npm run typecheck:panel`.
-        - Node `>= 22` per `engines` (uses Node's built-in test runner).
+        - Node `>= 24` per `engines` (uses Node's built-in test runner).
 
         ## Tests
 
