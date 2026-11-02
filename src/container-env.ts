@@ -146,6 +146,21 @@ export function buildContainerEnv(
     // back to INFO when diagnosing a database that has stopped recording.
     QDB_LOG_W_STDOUT_LEVEL: "ERROR",
 
+    // The HTTP endpoint keeps up to 128 compiled queries (32 blocks of 4) for
+    // reuse by identical SQL text, and pg-wire keeps another such cache. The
+    // plugin's history reads put their time range into the SQL as literals,
+    // and so do Grafana's macros, so neither cache gets a hit — they only
+    // fill. On QuestDB before 10.0.0 every cached parallel GROUP BY / SAMPLE
+    // BY also keeps its native buffers at their peak size (fixed upstream in
+    // questdb#7267): about 7 MiB each over a month of data, so a full cache
+    // holds more than the 691 MiB the 768m cap leaves QuestDB, and it then
+    // fails every allocation with "global RSS memory limit exceeded". Seen
+    // twice on 9.4.3 within a day: 20 distinct reads added 150 MiB that only
+    // flush_query_cache() or a restart gave back. Without the caches, each
+    // read frees its buffers when it ends.
+    QDB_HTTP_QUERY_CACHE_ENABLED: "false",
+    QDB_PG_SELECT_CACHE_ENABLED: "false",
+
     QDB_CAIRO_O3_COLUMN_MEMORY_SIZE: "262144",
     ...(config.compression && config.compression !== "none"
       ? {

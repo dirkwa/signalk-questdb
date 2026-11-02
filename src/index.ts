@@ -84,6 +84,9 @@ import {
   type PendingSegment,
   type SuspendedTable,
 } from "./wal-monitor.js";
+import { QuestdbWatchdog, questdbErrorLines } from "./questdb-watchdog.js";
+import { WatchdogChecks } from "./watchdog-checks.js";
+import { drained } from "./drained.js";
 import {
   QUESTDB_INTERNAL_HTTP_PORT,
   QUESTDB_INTERNAL_ILP_PORT,
@@ -300,6 +303,34 @@ export default (app: App) => {
   // stall point, and raises/clears the Signal K notification. Lives from a
   // completed start to the next stop/purge.
   let walMonitor: WalMonitor | null = null;
+  // Restarts a managed QuestDB that ran out of memory or stopped answering
+  // (questdb-watchdog.ts). Lives from a completed start to the next
+  // stop/purge, managed mode only.
+  let watchdog: QuestdbWatchdog | null = null;
+  // The watchdog's probe and restart, and what they learn from the plugin's
+  // own queries (watchdog-checks.ts).
+  let watchdogChecks: WatchdogChecks | null = null;
+  // A client reports to the watchdog of the start that created it: a request
+  // of an earlier start that ends late tells nothing about the container now.
+  const questdbClientOptions = (generation: number) => ({
+    onErrorResponse: (body: string) => {
+      if (generation === lifecycleGeneration)
+        watchdogChecks?.noteErrorResponse(body);
+    },
+    onResponse: () => {
+      if (generation === lifecycleGeneration) watchdogChecks?.noteResponse();
+    },
+  });
+  // The watchdog's error is the one on the status line, so its recovery may
+  // replace it with the recording line. Any other error published since
+  // stays.
+  let watchdogStatusShown = false;
+  // Parquet exports streaming from QuestDB. One can keep QuestDB's single
+  // worker busy for minutes, so health checks time out while it streams: the
+  // watchdog does not judge QuestDB meanwhile. Counted only once QuestDB has
+  // answered, so an export waiting on a QuestDB that answers nothing does
+  // not hide it.
+  let questdbExportsRunning = 0;
   // Serializes the lifecycle operations that create or destroy QuestDB
   // resources — asyncStart, /api/update/apply, and /api/purge-data — so they
   // can never interleave. Without this, a purge (or update) issued while a
@@ -321,6 +352,9 @@ export default (app: App) => {
   // that must not span a container swap (the WAL skip's final guard) needs
   // this separate epoch to notice one.
   let containerEpoch = 0;
+  // The watchdog's container stops still in flight, across plugin restarts
+  // (WatchdogChecksDeps.stops).
+  const watchdogStops = { pending: 0 };
   // True only between a FULLY completed start (providers, stream
   // subscription, and timers all registered) and the next stop/purge.
   // queryClient/writer are not usable as a running sentinel: they are
@@ -351,6 +385,7 @@ export default (app: App) => {
   let pluginErrorActive = false;
   const publishError = (msg: string) => {
     pluginErrorActive = true;
+    watchdogStatusShown = false;
     app.setPluginError(msg);
   };
   // Republish the recording line, but never at the cost of an active error.
@@ -774,6 +809,49 @@ export default (app: App) => {
     lastWalNotification = null;
   }
 
+  const WATCHDOG_NOTIFICATION_PATH = "notifications.signalk-questdb.watchdog";
+
+  // The watchdog sends each state change once (an alert when it restarts or
+  // holds a restart back, normal once QuestDB answers again), so no dedupe.
+  function emitWatchdogNotification(
+    state: "alert" | "normal",
+    message: string,
+  ): void {
+    app.handleMessage("signalk-questdb", {
+      updates: [
+        {
+          values: [
+            {
+              path: WATCHDOG_NOTIFICATION_PATH,
+              value: {
+                state,
+                method: ["visual"],
+                message,
+                timestamp: new Date().toISOString(),
+              },
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  // Same reason as clearWalAlertOnTeardown: an alert nobody will clear must
+  // not outlive the watchdog.
+  function stopWatchdog(): void {
+    if (!watchdog) return;
+    watchdog.stop();
+    if (watchdog.alertOutstanding) {
+      emitWatchdogNotification(
+        "normal",
+        "QuestDB watchdog stopped (plugin stopped or data removed); QuestDB " +
+          "is no longer watched.",
+      );
+    }
+    watchdog = null;
+    watchdogChecks = null;
+  }
+
   // wal_tables() probe shared by /api/status, the WAL monitor, and the
   // resume endpoints. errorTag/errorMessage carry QuestDB's reason for a
   // suspension when it has one; the columns are absent on an older pinned
@@ -1078,7 +1156,11 @@ export default (app: App) => {
     let { host: httpHost, port: httpPort } = questdbEndpoints.http;
 
     app.debug("connecting to QuestDB at %s:%d", httpHost, httpPort);
-    queryClient = new QueryClient(httpHost, httpPort);
+    queryClient = new QueryClient(
+      httpHost,
+      httpPort,
+      questdbClientOptions(lifecycleGeneration),
+    );
 
     app.setPluginStatus("Waiting for QuestDB to become ready...");
     let questdb = queryClient;
@@ -1094,7 +1176,11 @@ export default (app: App) => {
               if (signal.aborted) return;
               questdbEndpoints = resolved;
               ({ host: httpHost, port: httpPort } = resolved.http);
-              questdb = queryClient = new QueryClient(httpHost, httpPort);
+              questdb = queryClient = new QueryClient(
+                httpHost,
+                httpPort,
+                questdbClientOptions(lifecycleGeneration),
+              );
             }
           : undefined,
         onAttemptFailed: (err, nextDelayMs) => {
@@ -1145,6 +1231,8 @@ export default (app: App) => {
       // stuck on a cheerful "Recording" while every sample is dropped.
       onUnhealthy: (msg) => publishError(msg),
       onHealthy: () => {
+        // The watchdog's error stays until the watchdog clears it.
+        if (watchdogStatusShown) return;
         // The writer recovered: the error is no longer current, so the
         // recording line may take the status entry back.
         pluginErrorActive = false;
@@ -1484,6 +1572,7 @@ export default (app: App) => {
           .exec(`ALTER TABLE "${name.replace(/"/g, '""')}" RESUME WAL`, 10_000)
           .then(() => undefined),
       onSuspended: (tables, anyAutoResumeFailed) => {
+        watchdogChecks?.noteSuspended(tables);
         const summary = tables
           .map((t) => `${t.name} (${t.txnLag} txns behind)`)
           .join(", ");
@@ -1512,12 +1601,79 @@ export default (app: App) => {
           "QuestDB history recording has recovered.",
           "normal:recovered",
         );
+        if (watchdogStatusShown) return;
         app.setPluginStatus(recordingStatus(ilpHost, ilpPort));
       },
       debug: (msg) => app.debug(msg),
       error: (msg) => app.error(msg),
     });
     walMonitor.start();
+
+    // Restart QuestDB when it runs out of memory or stops answering: neither
+    // ends the JVM, so the container's restart policy never acts, and both
+    // cost every sample from then on (questdb-watchdog.ts). Managed mode
+    // only: an external QuestDB is not the plugin's to restart.
+    const managedContainers =
+      config.managedContainer !== false
+        ? ((globalThis as any).__signalk_containerManager as
+            ContainerManagerApi | undefined)
+        : undefined;
+    if (managedContainers) {
+      // Captured like an update's: stop() and purge bump it, and a restart
+      // that spans one must not start the container the teardown stopped.
+      const generation = lifecycleGeneration;
+      const ended = () => generation !== lifecycleGeneration;
+      const checks = new WatchdogChecks({
+        containers: managedContainers,
+        name: QUESTDB_CONTAINER_NAME,
+        client: () => queryClient,
+        busy: () =>
+          legacyCleanupRunning
+            ? "the string table is being rebuilt"
+            : questdbExportsRunning > 0
+              ? "an export is running"
+              : null,
+        epoch: () => containerEpoch,
+        bumpEpoch: () => {
+          containerEpoch++;
+        },
+        ended,
+        endpoint: () => {
+          const http = questdbEndpoints?.http;
+          return http ? `${http.host}:${http.port}` : null;
+        },
+        stops: watchdogStops,
+        reconnectWriter: () => {
+          // A connect that fails leaves the writer's own reconnect with
+          // backoff to it.
+          if (writer && !ended()) writer.connect().catch(() => {});
+        },
+      });
+      watchdogChecks = checks;
+      watchdog = new QuestdbWatchdog({
+        exclusive: (fn) => withLifecycleLock(fn),
+        probe: () => checks.probe(),
+        recentErrors: async () =>
+          questdbErrorLines((await fetchEngineLogLines()) ?? []),
+        restart: () => checks.restart(),
+        log: (msg) => app.error(msg),
+        status: (msg) => {
+          publishError(msg);
+          watchdogStatusShown = true;
+        },
+        recovered: () => {
+          // Another error published meanwhile is still current.
+          if (pluginErrorActive && !watchdogStatusShown) return;
+          pluginErrorActive = false;
+          watchdogStatusShown = false;
+          const ilp = questdbEndpoints?.ilp;
+          if (ilp) app.setPluginStatus(recordingStatus(ilp.host, ilp.port));
+        },
+        notify: (state, message) => emitWatchdogNotification(state, message),
+        debug: (msg) => app.debug(msg),
+      });
+      watchdog.start();
+    }
 
     // vm.max_map_count is kernel-global (not namespaced), so in managed mode
     // this local probe reflects the limit the QuestDB container actually runs
@@ -1711,6 +1867,7 @@ export default (app: App) => {
         walMonitor = null;
       }
       clearWalAlertOnTeardown();
+      stopWatchdog();
       schemaMismatch = false;
 
       // Clear the clamp warning so it doesn't survive into the next start
@@ -2693,6 +2850,7 @@ export default (app: App) => {
               walMonitor = null;
             }
             clearWalAlertOnTeardown();
+            stopWatchdog();
             if (retention) {
               retention.stop();
               retention = null;
@@ -2753,6 +2911,9 @@ export default (app: App) => {
           // later wakes up returns early instead of recreating the container.
           lifecycleGeneration++;
           startAbort?.abort();
+          // Silences a restart in flight now; the teardown below clears the
+          // alert once it has the lock.
+          watchdog?.stop();
 
           let lockedTeardownSettled = false;
           let lockedTeardownError: unknown;
@@ -3778,8 +3939,18 @@ export default (app: App) => {
               }
             }
 
+            // Also bounds the streaming below: a client that stops reading
+            // must not hold the export past it (see drained()). A client that
+            // leaves ends it at once, as in /api/full-export: during a slow
+            // query QuestDB may send nothing for minutes.
+            const clientLeft = new AbortController();
+            res.once("close", () => clientLeft.abort());
+            const exportSignal = AbortSignal.any([
+              AbortSignal.timeout(300000),
+              clientLeft.signal,
+            ]);
             const qdbRes = await fetch(expUrl.toString(), {
-              signal: AbortSignal.timeout(300000),
+              signal: exportSignal,
             });
             if (!qdbRes.ok || !qdbRes.body) {
               const body = await qdbRes.text().catch(() => "");
@@ -3794,18 +3965,36 @@ export default (app: App) => {
             );
             // Stream the response through
             const reader = qdbRes.body.getReader();
+            // Same as /api/full-export: QuestDB is busy until the stream ends.
+            questdbExportsRunning++;
+            let complete = false;
             try {
               while (true) {
                 const { done, value } = await reader.read();
-                if (done) break;
-                if (!res.write(value)) {
-                  await new Promise((resolve) => res.once("drain", resolve));
+                if (done) {
+                  complete = true;
+                  break;
                 }
+                if (!res.write(value) && !(await drained(res, exportSignal)))
+                  break;
               }
-              res.end();
             } catch (streamErr) {
               app.debug("export stream error:", streamErr);
-              res.end();
+            } finally {
+              questdbExportsRunning--;
+              // A stream cut short must not end like a complete one: the
+              // response is chunked, so end() would hand the client a
+              // truncated parquet file under a clean 200.
+              if (complete) res.end();
+              else res.destroy();
+              // A client that left mid-stream ends the loop early: close
+              // QuestDB's side too rather than leave it streaming to nobody.
+              // cancel() throws if the stream already ended; that is fine.
+              try {
+                await reader.cancel();
+              } catch {
+                // already finished
+              }
             }
           } else {
             const csv = await queryClient.execCsv(sql);
@@ -3938,8 +4127,8 @@ export default (app: App) => {
 
           // Streaming phase: headers are committed at the first write,
           // so we can no longer switch to a JSON error. Best we can do
-          // on stream failure is end the response and let the client
-          // notice the truncation.
+          // on stream failure is break the connection, so the client sees
+          // the truncation.
           res.setHeader("Content-Type", "application/vnd.apache.parquet");
           res.setHeader(
             "Content-Disposition",
@@ -3947,17 +4136,24 @@ export default (app: App) => {
           );
 
           const reader = qdbRes.body.getReader();
+          // QuestDB answered and streams: its one worker is busy until the
+          // stream ends (see questdbExportsRunning).
+          questdbExportsRunning++;
+          let complete = false;
           try {
             while (true) {
               const { done, value } = await reader.read();
-              if (done) break;
-              if (!res.write(value)) {
-                await new Promise((resolve) => res.once("drain", resolve));
+              if (done) {
+                complete = true;
+                break;
               }
+              if (!res.write(value) && !(await drained(res, controller.signal)))
+                break;
             }
           } catch (streamErr) {
             app.debug("full-export stream error:", streamErr);
           } finally {
+            questdbExportsRunning--;
             clearTimeout(timeoutId);
             res.removeListener("close", onClientClose);
             // Cancel the upstream reader so QuestDB's connection is
@@ -3969,7 +4165,9 @@ export default (app: App) => {
               // already finished
             }
             if (!res.writableEnded) {
-              res.end();
+              // Same as /api/export: a truncated file must not end cleanly.
+              if (complete) res.end();
+              else res.destroy();
             }
           }
         } catch (err) {

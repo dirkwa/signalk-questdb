@@ -110,6 +110,19 @@ describe("buildContainerEnv low-power tuning", () => {
   });
 });
 
+describe("buildContainerEnv query caches", () => {
+  it("turns the HTTP and pg-wire query caches off", () => {
+    // Before QuestDB 10.0.0 a cached GROUP BY keeps its buffers at peak size,
+    // and history SQL embeds its time range, so every read is a new entry:
+    // the cache filled QuestDB's memory cap within a day. The spellings are
+    // the ones SHOW PARAMETERS reports for http.query.cache.enabled and
+    // pg.select.cache.enabled.
+    const env = buildContainerEnv({});
+    assert.equal(env.QDB_HTTP_QUERY_CACHE_ENABLED, "false");
+    assert.equal(env.QDB_PG_SELECT_CACHE_ENABLED, "false");
+  });
+});
+
 describe("buildContainerEnv JVM flags", () => {
   // A heap OOM in a worker loop killed a QuestDB worker thread while the JVM
   // stayed up in back-to-back full GCs — recording nothing, never restarted.
