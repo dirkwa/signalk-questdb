@@ -806,11 +806,10 @@ shown on the status card as **WAL suspended**. Two causes need two remedies:
 
 ### Out of memory or not answering
 
-QuestDB caps the native memory it tracks at 90 % of the container's memory
-limit (691 MiB under the 768 MB default) and fails any allocation past the cap
-with `global RSS memory limit exceeded`. When something holds memory at the
-cap, queries fail, the WAL apply job then suspends the tables, and in the end
-QuestDB stops accepting HTTP connections. The JVM stays up throughout, so the
+QuestDB caps the native memory it tracks below the container's memory limit
+and fails any allocation past the cap with `global RSS memory limit exceeded`.
+When something holds memory at the cap, queries fail, the WAL apply job then
+suspends the tables, and in the end QuestDB stops accepting HTTP connections. The JVM stays up throughout, so the
 container's restart policy never acts.
 
 In managed mode the plugin checks for this every minute while it runs, and
