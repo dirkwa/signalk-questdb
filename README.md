@@ -289,8 +289,8 @@ data really stopped:
   age**. Keep the heartbeat below that, or a vessel lying still may come back
   with its position but without its speed, course and heading.
 
-`navigation.position` is never skipped. Set the heartbeat to 0 to record every
-sample.
+`navigation.position` is written even when unchanged. Set the heartbeat to 0 to
+record every sample.
 
 **Batching.** Samples are buffered and committed every **Write batch interval**
 (5 s), one WAL transaction per table per commit. The buffer holds 100 000 lines;
