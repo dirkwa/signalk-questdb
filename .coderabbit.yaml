@@ -145,7 +145,13 @@ reviews:
         (`npm run build:all`). Flag changes that add tests but don't
         match the existing pattern.
 
-        ## Echo comments
+        ## Comments
+
+        Code explains itself: names, types and small functions say what
+        it does. Do not ask for docstrings or JSDoc, and do not flag a
+        function for lacking one. A comment is there for the *why* the
+        code cannot show: a constraint, a trap, a choice against the
+        obvious alternative.
 
         Flag any comment that merely restates what the code already says.
         Examples to flag:
@@ -222,3 +228,12 @@ reviews:
           `ContainerResourceLimits` (memory + cpus) — the defaults of
           `768m` / `1.5 cpus` are deliberate for the typical Signal K
           host stack (questdb + grafana + mayara + backup co-resident).
+
+  # Docstrings are not wanted for their own sake; see "Comments" above.
+  finishing_touches:
+    docstrings:
+      enabled: false
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
