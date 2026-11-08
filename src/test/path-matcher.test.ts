@@ -119,11 +119,17 @@ describe("RateMatcher", () => {
     assert.equal(r.rateFor("environment.water.temperature"), null);
   });
 
-  it("ignores non-positive rates, matching the previous skip", () => {
-    const r = new RateMatcher({ "a.*": 0, "b.*": -1, "c.*": 100 });
-    assert.equal(r.rateFor("a.x"), null);
+  it("resolves a rate of 0 and ignores negative and infinite ones", () => {
+    const r = new RateMatcher({
+      "a.*": 0,
+      "b.*": -1,
+      "c.*": 100,
+      "d.*": Infinity,
+    });
+    assert.equal(r.rateFor("a.x"), 0);
     assert.equal(r.rateFor("b.x"), null);
     assert.equal(r.rateFor("c.x"), 100);
+    assert.equal(r.rateFor("d.x"), null);
   });
 
   it("prefers an exact pattern over a glob", () => {
@@ -135,7 +141,8 @@ describe("RateMatcher", () => {
 
   it("is empty when no usable rates are configured", () => {
     assert.equal(new RateMatcher({}).isEmpty, true);
-    assert.equal(new RateMatcher({ "a.*": 0 }).isEmpty, true);
+    assert.equal(new RateMatcher({ "a.*": -1 }).isEmpty, true);
+    assert.equal(new RateMatcher({ "a.*": 0 }).isEmpty, false);
     assert.equal(new RateMatcher({ "a.*": 5 }).isEmpty, false);
   });
 });
@@ -143,7 +150,8 @@ describe("RateMatcher", () => {
 describe("RateMatcher throttle semantics", () => {
   // The previous implementation returned as soon as a positive override
   // matched, and only otherwise fell through to the default rate. Resolving
-  // the rate first and applying one check must keep exactly that behaviour.
+  // the rate first and applying one check must keep exactly that behaviour,
+  // except that an override of 0 now matches too.
   function effectiveRate(
     rates: Record<string, number>,
     path: string,
@@ -170,11 +178,23 @@ describe("RateMatcher throttle semantics", () => {
     );
   });
 
-  it("falls back to the default when the only match is non-positive", () => {
-    // A 0 override meant "not a throttle rule" and fell through, rather than
-    // disabling throttling for that path.
+  it("records a path at wire speed when its override is 0", () => {
+    // A 0 override used to mean "not a throttle rule" and fell through to the
+    // default, so wind could not be recorded at wire speed while everything
+    // else stayed at 2 s. It now means every update, as for the default rate.
     assert.equal(
-      effectiveRate({ "navigation.*": 0 }, "navigation.position", 2000),
+      effectiveRate(
+        { "environment.wind.*": 0 },
+        "environment.wind.angleApparent",
+        2000,
+      ),
+      0,
+    );
+  });
+
+  it("falls back to the default when the only match is negative", () => {
+    assert.equal(
+      effectiveRate({ "navigation.*": -1 }, "navigation.position", 2000),
       2000,
     );
   });
