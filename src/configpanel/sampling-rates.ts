@@ -5,7 +5,10 @@
 
 export interface ParsedSamplingRates {
   rates: Record<string, number>;
-  /** Lines that are not a pattern followed by a rate of 0 or more. */
+  /**
+   * Lines that are not a pattern followed by a rate of 0 or more, or that
+   * repeat a pattern.
+   */
   invalid: string[];
 }
 
@@ -25,7 +28,9 @@ export function parseSamplingRates(text: string): ParsedSamplingRates {
     if (line === "") continue;
     const parts = line.split(/\s+/);
     const ms = parts.length === 2 ? Number(parts[1]) : NaN;
-    if (!Number.isFinite(ms) || ms < 0) {
+    // A repeated pattern is refused: its later line would otherwise replace
+    // the earlier rate without a word.
+    if (!Number.isFinite(ms) || ms < 0 || Object.hasOwn(rates, parts[0])) {
       invalid.push(line);
       continue;
     }

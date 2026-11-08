@@ -36,6 +36,14 @@ describe("per-path sampling rates in the panel", () => {
     ]);
   });
 
+  it("reports a line that repeats a pattern and keeps the first rate", () => {
+    const { rates, invalid } = parseSamplingRates("tanks.* 10000\ntanks.* 0");
+    assert.deepEqual(rates, { "tanks.*": 10000 });
+    assert.deepEqual(invalid, ["tanks.* 0"]);
+    // Only the lines count, not what every object inherits.
+    assert.deepEqual(parseSamplingRates("toString 5").invalid, []);
+  });
+
   it("round-trips the stored rates", () => {
     const stored = { "environment.wind.*": 0, "tanks.*": 10000 };
     assert.equal(

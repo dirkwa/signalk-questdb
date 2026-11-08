@@ -119,11 +119,17 @@ describe("RateMatcher", () => {
     assert.equal(r.rateFor("environment.water.temperature"), null);
   });
 
-  it("resolves a rate of 0 and ignores negative ones", () => {
-    const r = new RateMatcher({ "a.*": 0, "b.*": -1, "c.*": 100 });
+  it("resolves a rate of 0 and ignores negative and infinite ones", () => {
+    const r = new RateMatcher({
+      "a.*": 0,
+      "b.*": -1,
+      "c.*": 100,
+      "d.*": Infinity,
+    });
     assert.equal(r.rateFor("a.x"), 0);
     assert.equal(r.rateFor("b.x"), null);
     assert.equal(r.rateFor("c.x"), 100);
+    assert.equal(r.rateFor("d.x"), null);
   });
 
   it("prefers an exact pattern over a glob", () => {

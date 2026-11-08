@@ -994,7 +994,7 @@ export default function PluginConfigurationPanel({
     const parsedRates = parseSamplingRates(samplingRates);
     if (parsedRates.invalid.length > 0) {
       setActionStatus(
-        `Per-path sampling rates need a pattern and 0 or more ms on each line: ${parsedRates.invalid.join(", ")}`,
+        `Per-path sampling rates need a pattern and 0 or more ms on each line, each pattern once: ${parsedRates.invalid.join(", ")}`,
       );
       setStatusError(true);
       return;

@@ -76,9 +76,9 @@ export class RateMatcher {
     for (const [pattern, rate] of Object.entries(rates ?? {})) {
       // 0 records the paths at wire speed. It has to stay a rule: skipping
       // it, as this once did, let the default rate apply to the very paths
-      // it named. A negative or non-numeric rate means nothing and is
-      // skipped.
-      if (!(rate >= 0)) continue;
+      // it named. A negative, infinite or non-numeric rate means nothing
+      // and is skipped.
+      if (!Number.isFinite(rate) || rate < 0) continue;
       if (GLOB_CHARS.test(pattern)) {
         this.globs.push({ matcher: new Minimatch(pattern), rate });
       } else {
