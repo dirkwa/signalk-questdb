@@ -112,7 +112,7 @@ rootless Podman.
 | QuestDB memory limit          | `768m`       | Hard cgroup cap on the container (empty = unlimited); the JVM heap gets half of it, so heap plus off-heap stays inside                                                          |
 | QuestDB CPU limit (cores)     | `1.5`        | Fractional cores (0 = unlimited)                                                                                                                                                |
 | Default sampling rate (ms)    | `2000`       | Minimum ms between writes for any one path (0 = every update)                                                                                                                   |
-| Per-path sampling rates (ms)  | _(empty)_    | Glob → ms overrides, one per line in the panel, e.g. `environment.wind.* 0` (wire speed) and `tanks.* 10000`                                                                    |
+| Per-path sampling rates (ms)  | _(empty)_    | Glob → ms overrides, one `pattern ms` per line in the panel (0 = wire speed, see Sampling)                                                                                      |
 | Unchanged-value heartbeat (s) | `300`        | A value equal to the last one recorded is written again only this often; changes are written at the sampling rate (0 = every sample, see Change-only recording)                 |
 | Write batch interval (ms)     | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance)                                                                           |
 | Record own vessel             | `true`       | Record the `self` context                                                                                                                                                       |
@@ -289,8 +289,9 @@ data really stopped:
   age**. Keep the heartbeat below that, or a vessel lying still may come back
   with its position but without its speed, course and heading.
 
-`navigation.position` is written even when unchanged. Set the heartbeat to 0 to
-record every sample.
+`navigation.position` is written even when unchanged. A heartbeat of 0 does the
+same for every path: each sample the sampling rate lets through is written. With
+a sampling rate of 0 as well, that is every update.
 
 **Batching.** Samples are buffered and committed every **Write batch interval**
 (5 s), one WAL transaction per table per commit. The buffer holds 100 000 lines;
@@ -919,8 +920,8 @@ QuestDB releases they held memory.
 
 - **Default sampling rate** of 2000 ms limits each path to one write per two
   seconds, keeping write volume modest on busy NMEA 2000 buses; per-path
-  overrides allow faster rates, or wire speed with 0, for critical paths
-  (`environment.wind.* 0`) while slow-changing ones stay throttled.
+  overrides allow faster rates, or wire speed with 0, for critical paths while
+  slow-changing ones stay throttled.
 - **Change-only recording** skips a value that has not changed since it was last
   written until the heartbeat is due. Paths that hold steady — which is
   most of them — cost one row per heartbeat instead of one per sampling
