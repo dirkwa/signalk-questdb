@@ -101,6 +101,12 @@ export const ConfigSchema = Type.Object({
     default: true,
     title: "Record AIS targets",
   }),
+  recordAllSources: Type.Boolean({
+    default: false,
+    title: "Record all sources",
+    description:
+      "Record every source of a path, not only the one Signal K's source priorities prefer. Off by default: priorities pick the better sensor, and its value is what history normally wants. Turn it on to keep the readings a priority hides, e.g. to calibrate a sensor or compare two GPS receivers. Each source is then sampled on its own, so a path with three sources writes up to three times the rows.",
+  }),
 
   restoreOnStart: Type.Boolean({
     default: false,

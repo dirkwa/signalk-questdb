@@ -232,6 +232,16 @@ describe("Throttle", () => {
     );
   });
 
+  it("gives each source its own window when a source is passed", () => {
+    // Record all sources: two receivers on one path inside one window must
+    // BOTH record, while a repeat from either one is still dropped.
+    const t = new Throttle();
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0, "gps.1"), false);
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0 + 10, "gps.2"), false);
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0 + 20, "gps.1"), true);
+    assert.equal(t.shouldDrop("a.b", "self", 2000, T0 + 30, "gps.2"), true);
+  });
+
   it("drops a same-pair update inside the window and passes it after", () => {
     const t = new Throttle();
     assert.equal(t.shouldDrop("a.b", "self", 2000, T0), false);
