@@ -1665,10 +1665,10 @@ export default function PluginConfigurationPanel({
         <div style={S.fieldHelp}>
           Overrides the default rate for the paths a pattern matches.
           environment.wind.* 0 records every change of the wind at wire speed
-          (an unchanged value still waits for the heartbeat); tanks.* 10000
-          writes tanks at most every 10 s. Wire speed on a busy path writes many
-          rows: a wind sensor at 10 Hz, angle and speed, is about 1.7 million
-          rows a day.
+          (an unchanged value still waits for the heartbeat, except a vessel
+          position, which is never skipped); tanks.* 10000 writes tanks at most
+          every 10 s. Wire speed on a busy path writes many rows: a wind sensor
+          at 10 Hz, angle and speed, is about 1.7 million rows a day.
         </div>
       </div>
 

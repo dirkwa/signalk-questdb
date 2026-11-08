@@ -243,12 +243,13 @@ between two samples is not in the history. A rate of 0, as default or per
 path, removes the window: `environment.wind.* 0` records every change of the
 wind at wire speed while everything else stays at the default. An unchanged
 value is still written only once per **Unchanged-value heartbeat** (see
-Change-only recording); set that to 0 as well to record every update. Wire
-speed costs rows: a wind sensor at 10 Hz writes about 1.7 million a day for
-angle and speed, and every path of a busy NMEA 2000 boat at wire speed can be
-a few hundred rows a second. **Record own vessel** and **Record AIS targets**
-switch the two kinds of context independently, and **Path patterns** exclude
-(or include only) paths by glob.
+Change-only recording), except `navigation.position`, which is never skipped;
+set the heartbeat to 0 as well to record every update. Wire speed costs rows:
+a wind sensor at 10 Hz writes about 1.7 million a day for angle and speed, and
+every path of a busy NMEA 2000 boat at wire speed can be a few hundred rows a
+second. **Record own vessel** and **Record AIS targets** switch the two kinds
+of context independently, and **Path patterns** exclude (or include only)
+paths by glob.
 
 **Source priorities.** When Signal K's source priorities rank the sources of a
 path, only the preferred source is recorded, the same value instruments show.
