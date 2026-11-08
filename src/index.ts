@@ -1549,9 +1549,18 @@ export default (app: App) => {
       // each sampling window instead of each heartbeat.
       const perSource = config.recordAllSources ? source : undefined;
 
+      // Meta updates ride the same bus as values, flagged isMeta. They
+      // describe a path (units, description, displayName), they are not a
+      // reading of it. Routed like a value object, their keys were stored
+      // as rows such as `….units` and `….displayName`, again each time a
+      // plugin republished its meta. Nor do they show that a vessel is
+      // transmitting: a local plugin publishes its meta on its own start,
+      // and counting that would cost the restore a vessel's saved position.
+      if (delta.isMeta) return;
+
       // Note the context BEFORE any early return or filter: identity-only
       // deltas return below, and path filters and throttles decide what gets
-      // STORED — but any delta at all proves the vessel is transmitting now,
+      // STORED — but any value at all proves the vessel is transmitting now,
       // which is what makes its stored position obsolete for the restore.
       if (trackLiveContexts) {
         liveContexts.add(context === app.selfContext ? "self" : context);
