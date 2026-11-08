@@ -1540,10 +1540,14 @@ export default (app: App) => {
       // null, same as rows written before it existed.
       const source =
         typeof delta.$source === "string" ? delta.$source : undefined;
-      // Recording every source samples each one on its own. The shared
-      // window would keep whichever source arrives first, so the fastest
-      // receiver would crowd out the ones recorded to compare against it.
-      const throttleSource = config.recordAllSources ? source : undefined;
+      // Recording every source keeps each one apart. It gets its own
+      // sampling window: the shared one would keep whichever source arrives
+      // first, so the fastest receiver would crowd out the ones recorded to
+      // compare against it. And its nulls forget only its own last values:
+      // a gateway sending "not available" several times a second would
+      // otherwise make every other source's unchanged values due again at
+      // each sampling window instead of each heartbeat.
+      const perSource = config.recordAllSources ? source : undefined;
 
       // Note the context BEFORE any early return or filter: identity-only
       // deltas return below, and path filters and throttles decide what gets
@@ -1604,6 +1608,7 @@ export default (app: App) => {
         changeGate?.forget(
           path,
           context === app.selfContext ? "self" : context,
+          perSource,
         );
       }
 
@@ -1666,7 +1671,7 @@ export default (app: App) => {
             path,
             isSelf ? "self" : context,
             config.defaultSamplingRate ?? 2000,
-            throttleSource,
+            perSource,
           )
         )
           return;
@@ -1743,7 +1748,7 @@ export default (app: App) => {
               leaf.path,
               ctx,
               config.defaultSamplingRate ?? 2000,
-              throttleSource,
+              perSource,
             )
           )
             continue;

@@ -88,6 +88,22 @@ describe("ChangeGate", () => {
     assert.equal(gate.size, 0);
   });
 
+  it("forgets only the given source of a stale path, leaves included", () => {
+    // Record all sources: a gateway's nulls must not make another source's
+    // unchanged value due again.
+    const gate = new ChangeGate(HEARTBEAT);
+    gate.wrote("a.b", "self", "gps1", 1, 0);
+    gate.wrote("a.b.c", "self", "gps1", 2, 0);
+    gate.wrote("a.b", "self", "gps2", 1, 0);
+    gate.wrote("a.b.c", "self", "gps2", 2, 0);
+    gate.forget("a.b", "self", "gps1");
+    assert.equal(gate.isRepeat("a.b", "self", "gps1", 1, 1), false);
+    assert.equal(gate.isRepeat("a.b.c", "self", "gps1", 2, 1), false);
+    assert.equal(gate.isRepeat("a.b", "self", "gps2", 1, 1), true);
+    assert.equal(gate.isRepeat("a.b.c", "self", "gps2", 2, 1), true);
+    assert.equal(gate.size, 2);
+  });
+
   it("clears when a sweep frees too little to stay below the cap", () => {
     // Otherwise each of the next few new keys would trigger another full walk.
     const gate = new ChangeGate(HEARTBEAT, 4);

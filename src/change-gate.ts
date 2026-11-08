@@ -90,17 +90,18 @@ export class ChangeGate {
   }
 
   /**
-   * Forgets a path in a context, for every source, along with any leaves it
-   * was flattened into. Signal K reports a path going stale as a null value;
-   * without this, the reading that comes back after the gap would be skipped
-   * whenever it equals the one before it, and the gap would read as a value
-   * held straight through it.
+   * Forgets a path in a context, for every source or only for `source` when
+   * given, along with any leaves it was flattened into. Signal K reports a
+   * path going stale as a null value; without this, the reading that comes
+   * back after the gap would be skipped whenever it equals the one before
+   * it, and the gap would read as a value held straight through it.
    */
-  forget(path: string, context: string): void {
+  forget(path: string, context: string, source?: string): void {
     const paths = this.byContext.get(context);
     if (!paths) return;
     const leafPrefix = `${path}.`;
     for (const [k, entry] of paths) {
+      if (source !== undefined && k !== key(entry.path, source)) continue;
       if (entry.path === path || entry.path.startsWith(leafPrefix)) {
         paths.delete(k);
         this.count -= 1;
