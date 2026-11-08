@@ -117,7 +117,8 @@ export class RateMatcher {
 // inside the window — with recordOthers and a fleet in range, that is one
 // position per interval fleet-wide instead of per target (issue #93).
 // Rate overrides stay per PATH (resolved by the caller via RateMatcher):
-// an override describes the channel, not the vessel.
+// an override describes the channel, not the vessel. A caller recording
+// every source passes the source too, so each one gets its own window.
 export class Throttle {
   private readonly lastWrite = new Map<string, number>();
   private maxRateMs = 0;
@@ -136,19 +137,24 @@ export class Throttle {
   }
 
   /**
-   * True when this path+context pair already wrote within the past
-   * `minMs`; records `now` as the pair's last write otherwise. A
-   * non-positive rate disables throttling for the call.
+   * True when this path+context pair (path+context+source when `source` is
+   * given) already wrote within the past `minMs`; records `now` as the
+   * pair's last write otherwise. A non-positive rate disables throttling
+   * for the call.
    */
   shouldDrop(
     path: string,
     context: string,
     minMs: number,
     now: number,
+    source?: string,
   ): boolean {
     if (minMs <= 0) return false;
     if (minMs > this.maxRateMs) this.maxRateMs = minMs;
-    const key = `${path}|${context}`;
+    const key =
+      source === undefined
+        ? `${path}|${context}`
+        : `${path}|${context}|${source}`;
     const last = this.lastWrite.get(key) ?? 0;
     if (now - last < minMs) return true;
     if (this.lastWrite.size >= this.maxEntries && !this.lastWrite.has(key)) {

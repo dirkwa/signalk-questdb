@@ -139,6 +139,9 @@ interface App {
     getBus: (path?: string) => {
       onValue: (cb: (delta: unknown) => void) => () => void;
     };
+    getUnfilteredBus: (path?: string) => {
+      onValue: (cb: (delta: unknown) => void) => () => void;
+    };
   };
   registerHistoryProvider: (provider: unknown) => void;
   registerHistoryApiProvider: (provider: HistoryApi.HistoryProvider) => void;
@@ -761,6 +764,7 @@ export default (app: App) => {
     path: string,
     context: string,
     defaultRate: number,
+    source?: string,
   ): boolean {
     // Per-path override wins when one matches; otherwise the default rate.
     const overrideRate = rateMatcher?.rateFor(path) ?? null;
@@ -769,6 +773,7 @@ export default (app: App) => {
       context,
       overrideRate ?? defaultRate,
       Date.now(),
+      source,
     );
   }
 
@@ -1508,7 +1513,14 @@ export default (app: App) => {
     liveContexts.clear();
     trackLiveContexts = config.restoreOnStart;
 
-    const bus = app.streambundle.getBus();
+    // getBus() carries only the source that Signal K's source priorities
+    // prefer on each path, the value instruments show. recordAllSources
+    // reads the unfiltered bus instead, so a source that loses the ranking
+    // is recorded as well: the raw paddlewheel next to a corrected STW
+    // (issue #235).
+    const bus = config.recordAllSources
+      ? app.streambundle.getUnfilteredBus()
+      : app.streambundle.getBus();
     const unsub = bus.onValue((delta: any) => {
       if (!writer) return;
       const { path, value, context } = delta;
@@ -1528,6 +1540,14 @@ export default (app: App) => {
       // null, same as rows written before it existed.
       const source =
         typeof delta.$source === "string" ? delta.$source : undefined;
+      // Recording every source keeps each one apart. It gets its own
+      // sampling window: the shared one would keep whichever source arrives
+      // first, so the fastest receiver would crowd out the ones recorded to
+      // compare against it. And its nulls forget only its own last values:
+      // a gateway sending "not available" several times a second would
+      // otherwise make every other source's unchanged values due again at
+      // each sampling window instead of each heartbeat.
+      const perSource = config.recordAllSources ? source : undefined;
 
       // Note the context BEFORE any early return or filter: identity-only
       // deltas return below, and path filters and throttles decide what gets
@@ -1588,6 +1608,7 @@ export default (app: App) => {
         changeGate?.forget(
           path,
           context === app.selfContext ? "self" : context,
+          perSource,
         );
       }
 
@@ -1638,17 +1659,19 @@ export default (app: App) => {
           return;
         // Throttled per path AND context: the sampling rate bounds each
         // vessel's stream, not the fleet's (issue #93). The stored context
-        // ("self" vs raw) is the key, matching what the rows carry. The key
-        // deliberately does NOT include source: the sampling rate bounds the
-        // per-path row volume, and keying per source would multiply it by the
-        // number of receivers. With two sources alternating, each window
-        // keeps whichever arrived first — a source-filtered read then sees
-        // roughly every other sample, which the rate already allows for.
+        // ("self" vs raw) is the key, matching what the rows carry. Unless
+        // recordAllSources asks for every source, the key deliberately does
+        // NOT include source: the sampling rate bounds the per-path row
+        // volume, and keying per source would multiply it by the number of
+        // receivers. With two sources alternating, each window keeps
+        // whichever arrived first — a source-filtered read then sees roughly
+        // every other sample, which the rate already allows for.
         if (
           isThrottled(
             path,
             isSelf ? "self" : context,
             config.defaultSamplingRate ?? 2000,
+            perSource,
           )
         )
           return;
@@ -1720,7 +1743,14 @@ export default (app: App) => {
           if (!shouldRecord(leaf.path, config.pathFilter.mode)) continue;
           if (changeGate?.isRepeat(leaf.path, ctx, source, leaf.value, now))
             continue;
-          if (isThrottled(leaf.path, ctx, config.defaultSamplingRate ?? 2000))
+          if (
+            isThrottled(
+              leaf.path,
+              ctx,
+              config.defaultSamplingRate ?? 2000,
+              perSource,
+            )
+          )
             continue;
           changeGate?.wrote(leaf.path, ctx, source, leaf.value, now);
           if (typeof leaf.value === "number") {

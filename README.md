@@ -117,6 +117,7 @@ rootless Podman.
 | Write batch interval (ms)     | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance)                                                                           |
 | Record own vessel             | `true`       | Record the `self` context                                                                                                                                                       |
 | Record AIS targets            | `true`       | Record other vessels                                                                                                                                                            |
+| Record all sources            | `false`      | Record every source of a path, not only the one the source priorities prefer (see Source priorities)                                                                            |
 | Restore vessels on startup    | `false`      | Replay each vessel's last recorded position after a restart (see Startup restore)                                                                                               |
 | Restore max age (minutes)     | `9`          | Only replay values recorded within this window                                                                                                                                  |
 | Allow `sourcePolicy=all`      | `false`      | Let History API callers split a path into one column per recording source (see History API)                                                                                     |
@@ -239,6 +240,14 @@ canboat WASM decoder do not produce the marker at all.
 resolution and the many that need less. **Record own vessel** and **Record AIS
 targets** switch the two kinds of context independently, and **Path patterns**
 exclude (or include only) paths by glob.
+
+**Source priorities.** When Signal K's source priorities rank the sources of a
+path, only the preferred source is recorded, the same value instruments show.
+Paths without a priority are recorded from every source. **Record all sources**
+records the sources a priority hides as well, for calibrating a sensor or
+comparing two GPS receivers. Each source is then sampled on its own, so a path
+with three sources writes up to three times the rows; with the option off, the
+sources of a path share one sampling window.
 
 **Change-only recording.** Most paths on a boat do not change from one sample
 to the next: a switch that flips twice a day, an energy counter at rest, a tank

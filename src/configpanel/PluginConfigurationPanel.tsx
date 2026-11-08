@@ -108,6 +108,10 @@ export default function PluginConfigurationPanel({
   );
   const [recordSelf, setRecordSelf] = useState(cfg.recordSelf !== false);
   const [recordOthers, setRecordOthers] = useState(cfg.recordOthers !== false);
+  // Opt-in, so a missing key means off — matching the schema default.
+  const [recordAllSources, setRecordAllSources] = useState(
+    cfg.recordAllSources === true,
+  );
   // Restore is opt-in, so a missing key means off — the inverse of the
   // recording toggles above.
   const [restoreOnStart, setRestoreOnStart] = useState(
@@ -1013,6 +1017,7 @@ export default function PluginConfigurationPanel({
       unchangedHeartbeatSeconds: heartbeatSeconds,
       recordSelf,
       recordOthers,
+      recordAllSources,
       restoreOnStart,
       historySourcePolicyAll,
       enableConsole,
@@ -1685,6 +1690,22 @@ export default function PluginConfigurationPanel({
           checked={recordOthers}
           onChange={(e) => setRecordOthers(e.target.checked)}
         />
+      </div>
+
+      <div style={S.fieldRow}>
+        <span style={S.label}>Record all sources</span>
+        <input
+          type="checkbox"
+          style={S.checkbox}
+          aria-label="Record all sources"
+          checked={recordAllSources}
+          onChange={(e) => setRecordAllSources(e.target.checked)}
+        />
+        <span style={S.hint}>
+          also record the sources a source priority hides, e.g. to calibrate a
+          sensor or compare two GPS receivers. Each source is sampled on its
+          own, so a path with three sources writes up to three times the rows
+        </span>
       </div>
 
       <div style={S.fieldRow}>
