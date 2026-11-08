@@ -82,7 +82,7 @@ export const ConfigSchema = Type.Object({
     default: {},
     title: "Per-path sampling rates (ms)",
     description:
-      'Override default rate for specific paths (0 = wire speed: every change, while an unchanged value still waits for the heartbeat; navigation.position is never skipped, so 0 writes every position update). e.g. { "environment.wind.*": 0, "tanks.*": 10000 }',
+      'Override default rate for specific paths (0 = wire speed: every change, while an unchanged value still waits for the heartbeat; navigation.position is written even when unchanged, so 0 writes every position update). e.g. { "environment.wind.*": 0, "tanks.*": 10000 }',
   }),
 
   unchangedHeartbeatSeconds: Type.Number({
