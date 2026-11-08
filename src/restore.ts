@@ -32,12 +32,16 @@ export interface RestoreDeps {
   selfContext: string;
   debug: (msg: string) => void;
   /**
-   * True if this context has already been seen live since startup. The query
-   * is slow enough that vessels transmit while it runs, and a stored fix
-   * replayed over a live one would move that vessel backwards on the chart.
-   * Keyed on the STORED context ("self" for own vessel), matching the rows.
+   * Reads the Signal K data model, as `app.getPath` does. A value the model
+   * already holds is never replaced: it came in since the server started, so
+   * a stored row is at best as new, or comes from a source the server's
+   * priorities passed over. Replaying an older fix would move the vessel
+   * backwards on the chart. This covers a vessel heard before the recorder
+   * subscribed, one heard while the query ran, and a plugin restart, which
+   * leaves the model's positions in place (issue #242). Timestamps are not
+   * compared: rows carry the server's receive time, the model the source's.
    */
-  hasLiveData?: (context: string) => boolean;
+  getPath: (path: string) => unknown;
 }
 
 export interface RestoreOptions {
@@ -55,7 +59,7 @@ export interface RestoreResult {
   contexts: number;
   values: number;
   skippedStale: number;
-  /** Contexts skipped because the vessel transmitted during startup. */
+  /** Contexts skipped because the model already holds their position. */
   skippedLive: number;
 }
 
@@ -265,6 +269,16 @@ function isMissingKindColumn(err: unknown): boolean {
   );
 }
 
+// A leaf the server has written holds `value`, but a node can exist without
+// one: meta published for a path creates it. A vessel name is a plain string
+// at the context's root, with no leaf around it.
+function inModel(node: unknown): boolean {
+  if (typeof node === "object" && node !== null) {
+    return (node as { value?: unknown }).value !== undefined;
+  }
+  return node !== undefined;
+}
+
 function decodeValue(row: Record<string, unknown>): unknown {
   const text = row.valuetext;
   if (text === null || text === undefined) return null;
@@ -386,10 +400,12 @@ export async function restoreFromHistory(
     // target that never expires.
     if (!entry.byPath.has("navigation.position")) continue;
 
-    // A vessel that transmitted while the query ran is already current; its
-    // stored fix is stale by comparison and replaying it would move the
-    // target backwards.
-    if (deps.hasLiveData?.(storedContext)) {
+    // Stored "self" is a placeholder for whatever this server's self context
+    // is; every other context is already a real Signal K context string.
+    const context = storedContext === "self" ? selfContext : storedContext;
+
+    // Already drawn, from a fix at least as new as the stored one.
+    if (inModel(deps.getPath(`${context}.navigation.position`))) {
       skippedLive++;
       continue;
     }
@@ -412,6 +428,14 @@ export async function restoreFromHistory(
       }
     }
 
+    // Looked up after the leaves are joined, under the bare path the model
+    // keeps an object identity at.
+    for (const path of entry.byPath.keys()) {
+      if (inModel(deps.getPath(`${context}.${path}`))) {
+        entry.byPath.delete(path);
+      }
+    }
+
     // One update per distinct recorded time. These paths were sampled at
     // different moments — an AIS name repeats every ~6 minutes while position
     // arrives every few seconds — so putting them all under the newest
@@ -426,10 +450,6 @@ export async function restoreFromHistory(
       );
       byTimestamp.set(row.ts, group);
     }
-
-    // Stored "self" is a placeholder for whatever this server's self context
-    // is; every other context is already a real Signal K context string.
-    const context = storedContext === "self" ? selfContext : storedContext;
 
     handleMessage({
       context,
@@ -449,7 +469,7 @@ export async function restoreFromHistory(
   debug(
     `restored ${contexts} context(s), ${values} value(s) from history` +
       (skippedStale ? `, skipped ${skippedStale} stale row(s)` : "") +
-      (skippedLive ? `, skipped ${skippedLive} already live` : ""),
+      (skippedLive ? `, skipped ${skippedLive} already in the model` : ""),
   );
 
   return { contexts, values, skippedStale, skippedLive };

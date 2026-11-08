@@ -93,7 +93,7 @@ export interface UnstorableStatus {
 export interface RestoreStatus {
   /** Vessels replayed into the Signal K model. */
   contexts: number;
-  /** Contexts skipped because the vessel had already transmitted. */
+  /** Contexts skipped because the Signal K model already held their position. */
   skippedLive: number;
   /** True when the restore threw; `contexts` is then not meaningful. */
   failed: boolean;
