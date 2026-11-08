@@ -30,6 +30,7 @@ import {
 } from "signalk-container-helper/ui";
 import { S } from "./styles.js";
 import { GpxImportSection } from "./GpxImportSection.js";
+import { formatSamplingRates, parseSamplingRates } from "./sampling-rates.js";
 import {
   formatDateTime,
   toLegacyImportRows,
@@ -131,6 +132,11 @@ export default function PluginConfigurationPanel({
   );
   const [defaultSamplingRate, setDefaultSamplingRate] = useState(
     cfg.defaultSamplingRate ?? 2000,
+  );
+  // One "pattern ms" rule per line; round-tripped to/from the schema's
+  // samplingRates object.
+  const [samplingRates, setSamplingRates] = useState(
+    formatSamplingRates(cfg.samplingRates),
   );
   // Kept as the raw input string: coercing per keystroke turns a cleared
   // field into 0 and partial input into NaN mid-edit. doSave parses and
@@ -985,6 +991,14 @@ export default function PluginConfigurationPanel({
       setStatusError(true);
       return;
     }
+    const parsedRates = parseSamplingRates(samplingRates);
+    if (parsedRates.invalid.length > 0) {
+      setActionStatus(
+        `Per-path sampling rates need a pattern and 0 or more ms on each line: ${parsedRates.invalid.join(", ")}`,
+      );
+      setStatusError(true);
+      return;
+    }
     const archiveSeconds = Number(archiveResolutionSeconds);
     if (
       archiveResolutionSeconds === "" ||
@@ -1040,7 +1054,7 @@ export default function PluginConfigurationPanel({
           .map((s) => s.trim())
           .filter(Boolean),
       },
-      samplingRates: cfg.samplingRates || {},
+      samplingRates: parsedRates.rates,
     } satisfies Partial<Config>;
     save(next);
     setActionStatus("Saved! Plugin will restart with new configuration.");
@@ -1636,6 +1650,26 @@ export default function PluginConfigurationPanel({
         <span style={S.hint}>
           1000 = max 1 write/sec per path (0 = every update)
         </span>
+      </div>
+
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ ...S.label, width: "auto", marginBottom: 6 }}>
+          Per-path sampling rates (one per line: pattern, then ms)
+        </div>
+        <textarea
+          style={S.textarea}
+          aria-label="Per-path sampling rates"
+          value={samplingRates}
+          onChange={(e) => setSamplingRates(e.target.value)}
+        />
+        <div style={S.fieldHelp}>
+          Overrides the default rate for the paths a pattern matches.
+          environment.wind.* 0 records every change of the wind at wire speed
+          (an unchanged value still waits for the heartbeat); tanks.* 10000
+          writes tanks at most every 10 s. Wire speed on a busy path writes many
+          rows: a wind sensor at 10 Hz, angle and speed, is about 1.7 million
+          rows a day.
+        </div>
       </div>
 
       <div style={S.fieldRow}>

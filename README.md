@@ -112,7 +112,7 @@ rootless Podman.
 | QuestDB memory limit          | `768m`       | Hard cgroup cap on the container (empty = unlimited); the JVM heap gets half of it, so heap plus off-heap stays inside                                                          |
 | QuestDB CPU limit (cores)     | `1.5`        | Fractional cores (0 = unlimited)                                                                                                                                                |
 | Default sampling rate (ms)    | `2000`       | Minimum ms between writes for any one path (0 = every update)                                                                                                                   |
-| Per-path sampling rates (ms)  | _(empty)_    | Glob → ms overrides, e.g. `{ "environment.wind.*": 200, "tanks.*": 10000 }`                                                                                                     |
+| Per-path sampling rates (ms)  | _(empty)_    | Glob → ms overrides, one per line in the panel, e.g. `environment.wind.* 0` (wire speed) and `tanks.* 10000`                                                                    |
 | Unchanged-value heartbeat (s) | `300`        | A value equal to the last one recorded is written again only this often; changes are written at the sampling rate (0 = every sample, see Change-only recording)                 |
 | Write batch interval (ms)     | `5000`       | How often buffered samples are committed — one WAL transaction per table per commit (see Performance)                                                                           |
 | Record own vessel             | `true`       | Record the `self` context                                                                                                                                                       |
@@ -237,7 +237,16 @@ canboat WASM decoder do not produce the marker at all.
 
 **Sampling.** Each path is written at most once per **Default sampling rate**
 (2000 ms), with per-path overrides by glob for the few paths that need finer
-resolution and the many that need less. **Record own vessel** and **Record AIS
+resolution and the many that need less. The first value after a window opens
+is written and the rest of the window is dropped, not averaged, so a gust
+between two samples is not in the history. A rate of 0, as default or per
+path, removes the window: `environment.wind.* 0` records every change of the
+wind at wire speed while everything else stays at the default. An unchanged
+value is still written only once per **Unchanged-value heartbeat** (see
+Change-only recording); set that to 0 as well to record every update. Wire
+speed costs rows: a wind sensor at
+10 Hz writes about 1.7 million a day for angle and speed, and every path of a
+busy NMEA 2000 boat at wire speed can be a few hundred rows a second. **Record own vessel** and **Record AIS
 targets** switch the two kinds of context independently, and **Path patterns**
 exclude (or include only) paths by glob.
 
@@ -909,8 +918,8 @@ QuestDB releases they held memory.
 
 - **Default sampling rate** of 2000 ms limits each path to one write per two
   seconds, keeping write volume modest on busy NMEA 2000 buses; per-path
-  overrides allow faster rates for critical paths
-  (`{ "environment.wind.*": 200 }`) while slow-changing ones stay throttled.
+  overrides allow faster rates, or wire speed with 0, for critical paths
+  (`environment.wind.* 0`) while slow-changing ones stay throttled.
 - **Change-only recording** skips a value that has not changed since it was last
   written until the heartbeat is due. Paths that hold steady — which is
   most of them — cost one row per heartbeat instead of one per sampling

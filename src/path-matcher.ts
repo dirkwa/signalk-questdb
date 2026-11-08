@@ -65,7 +65,8 @@ export class PathMatcher {
 // Throttle rates are pattern -> interval, and the winning pattern's interval
 // is what matters, so this resolves a path to its rate rather than a boolean.
 // Same construction cost and same memoization; null means "no pattern
-// matched", i.e. use the default rate.
+// matched", i.e. use the default rate. A rate of 0 is a match like any other
+// and means every update, as it does for the default rate.
 export class RateMatcher {
   private readonly literals = new Map<string, number>();
   private readonly globs: { matcher: Minimatch; rate: number }[] = [];
@@ -73,9 +74,11 @@ export class RateMatcher {
 
   constructor(rates: Record<string, number>) {
     for (const [pattern, rate] of Object.entries(rates ?? {})) {
-      // A non-positive rate means "no throttling", which the old code
-      // skipped; keeping that here avoids paying for it per delta.
-      if (!(rate > 0)) continue;
+      // 0 records the paths at wire speed. It has to stay a rule: skipping
+      // it, as this once did, let the default rate apply to the very paths
+      // it named. A negative or non-numeric rate means nothing and is
+      // skipped.
+      if (!(rate >= 0)) continue;
       if (GLOB_CHARS.test(pattern)) {
         this.globs.push({ matcher: new Minimatch(pattern), rate });
       } else {
