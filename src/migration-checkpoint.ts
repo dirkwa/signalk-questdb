@@ -267,10 +267,10 @@ function isCheckpoint(value: unknown): value is MigrationCheckpoint {
  * what the kernel had already written back — with default settings anything
  * older than about 35 s (30 s dirty-page expiry plus the 5 s flusher period).
  * A minute clears both with room to spare, on the assumption of those
- * defaults: an external QuestDB is the operator's, and the README asks them to
- * run it with sync, which is the real answer for a power cut. The price is
- * that a resumed import redoes up to a minute of work, which costs nothing but
- * the time: rows upsert.
+ * defaults: an external QuestDB is the operator's, and doc/deployment.md asks
+ * them to run it with sync, which is the real answer for a power cut. The price
+ * is that a resumed import redoes up to a minute of work, which costs nothing
+ * but the time: rows upsert.
  */
 export const CHECKPOINT_LAG_MS = 60_000;
 

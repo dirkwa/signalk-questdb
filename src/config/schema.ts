@@ -75,7 +75,7 @@ export const ConfigSchema = Type.Object({
     maximum: 300000,
     title: "Write batch interval (ms)",
     description:
-      "How often buffered samples are committed to QuestDB. Each commit is one WAL transaction per table, so short intervals create huge numbers of tiny transactions whose apply cost eventually stalls recording on Pi-class hardware — QuestDB recommends >100 rows per transaction and its console flags tables below that (see README, 'Small transactions' alert). Longer intervals mean at most this many ms of buffered data is lost on a hard crash.",
+      "How often buffered samples are committed to QuestDB. Each commit is one WAL transaction per table, so short intervals create huge numbers of tiny transactions whose apply cost eventually stalls recording on Pi-class hardware — QuestDB recommends >100 rows per transaction and its console flags tables below that (see doc/deployment.md, 'Small transactions' alert). Longer intervals mean at most this many ms of buffered data is lost on a hard crash.",
   }),
 
   samplingRates: Type.Record(Type.String(), Type.Number(), {

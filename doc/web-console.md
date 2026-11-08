@@ -39,6 +39,23 @@ console but QuestDB's REST API and data ingestion, with no authentication, so
 anyone who can reach it can read, **modify or delete** your history. The webapp
 route needs a Signal K admin session; prefer it.
 
+## Access and safety
+
+**It is admin only.** The console is proxied at
+`/plugins/signalk-questdb/console/`, and Signal K gives plugin routes an
+admin-only default — the plugin deliberately does not relax that. A non-admin
+who opens the webapp sees the page frame and an authorization error, never the
+console.
+
+**It can modify data.** Unlike the read-only `/query` endpoint, which rejects
+anything that is not a `SELECT`, the console is a real SQL client: it can drop
+tables and delete recorded history. That is the point of having it, and it is
+what an administrator would use it for — but it is worth knowing before handing
+someone an admin account.
+
+If you would rather not serve it at all, switch the option off and the route is
+not registered.
+
 ## A Quick Tour
 
 - The **left panel** lists the tables. Click a table to see its columns.
