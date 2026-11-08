@@ -535,9 +535,11 @@ collision-avoidance setting, not a convenience one.
 
 Only navigation and identity paths are replayed, so stale tank levels and engine
 temperatures are not resurrected as though they were current readings. A vessel
-with no position in the window is skipped, as is one that has already
-transmitted since startup. Restore honours the recording toggles: with **Record
-AIS targets** off, no AIS target is restored.
+with no position in the window is skipped. Nothing the Signal K model already
+holds is replaced: a vessel heard while QuestDB was still starting keeps its
+newer position, and after a plugin restart every vessel keeps the one it has.
+Restore honours the recording toggles: with **Record AIS targets** off, no AIS
+target is restored.
 
 The config panel reports the outcome once startup finishes: **Vessels Restored**
 with the count, or **Restore failed** if the replay could not run. Neither

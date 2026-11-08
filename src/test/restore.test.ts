@@ -51,7 +51,7 @@ function run(
   dataset: Row[],
   overrides: Partial<RestoreOptions> = {},
   captured: Captured[] = [],
-  hasLiveData?: (context: string) => boolean,
+  model: Record<string, unknown> = {},
 ) {
   const deltas: RestoredDelta[] = [];
   const promise = restoreFromHistory(
@@ -60,7 +60,7 @@ function run(
       handleMessage: (d) => deltas.push(d as RestoredDelta),
       selfContext: SELF,
       debug: () => {},
-      hasLiveData,
+      getPath: (path) => model[path],
     },
     {
       maxAgeMs: 9 * 60_000,
@@ -287,22 +287,28 @@ describe("restore: recording toggles", () => {
   });
 });
 
-describe("restore: vessels already live", () => {
-  it("does not replay a context that transmitted during startup", async () => {
-    // The query is slow enough that vessels report while it runs. Replaying
-    // a stored fix over a live one would move the target BACKWARDS.
-    const rows = [position(AIS, 60_000)];
-    const { promise, deltas } = run(rows, {}, [], (ctx) => ctx === AIS);
+describe("restore: values the model already holds", () => {
+  const livePosition = {
+    value: { latitude: -36.9, longitude: 174.8 },
+    timestamp: ago(5_000),
+  };
+
+  it("does not replay a vessel the model has a position for", async () => {
+    // Heard before the recorder subscribed, or while the query ran. Its
+    // stored fix is older, and replaying it would move the target backwards.
+    const model = { [`${AIS}.navigation.position`]: livePosition };
+    const { promise, deltas } = run([position(AIS, 60_000)], {}, [], model);
     const result = await promise;
 
     assert.equal(deltas.length, 0);
     assert.equal(result.skippedLive, 1);
   });
 
-  it("still replays contexts that have not been seen live", async () => {
+  it("still replays vessels the model has no position for", async () => {
     const other = "vessels.urn:mrn:imo:mmsi:111111111";
     const rows = [position(AIS, 60_000), position(other, 60_000)];
-    const { promise, deltas } = run(rows, {}, [], (ctx) => ctx === AIS);
+    const model = { [`${AIS}.navigation.position`]: livePosition };
+    const { promise, deltas } = run(rows, {}, [], model);
     const result = await promise;
 
     assert.equal(deltas.length, 1);
@@ -310,17 +316,73 @@ describe("restore: vessels already live", () => {
     assert.equal(result.skippedLive, 1);
   });
 
-  it("keys the live check on the stored context, not the resolved one", async () => {
-    // Own vessel is stored as the literal "self"; checking the resolved
-    // self context would never match what the recorder recorded.
-    const seen: string[] = [];
-    const { promise } = run([position("self", 60_000)], {}, [], (ctx) => {
-      seen.push(ctx);
-      return false;
-    });
+  it("looks the own vessel up under this server's self context", async () => {
+    // Stored as the literal "self"; the model knows it by its identity.
+    const model = { [`${SELF}.navigation.position`]: livePosition };
+    const { promise, deltas } = run([position("self", 60_000)], {}, [], model);
     await promise;
 
-    assert.deepEqual(seen, ["self"]);
+    assert.equal(deltas.length, 0);
+  });
+
+  it("does not count a node that holds only meta", async () => {
+    // A plugin publishing meta for a path creates the node without a value.
+    const model = {
+      [`${AIS}.navigation.position`]: { meta: { description: "Position" } },
+    };
+    const { promise, deltas } = run([position(AIS, 60_000)], {}, [], model);
+    await promise;
+
+    assert.equal(deltas.length, 1);
+  });
+
+  it("replays the position but keeps the values the model holds", async () => {
+    // A vessel that sent its speed and name but no position yet gets its
+    // position from history, without its speed and name going back in time.
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      [ago(60_000), "navigation.speedOverGround", AIS, "2.5", "number"],
+      [ago(60_000), "navigation.courseOverGroundTrue", AIS, "1.2", "number"],
+      [ago(6 * 60_000), "name", AIS, "Black Pearl", "identity"],
+    ];
+    const model = {
+      [`${AIS}.navigation.speedOverGround`]: {
+        value: 3.1,
+        timestamp: ago(5_000),
+      },
+      // A name sits at the context's root as a plain string.
+      [`${AIS}.name`]: "BLACK PEARL",
+    };
+    const { promise, deltas } = run(rows, {}, [], model);
+    const result = await promise;
+
+    assert.deepEqual(
+      allValues(deltas[0])
+        .map((v) => v.path)
+        .sort(),
+      ["navigation.courseOverGroundTrue", "navigation.position"],
+    );
+    assert.equal(result.values, 2);
+  });
+
+  it("checks an object identity under its bare path", async () => {
+    // The model keeps design.aisShipType as one object, not as its leaves.
+    const rows: Row[] = [
+      position(AIS, 60_000),
+      [ago(40 * 60_000), "design.aisShipType.id", AIS, "70", "number"],
+      [ago(40 * 60_000), "design.aisShipType.name", AIS, "Cargo", null],
+    ];
+    const model = {
+      [`${AIS}.design.aisShipType`]: {
+        value: { id: 70, name: "Cargo" },
+        timestamp: ago(10_000),
+      },
+    };
+    const { promise, deltas } = run(rows, {}, [], model);
+    await promise;
+
+    assert.equal(valueAt(deltas[0], "design.aisShipType"), undefined);
+    assert.ok(valueAt(deltas[0], "navigation.position"));
   });
 });
 
@@ -465,6 +527,7 @@ describe("restore: query shape", () => {
         handleMessage: (d) => deltas.push(d),
         selfContext: SELF,
         debug: () => {},
+        getPath: () => undefined,
       },
       {
         maxAgeMs: 9 * 60_000,
@@ -521,6 +584,7 @@ describe("restore: query shape", () => {
         handleMessage: (d) => deltas.push(d as RestoredDelta),
         selfContext: SELF,
         debug: () => {},
+        getPath: () => undefined,
       },
       {
         maxAgeMs: 9 * 60_000,
@@ -553,6 +617,7 @@ describe("restore: query shape", () => {
           handleMessage: () => {},
           selfContext: SELF,
           debug: () => {},
+          getPath: () => undefined,
         },
         {
           maxAgeMs: 9 * 60_000,

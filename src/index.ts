@@ -412,14 +412,6 @@ export default (app: App) => {
     app.setPluginStatus(recordingStatus(host, port));
   };
 
-  // Contexts seen live while a startup restore is in flight. A stored fix
-  // must never overwrite a vessel that has already transmitted since boot —
-  // that would move it backwards on the chart. Populated by the recorder
-  // subscription and cleared as soon as the restore settles, so this stays a
-  // startup-window set rather than an unbounded one.
-  const liveContexts = new Set<string>();
-  let trackLiveContexts = false;
-
   const withLifecycleLock = <T>(fn: () => Promise<T>): Promise<T> => {
     const run = lifecycleChain.then(fn, fn);
     // Keep the chain alive regardless of this op's outcome.
@@ -1508,11 +1500,6 @@ export default (app: App) => {
     );
     app.registerHistoryProvider(v1Provider);
 
-    // Arm live-context tracking before the first delta can arrive, so the
-    // restore sees every vessel that transmitted during startup.
-    liveContexts.clear();
-    trackLiveContexts = config.restoreOnStart;
-
     // getBus() carries only the source that Signal K's source priorities
     // prefer on each path, the value instruments show. recordAllSources
     // reads the unfiltered bus instead, so a source that loses the ranking
@@ -1527,10 +1514,8 @@ export default (app: App) => {
 
       // Values this plugin replayed at startup come straight back around
       // through the streambundle. Recording them would re-stamp historical
-      // fixes with the current receive time — inventing present-tense
-      // positions for vessels that may be long gone — and marking their
-      // context live would defeat the guard that stops a restore from
-      // overwriting a vessel that actually transmitted.
+      // fixes with the current receive time, inventing present-tense
+      // positions for vessels that may be long gone.
       if (delta.$source === RESTORE_SOURCE) return;
 
       // The delta's sourceRef, stored as the rows' `source` column so
@@ -1553,18 +1538,8 @@ export default (app: App) => {
       // describe a path (units, description, displayName), they are not a
       // reading of it. Routed like a value object, their keys were stored
       // as rows such as `….units` and `….displayName`, again each time a
-      // plugin republished its meta. Nor do they show that a vessel is
-      // transmitting: a local plugin publishes its meta on its own start,
-      // and counting that would cost the restore a vessel's saved position.
+      // plugin republished its meta.
       if (delta.isMeta) return;
-
-      // Note the context BEFORE any early return or filter: identity-only
-      // deltas return below, and path filters and throttles decide what gets
-      // STORED — but any value at all proves the vessel is transmitting now,
-      // which is what makes its stored position obsolete for the restore.
-      if (trackLiveContexts) {
-        liveContexts.add(context === app.selfContext ? "self" : context);
-      }
 
       // Static vessel identity (issue #91): names arrive as empty-path
       // object deltas, which the path guard below would drop. Stored as
@@ -1980,11 +1955,10 @@ export default (app: App) => {
     // reads pluginRunning and everything before this point can still throw
     // and abandon the start.
     //
-    // The recorder is already subscribed, so live deltas keep arriving while
-    // the (slow, whole-table) restore query runs. Those are newer by
-    // definition: replaying a stored fix over a vessel that just transmitted
-    // would move it BACKWARDS on the chart. liveContexts records what the
-    // recorder saw and the restore skips those contexts entirely.
+    // Live deltas keep arriving while the (slow, whole-table) restore query
+    // runs, and some arrived before the recorder subscribed. The restore
+    // reads the model and leaves alone whatever it already holds, so neither
+    // is overwritten by an older stored value.
     if (config.restoreOnStart) {
       const restoreGeneration = lifecycleGeneration;
       void restoreFromHistory(
@@ -2000,7 +1974,7 @@ export default (app: App) => {
           },
           selfContext: app.selfContext,
           debug: (msg) => app.debug(msg),
-          hasLiveData: (context) => liveContexts.has(context),
+          getPath: (path) => app.getPath?.(path),
         },
         {
           maxAgeMs: config.restoreMaxAgeMinutes * 60_000,
@@ -2040,15 +2014,6 @@ export default (app: App) => {
             const { host, port } = questdbEndpoints.ilp;
             publishRecordingStatus(host, port);
           }
-        })
-        .finally(() => {
-          // Only needed to shield the restore; tracking every context for the
-          // life of the plugin would be an unbounded set. Guarded on the
-          // generation so a slow restore settling after a restart does not
-          // disarm the tracking the NEW start just armed.
-          if (lifecycleGeneration !== restoreGeneration) return;
-          liveContexts.clear();
-          trackLiveContexts = false;
         });
     }
   }
@@ -2098,10 +2063,6 @@ export default (app: App) => {
       imageCheckAbort?.abort();
       pluginRunning = false;
 
-      // A start aborted before its restore ran would otherwise leave tracking
-      // armed, accumulating contexts for a restore that never happens.
-      trackLiveContexts = false;
-      liveContexts.clear();
       // Stale across a restart otherwise: the card would still claim a
       // restore count from the previous run.
       restoreSummary = null;
