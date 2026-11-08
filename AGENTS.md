@@ -42,7 +42,7 @@ Both build outputs are shipped in the npm package; `prepublishOnly` rebuilds the
 
 ### Container integration
 
-The plugin **does not run QuestDB itself**. It declares an optional peer dep on `signalk-container` and looks up that plugin's API at runtime (`ContainerManagerApi` in `src/index.ts`). When `managedContainer` is true, it calls `ensureRunning` / `ensureNetwork` / `pullImage` / `stop` to control a QuestDB container on the shared `sk-network` Podman/Docker network. The plugin lifecycle (`start`/`stop`) drives container lifecycle.
+The plugin **does not run QuestDB itself**. It names `signalk-container` in `package.json`'s `signalk.requires`, with no npm dependency on it, and looks up that plugin's API at runtime (`ContainerManagerApi` in `src/index.ts`). When `managedContainer` is true, it calls `ensureRunning` / `ensureNetwork` / `pullImage` / `stop` to control a QuestDB container on the shared `sk-network` Podman/Docker network. The plugin lifecycle (`start`/`stop`) drives container lifecycle.
 
 When `managedContainer` is false, the plugin connects to an external QuestDB at the configured host/ports.
 
