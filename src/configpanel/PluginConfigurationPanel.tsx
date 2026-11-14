@@ -1360,16 +1360,18 @@ export default function PluginConfigurationPanel({
                   <code>user@.service</code> <code>LimitNOFILE</code> drop-in,
                   or when Signal K itself runs as <code>signalk.service</code>,{" "}
                   <code>DefaultLimitNOFILE</code> in{" "}
-                  <code>/etc/systemd/system.conf</code>, which raises both — and
-                  check <code>/etc/security/limits.conf</code> and{" "}
+                  <code>/etc/systemd/system.conf</code>, which raises both
+                  unless a lower <code>user@.service</code> drop-in overrides it
+                  — and check <code>/etc/security/limits.conf</code> and{" "}
                   <code>/etc/security/limits.d/</code> for a <code>nofile</code>{" "}
                   entry of type <code>hard</code> or <code>-</code> with a lower
                   value, which overrides either. Then reboot: the limits only
                   apply to freshly started services, and after the reboot the
                   plugin re-creates the QuestDB container with the raised limit
-                  (signalk-container 1.25.3+; on older versions also remove the
+                  (signalk-container 1.25.3+; on older versions remove the
                   container once with{" "}
-                  <code>podman rm -f sk-signalk-questdb</code>).
+                  <code>podman rm -f sk-signalk-questdb</code> before the
+                  reboot).
                 </>
               )}{" "}
               This warning clears itself once the container is running with the
