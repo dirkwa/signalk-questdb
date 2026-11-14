@@ -1357,13 +1357,19 @@ export default function PluginConfigurationPanel({
                   QuestDB is running on the lower limit. To grant the full
                   value, raise the host limit for the user running the container
                   runtime — under rootless Podman that means a systemd{" "}
-                  <code>user@.service</code> <code>LimitNOFILE</code> drop-in
-                  (editing <code>/etc/security/limits.conf</code> alone is
-                  usually not enough) — then restart the Signal K server so the
-                  plugin can re-create the QuestDB container with the raised
-                  limit (signalk-container 1.25.3+; on older versions remove the
+                  <code>user@.service</code> <code>LimitNOFILE</code> drop-in,
+                  or when Signal K itself runs as <code>signalk.service</code>,{" "}
+                  <code>DefaultLimitNOFILE</code> in{" "}
+                  <code>/etc/systemd/system.conf</code>, which raises both — and
+                  check <code>/etc/security/limits.conf</code> and{" "}
+                  <code>/etc/security/limits.d/</code> for a <code>nofile</code>{" "}
+                  entry of type <code>hard</code> or <code>-</code> with a lower
+                  value, which overrides either. Then reboot: the limits only
+                  apply to freshly started services, and after the reboot the
+                  plugin re-creates the QuestDB container with the raised limit
+                  (signalk-container 1.25.3+; on older versions also remove the
                   container once with{" "}
-                  <code>podman rm -f sk-signalk-questdb</code> instead).
+                  <code>podman rm -f sk-signalk-questdb</code>).
                 </>
               )}{" "}
               This warning clears itself once the container is running with the
