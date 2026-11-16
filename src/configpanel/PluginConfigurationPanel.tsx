@@ -1365,7 +1365,19 @@ export default function PluginConfigurationPanel({
                   — and check <code>/etc/security/limits.conf</code> and{" "}
                   <code>/etc/security/limits.d/</code> for a <code>nofile</code>{" "}
                   entry of type <code>hard</code> or <code>-</code> with a lower
-                  value, which overrides either. Then reboot: the limits only
+                  value, which overrides either. Under rootless Podman, also
+                  check{" "}
+                  <code>
+                    systemctl --user show podman.service -p LimitNOFILE
+                  </code>
+                  : containers never get more than the Podman service itself, so
+                  a lower value there caps QuestDB even when everything above is
+                  raised. It comes from a <code>LimitNOFILE</code> in a{" "}
+                  <code>podman.service</code> drop-in (
+                  <code>systemctl --user cat podman.service</code> lists them)
+                  or from <code>DefaultLimitNOFILE</code> in the user
+                  manager&apos;s <code>user.conf</code> or a{" "}
+                  <code>user.conf.d/</code> file. Then reboot: the limits only
                   apply to freshly started services, and after the reboot the
                   plugin re-creates the QuestDB container with the raised limit
                   (signalk-container 1.25.3+; on older versions remove the
